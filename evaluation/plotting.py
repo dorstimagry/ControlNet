@@ -58,7 +58,7 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     grade_force = _to_numpy(trace.get("grade_force", np.zeros_like(time)))
     net_force = _to_numpy(trace.get("net_force", np.zeros_like(time)))
 
-    fig, axes = plt.subplots(7, 1, figsize=(12, 21), sharex=True)
+    fig, axes = plt.subplots(8, 1, figsize=(12, 24), sharex=True)
 
     # 1. Speed and ref speed
     axes[0].plot(time, speed, label="Speed")
@@ -66,18 +66,21 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     axes[0].set_ylabel("Speed (m/s)")
     axes[0].legend(loc="upper right")
     axes[0].grid(alpha=0.3)
+    axes[0].set_title("Speed Tracking")
 
     # 2. Acceleration
     axes[1].plot(time, acceleration, label="Acceleration")
     axes[1].set_ylabel("Acceleration (m/s²)")
     axes[1].legend(loc="upper right")
     axes[1].grid(alpha=0.3)
+    axes[1].set_title("Vehicle Acceleration")
 
     # 3. Jerk
     axes[2].plot(time, jerk, label="Jerk")
     axes[2].set_ylabel("Jerk (m/s³)")
     axes[2].legend(loc="upper right")
     axes[2].grid(alpha=0.3)
+    axes[2].set_title("Vehicle Jerk")
 
     # 4. Throttle %
     axes[3].plot(time, throttle_pct, label="Throttle %", color="#1b9e77")
@@ -85,6 +88,7 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     axes[3].set_ylim(0, 100)
     axes[3].legend(loc="upper right")
     axes[3].grid(alpha=0.3)
+    axes[3].set_title("Motor Throttle Command")
 
     # 5. Brake %
     axes[4].plot(time, brake_pct, label="Brake %", color="#d95f02")
@@ -92,28 +96,39 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     axes[4].set_ylim(0, 100)
     axes[4].legend(loc="upper right")
     axes[4].grid(alpha=0.3)
+    axes[4].set_title("Brake Command")
 
-    # 6. Forces acting on the vehicle
-    axes[5].plot(time, tire_force, label="Tire force (N)")
-    axes[5].plot(time, drag_force, label="Drag force (N)")
-    axes[5].plot(time, rolling_force, label="Rolling force (N)")
-    axes[5].plot(time, grade_force, label="Grade force (N)")
-    axes[5].plot(time, net_force, label="Net force (N)", linewidth=2)
-    axes[5].set_ylabel("Forces (N)")
-    axes[5].legend(loc="upper right", ncol=2)
+    # 6. External forces (resistive forces acting on vehicle)
+    axes[5].plot(time, drag_force, label="Drag force (N)", color="#ff7f0e")
+    axes[5].plot(time, rolling_force, label="Rolling force (N)", color="#2ca02c")
+    axes[5].plot(time, grade_force, label="Grade force (N)", color="#d62728")
+    axes[5].set_ylabel("External Forces (N)")
+    axes[5].legend(loc="upper right")
     axes[5].grid(alpha=0.3)
+    axes[5].set_title("External Resistive Forces")
 
-    # 7. Policy mu post-tanh with 68th percentile band
+    # 7. Force balance (external + tire = net)
+    total_external = -(drag_force + rolling_force + grade_force)  # Total external force on vehicle
+    axes[6].plot(time, total_external, label="Total external (N)", color="#17becf", linewidth=2)
+    axes[6].plot(time, tire_force, label="Tire force (N)", color="#1f77b4", linewidth=2)
+    axes[6].plot(time, net_force, label="Net force (N)", color="#e377c2", linewidth=2)
+    axes[6].set_ylabel("Total Forces (N)")
+    axes[6].legend(loc="upper right")
+    axes[6].grid(alpha=0.3)
+    axes[6].set_title("Force Balance: External + Tire = Net")
+
+    # 8. Policy mu post-tanh with 68th percentile band
     policy_std = np.exp(policy_log_std)  # Convert log std to std
     policy_mean_tanh = np.tanh(policy_mean)  # Post-tanh mean
     y_low, y_high = tanh_band(policy_mean, policy_std, p=0.68)  # 68th percentile band
 
-    axes[6].plot(time, policy_mean_tanh, label="Policy μ (post-tanh)", color="#1f77b4", linewidth=2)
-    axes[6].fill_between(time, y_low, y_high, alpha=0.3, color="#1f77b4", label="68th percentile")
-    axes[6].set_ylabel("Policy μ (post-tanh)")
-    axes[6].set_xlabel("Time (s)")
-    axes[6].legend(loc="upper right")
-    axes[6].grid(alpha=0.3)
+    axes[7].plot(time, policy_mean_tanh, label="Policy μ (post-tanh)", color="#1f77b4", linewidth=2)
+    axes[7].fill_between(time, y_low, y_high, alpha=0.3, color="#1f77b4", label="68th percentile")
+    axes[7].set_ylabel("Policy μ (post-tanh)")
+    axes[7].set_xlabel("Time (s)")
+    axes[7].legend(loc="upper right")
+    axes[7].grid(alpha=0.3)
+    axes[7].set_title("Policy Output Distribution")
 
     fig.suptitle(f"Sequence diagnostics: {trace.get('sequence_id', 'unknown')}")
     fig.tight_layout(rect=(0, 0.02, 1, 0.98))

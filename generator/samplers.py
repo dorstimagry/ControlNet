@@ -172,7 +172,7 @@ def generate_ou_spatial_grids(
 
     # Initial values from stationary distribution
     var = (sigma**2) / (2 * theta)  # Stationary variance
-    x[:, 0] = mu + torch.sqrt(torch.tensor(var, device=device)) * torch.randn(batch_size, device=device)
+    x[:, 0] = mu + torch.sqrt(var) * torch.randn(batch_size, device=device)
 
     # Generate OU process along spatial dimension
     sqrt_ds = torch.sqrt(torch.tensor(ds, device=device))
