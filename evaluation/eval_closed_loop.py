@@ -59,7 +59,11 @@ def run_closed_loop_evaluation(
             print(f"Using config override from {config_path}")
 
     # Extract generator config if present
-    generator_config = raw_config.get("generator")
+    generator_config = raw_config.get("generator", {})
+
+    # Add vehicle randomization config to generator_config
+    if "vehicle_randomization" in raw_config:
+        generator_config["vehicle_randomization"] = raw_config["vehicle_randomization"]
 
     env = LongitudinalEnv(env_cfg, randomization=RandomizationConfig(), generator_config=generator_config, seed=4321)
 
@@ -94,6 +98,7 @@ def run_closed_loop_evaluation(
             "brake_tau": float(env.extended_params.brake.tau_br),
             "brake_T_max": float(env.extended_params.brake.T_br_max),
             "brake_p": float(env.extended_params.brake.p_br),
+            "brake_kappa_c": float(env.extended_params.brake.kappa_c),
             "brake_mu": float(env.extended_params.brake.mu),
             # Body parameters (extended)
             "body_mass": float(env.extended_params.body.mass),

@@ -111,7 +111,11 @@ class LongitudinalEnv(gym.Env):
 
         self.params: VehicleParams | None = None
         self.extended_params: ExtendedPlantParams | None = None
-        self.extended_random = ExtendedPlantRandomization()
+        # Create extended randomization from config if available
+        extended_config = {}
+        if generator_config and 'vehicle_randomization' in generator_config:
+            extended_config = generator_config
+        self.extended_random = ExtendedPlantRandomization.from_config(extended_config)
         self.extended: ExtendedPlant | None = None
         self.reference: np.ndarray | None = None
         self.grade_profile: np.ndarray | None = None

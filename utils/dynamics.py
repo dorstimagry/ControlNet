@@ -146,25 +146,73 @@ class ExtendedPlantParams:
 
 @dataclass(slots=True)
 class ExtendedPlantRandomization:
-    mass_range: Tuple[float, float] = (1500.0, 3500.0)  # kg - updated range
-    drag_area_range: Tuple[float, float] = (0.55, 0.85)
+    """Configuration for randomizing extended plant parameters."""
+
+    # Basic vehicle parameters
+    mass_range: Tuple[float, float] = (1500.0, 3500.0)  # kg
+    drag_area_range: Tuple[float, float] = (0.55, 0.85)  # m²
     rolling_coeff_range: Tuple[float, float] = (0.008, 0.02)
+    actuator_tau_range: Tuple[float, float] = (0.05, 0.30)  # seconds
+    grade_deg_range: Tuple[float, float] = (-5.0, 5.0)  # degrees
+
+    # Motor parameters
+    motor_Vmax_range: Tuple[float, float] = (200.0, 800.0)  # V
+    motor_R_range: Tuple[float, float] = (0.05, 0.5)  # Ω
+    motor_K_range: Tuple[float, float] = (0.1, 0.4)  # Nm/A
+    motor_Bm_range: Tuple[float, float] = (1e-4, 5e-2)  # Nm·s/rad
+
+    # Gearbox
+    gear_ratio_range: Tuple[float, float] = (4.0, 20.0)
+
+    # Brake parameters
+    brake_tau_range: Tuple[float, float] = (0.04, 0.12)  # seconds
+    brake_Tmax_range: Tuple[float, float] = (5000.0, 10000.0)  # Nm
+    brake_p_range: Tuple[float, float] = (0.6, 2.5)
+    brake_kappa_range: Tuple[float, float] = (0.02, 0.25)
     mu_range: Tuple[float, float] = (0.5, 1.0)
-    motor_Vmax_range: Tuple[float, float] = (200.0, 800.0)  # V - max motor voltage
-    motor_R_range: Tuple[float, float] = (0.05, 0.5)  # Ω - motor resistance
-    motor_K_range: Tuple[float, float] = (0.1, 0.4)  # Nm/A - motor constants
-    gear_ratio_range: Tuple[float, float] = (4.0, 20.0)  # gear reduction ratio
-    brake_tau_range: Tuple[float, float] = (0.04, 0.12)
-    brake_Tmax_range: Tuple[float, float] = (5000.0, 10000.0)
-    grade_deg_range: Tuple[float, float] = (-5.0, 5.0)
+
+    # Wheel parameters
+    wheel_radius_range: Tuple[float, float] = (0.25, 0.45)  # m
+    wheel_inertia_range: Tuple[float, float] = (0.5, 4.0)  # kg·m²
+
+    # Efficiency
+    eta_gb_range: Tuple[float, float] = (0.80, 0.98)
+
+    @classmethod
+    def from_config(cls, config: dict) -> 'ExtendedPlantRandomization':
+        """Create ExtendedPlantRandomization from config dictionary."""
+        if 'vehicle_randomization' not in config:
+            return cls()  # Use defaults
+
+        vr_config = config['vehicle_randomization']
+        return cls(
+            mass_range=tuple(vr_config.get('mass_range', (1500.0, 3500.0))),
+            drag_area_range=tuple(vr_config.get('drag_area_range', (0.55, 0.85))),
+            rolling_coeff_range=tuple(vr_config.get('rolling_coeff_range', (0.008, 0.02))),
+            actuator_tau_range=tuple(vr_config.get('actuator_tau_range', (0.05, 0.30))),
+            grade_deg_range=tuple(vr_config.get('grade_range_deg', (-5.0, 5.0))),
+            motor_Vmax_range=tuple(vr_config.get('motor_Vmax_range', (200.0, 800.0))),
+            motor_R_range=tuple(vr_config.get('motor_R_range', (0.05, 0.5))),
+            motor_K_range=tuple(vr_config.get('motor_K_range', (0.1, 0.4))),
+            motor_Bm_range=tuple(vr_config.get('motor_Bm_range', (1e-4, 5e-2))),
+            gear_ratio_range=tuple(vr_config.get('gear_ratio_range', (4.0, 20.0))),
+            brake_tau_range=tuple(vr_config.get('brake_tau_range', (0.04, 0.12))),
+            brake_Tmax_range=tuple(vr_config.get('brake_Tmax_range', (5000.0, 10000.0))),
+            brake_p_range=tuple(vr_config.get('brake_p_range', (0.6, 2.5))),
+            brake_kappa_range=tuple(vr_config.get('brake_kappa_range', (0.02, 0.25))),
+            mu_range=tuple(vr_config.get('mu_range', (0.5, 1.0))),
+            wheel_radius_range=tuple(vr_config.get('wheel_radius_range', (0.25, 0.45))),
+            wheel_inertia_range=tuple(vr_config.get('wheel_inertia_range', (0.5, 4.0))),
+            eta_gb_range=tuple(vr_config.get('eta_gb_range', (0.80, 0.98))),
+        )
 
 
 def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomization) -> ExtendedPlantParams:
     """Sample plant parameters for the extended dynamics with rejection sampling for acceleration capability."""
 
-    # Fixed parameters
-    wheel_radius = 0.3  # m - fixed wheel radius
-    eta_gb = 0.9  # gearbox efficiency
+    # Sample additional parameters
+    wheel_radius = float(rng.uniform(*rand.wheel_radius_range))  # m - wheel radius
+    eta_gb = float(rng.uniform(*rand.eta_gb_range))  # gearbox efficiency
 
     # Rejection sampling loop to ensure 2.5-4.0 m/s² acceleration capability
     max_attempts = 100
@@ -182,6 +230,8 @@ def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomiz
         R = float(rng.uniform(*rand.motor_R_range))
         K_t = float(rng.uniform(*rand.motor_K_range))
         K_e = K_t  # SI units: K_e = K_t
+        # Sample motor viscous damping (log-uniform as recommended)
+        B_m = 10 ** rng.uniform(np.log10(rand.motor_Bm_range[0]), np.log10(rand.motor_Bm_range[1]))
         gear_ratio = float(rng.uniform(*rand.gear_ratio_range))
 
         # Compute theoretical stall torque
@@ -202,18 +252,25 @@ def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomiz
                 R=R,
                 K_e=K_e,
                 K_t=K_t,
-                B_m=1e-3,  # fixed damping
+                B_m=float(B_m),  # sampled damping
                 V_max=V_max,
                 gear_ratio=gear_ratio,
             )
             brake = BrakeParams(
                 T_br_max=float(rng.uniform(*rand.brake_Tmax_range)),
-                p_br=1.2,
+                p_br=float(rng.uniform(*rand.brake_p_range)),
                 tau_br=float(rng.uniform(*rand.brake_tau_range)),
-                kappa_c=0.08,
+                kappa_c=float(10 ** rng.uniform(np.log10(rand.brake_kappa_range[0]), np.log10(rand.brake_kappa_range[1]))),  # log-uniform
                 mu=float(rng.uniform(*rand.mu_range)),
             )
-            return ExtendedPlantParams(motor=motor, brake=brake, body=body, wheel=WheelParams())
+            # Sample wheel parameters
+            wheel_inertia = float(10 ** rng.uniform(np.log10(rand.wheel_inertia_range[0]), np.log10(rand.wheel_inertia_range[1])))  # log-uniform
+            wheel = WheelParams(
+                radius=wheel_radius,
+                inertia=wheel_inertia,
+                v_eps=0.1,  # keep fixed
+            )
+            return ExtendedPlantParams(motor=motor, brake=brake, body=body, wheel=wheel)
 
         # If parameters don't meet requirements, continue to next attempt
 
