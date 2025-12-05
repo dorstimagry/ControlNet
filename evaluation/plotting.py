@@ -52,7 +52,6 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     policy_mean = _to_numpy(trace["policy_pre_tanh_mean"])
     policy_log_std = _to_numpy(trace["policy_log_std"])
     # Force data
-    drive_torque = _to_numpy(trace.get("drive_torque", np.zeros_like(time)))
     tire_force = _to_numpy(trace.get("tire_force", np.zeros_like(time)))
     drag_force = _to_numpy(trace.get("drag_force", np.zeros_like(time)))
     rolling_force = _to_numpy(trace.get("rolling_force", np.zeros_like(time)))
@@ -95,13 +94,12 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     axes[4].grid(alpha=0.3)
 
     # 6. Forces acting on the vehicle
-    axes[5].plot(time, drive_torque, label="Drive torque (Nm)")
     axes[5].plot(time, tire_force, label="Tire force (N)")
     axes[5].plot(time, drag_force, label="Drag force (N)")
     axes[5].plot(time, rolling_force, label="Rolling force (N)")
     axes[5].plot(time, grade_force, label="Grade force (N)")
     axes[5].plot(time, net_force, label="Net force (N)", linewidth=2)
-    axes[5].set_ylabel("Forces/Torques")
+    axes[5].set_ylabel("Forces (N)")
     axes[5].legend(loc="upper right", ncol=2)
     axes[5].grid(alpha=0.3)
 
@@ -163,6 +161,105 @@ def plot_summary(metrics: list[Mapping[str, float]], output_path: Path) -> None:
     plt.close(fig)
 
 
-__all__ = ["plot_sequence_diagnostics", "plot_summary"]
+def plot_feasibility_diagnostics(trace: dict, vehicle_caps, output_path: Path) -> None:
+    """Plot feasibility diagnostics for a profile.
+
+    Args:
+        trace: Evaluation trace with original and feasible profiles
+        vehicle_caps: VehicleCapabilities object
+        output_path: Path to save the plot
+    """
+    from utils.data_utils import feasible_accel_bounds
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+
+    # Extract data
+    dt = 0.1  # Assume 10Hz
+    original_v = _to_numpy(trace.get("original_reference", []))
+    feasible_v = _to_numpy(trace.get("feasible_reference", []))
+    time = np.arange(len(feasible_v)) * dt
+
+    if len(original_v) == 0 or len(feasible_v) == 0:
+        plt.close(fig)
+        return
+
+    # 1. Speed profiles comparison
+    axes[0].plot(time, original_v, label="Original", color="#ff7f0e", linestyle="--", alpha=0.7)
+    axes[0].plot(time, feasible_v, label="Feasible", color="#1f77b4", linewidth=2)
+    axes[0].set_ylabel("Speed (m/s)")
+    axes[0].set_title("Profile Feasibility: Original vs Feasible")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    # 2. Acceleration bounds and requested acceleration
+    grade_profile = np.zeros_like(feasible_v)  # Assume flat road for diagnostics
+
+    a_req = np.zeros(len(feasible_v) - 1)
+    a_min_bounds = np.zeros(len(feasible_v) - 1)
+    a_max_bounds = np.zeros(len(feasible_v) - 1)
+
+    for k in range(len(a_req)):
+        a_req[k] = (feasible_v[k+1] - feasible_v[k]) / dt
+        a_min_bounds[k], a_max_bounds[k] = feasible_accel_bounds(
+            feasible_v[k], grade_profile[k], vehicle_caps, safety_margin=0.9
+        )
+
+    time_accel = time[:-1] + dt/2  # Center on acceleration intervals
+
+    axes[1].fill_between(time_accel, a_min_bounds, a_max_bounds, alpha=0.3, color="#2ca02c",
+                        label="Feasible range")
+    axes[1].plot(time_accel, a_req, color="#d62728", linewidth=2, label="Requested")
+    axes[1].set_ylabel("Acceleration (m/s²)")
+    axes[1].set_title("Acceleration Feasibility Check")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    # Check for violations
+    violations = 0
+    for k in range(len(a_req)):
+        if not (a_min_bounds[k] - 1e-3 <= a_req[k] <= a_max_bounds[k] + 1e-3):
+            violations += 1
+            axes[1].plot(time_accel[k], a_req[k], 'rx', markersize=8, markeredgewidth=2)
+
+    # 3. Force analysis
+    F_drive_max = np.zeros_like(feasible_v)
+    F_brake_max = np.zeros_like(feasible_v)
+    F_drag = np.zeros_like(feasible_v)
+    F_roll = np.zeros_like(feasible_v)
+    F_grade = np.zeros_like(feasible_v)
+
+    for k in range(len(feasible_v)):
+        F_drag[k] = 0.5 * vehicle_caps.rho * vehicle_caps.C_dA * feasible_v[k]**2
+        F_roll[k] = vehicle_caps.C_r * vehicle_caps.m * 9.80665
+        F_grade[k] = vehicle_caps.m * 9.80665 * np.sin(grade_profile[k])
+        F_fric = vehicle_caps.mu * vehicle_caps.m * 9.80665
+
+        F_drive_max[k] = 0.9 * min(vehicle_caps.T_drive_max / vehicle_caps.r_w, F_fric)
+        F_brake_max[k] = 0.9 * min(vehicle_caps.T_brake_max / vehicle_caps.r_w, F_fric)
+
+    axes[2].plot(time, F_drive_max, label="Max drive force", color="#1f77b4")
+    axes[2].plot(time, F_brake_max, label="Max brake force", color="#d62728")
+    axes[2].plot(time, F_drag + F_roll + F_grade, label="Resistive forces", color="#ff7f0e")
+    axes[2].set_ylabel("Force (N)")
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_title("Force Analysis")
+    axes[2].legend()
+    axes[2].grid(alpha=0.3)
+
+    # Add text annotation with summary
+    profile_feasible = trace.get("profile_feasible", True)
+    max_adjustment = trace.get("max_profile_adjustment", 0.0)
+
+    status_text = f"Feasible: {profile_feasible}\nMax adjustment: {max_adjustment:.3f} m/s\nAccel violations: {violations}"
+    axes[0].text(0.02, 0.98, status_text, transform=axes[0].transAxes,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    fig.tight_layout()
+    _ensure_parent(output_path)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+__all__ = ["plot_sequence_diagnostics", "plot_summary", "plot_feasibility_diagnostics"]
 
 

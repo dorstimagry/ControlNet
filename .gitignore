@@ -77,12 +77,8 @@ evaluation/results/
 evaluation/results/plots/
 evaluation/results/*.json
 
-# Instruction/documentation files (implementation guides)
-fix_tire_model_and_plant_instructions.md
-remove_engine_map_and_use_pure_dc_motor.md
-sac_ego_longitudinal_extended_plant.md
-sac_ego_longitudinal_full_pipeline.md
-PROGRESS_LOG.md
+# Documentation files (implementation guides)
+docs/
 
 # Generated datasets (can be large)
 data/

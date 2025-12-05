@@ -74,7 +74,11 @@ def aerodynamic_drag(speed: float, params: VehicleParams) -> float:
 
 
 def rolling_resistance(params: VehicleParams) -> float:
-    """Rolling resistance force magnitude."""
+    """Maximum rolling resistance force magnitude (at high speeds).
+
+    Note: Actual rolling resistance in simulation varies with vehicle speed,
+    going to zero as speed approaches zero.
+    """
 
     return params.rolling_coeff * params.mass * GRAVITY
 
@@ -105,19 +109,6 @@ class MotorParams:
     B_m: float = 1e-3  # motor damping (Nm/(rad/s))
     V_max: float = 400.0  # max motor voltage (V)
     gear_ratio: float = 10.0  # gear reduction ratio
-    theta_min: float = 0.0
-    theta_max: float = 1.0
-    theta_rest: float = 0.0
-    theta_mid: float = 0.5
-    k_th_map: float = 10.0
-
-
-@dataclass(slots=True)
-class EngineParams:
-    T_idle: float = 10.0
-    T_max: float = 200.0
-    eta_gb: float = 0.9
-    N_gb: float = 4.0
 
 
 @dataclass(slots=True)
@@ -148,7 +139,6 @@ class WheelParams:
 @dataclass(slots=True)
 class ExtendedPlantParams:
     motor: MotorParams = MotorParams()
-    engine: EngineParams = EngineParams()
     brake: BrakeParams = BrakeParams()
     body: BodyParams = BodyParams()
     wheel: WheelParams = WheelParams()
@@ -223,7 +213,7 @@ def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomiz
                 kappa_c=0.08,
                 mu=float(rng.uniform(*rand.mu_range)),
             )
-            return ExtendedPlantParams(motor=motor, engine=EngineParams(), brake=brake, body=body, wheel=WheelParams())
+            return ExtendedPlantParams(motor=motor, brake=brake, body=body, wheel=WheelParams())
 
         # If parameters don't meet requirements, continue to next attempt
 
@@ -254,6 +244,7 @@ class ExtendedPlantState:
     rolling_force: float
     grade_force: float
     net_force: float
+    held_by_brakes: bool  # True when vehicle is held at rest by brakes/static friction
 
 
 class ExtendedPlant:
@@ -265,7 +256,7 @@ class ExtendedPlant:
 
     # ------------------------------------------------------------------
     def reset(self, speed: float = 0.0, position: float = 0.0) -> ExtendedPlantState:
-        self.speed = max(0.0, speed)
+        self.speed = speed  # Allow negative speeds for testing reverse motion
         self.position = position
         self.acceleration = 0.0
         self.wheel_speed = self.speed / max(self.params.wheel.radius, 1e-3)
@@ -282,6 +273,8 @@ class ExtendedPlant:
         self.rolling_force = 0.0
         self.grade_force = 0.0
         self.net_force = 0.0
+        self.held_by_brakes = False
+        self._current_grade_rad = None  # Current grade override (None = use body.grade_rad)
         return self.state
 
     # ------------------------------------------------------------------
@@ -304,11 +297,15 @@ class ExtendedPlant:
             rolling_force=self.rolling_force,
             grade_force=self.grade_force,
             net_force=self.net_force,
+            held_by_brakes=self.held_by_brakes,
         )
 
     # ------------------------------------------------------------------
-    def step(self, action: float, dt: float, substeps: int = 1) -> ExtendedPlantState:
+    def step(self, action: float, dt: float, substeps: int = 1, grade_rad: float | None = None) -> ExtendedPlantState:
         """Advance the plant by ``dt`` seconds, optionally using sub-steps."""
+
+        # Store the grade for this step (None means use default body.grade_rad)
+        self._current_grade_rad = grade_rad
 
         dt = max(dt, 1e-6)
         sub_dt = dt / max(substeps, 1)
@@ -356,45 +353,97 @@ class ExtendedPlant:
         T_br_cmd = brake_params.T_br_max * (brake_cmd ** brake_params.p_br)
         self.brake_torque += dt / max(brake_params.tau_br, 1e-4) * (T_br_cmd - self.brake_torque)
 
-        # ===== TIRE MODEL (torque-first) =====
-        # compute net wheel torque from motor drive and brake
-        T_net = float(self.drive_torque - self.brake_torque)
+        # ===== PHYSICS-ROOTED HOLD & SLIP BRAKING MODEL =====
 
-        # convert net torque to raw longitudinal force at the tire
-        F_raw = T_net / max(wheel.radius, 1e-6)  # N
+        # Constants for hold/slip logic
+        v_lock_threshold = 0.05  # m/s - speed below which we consider "stopped"
+        mu_s = brake_params.mu * 1.05  # static friction (slightly higher than kinetic)
+        mu_k = brake_params.mu          # kinetic friction
 
-        # compute frictional limit (whole-vehicle)
-        F_limit = float(brake_params.mu * body.mass * GRAVITY)
+        # 1. Compute drive torque and brake command
+        tau_drive = self.drive_torque  # already signed (positive = forward)
+        tau_brake_cmd = max(self.brake_torque, 0.0)  # magnitude (ensure non-negative)
 
-        # saturate the longitudinal force by friction limit
-        F_x = float(np.clip(F_raw, -F_limit, F_limit))
+        # 2. Compute brake torque (opposes current motion direction)
+        # For stable behavior, brake torque should always oppose the vehicle's current motion
+        # This prevents oscillations and ensures braking always slows the vehicle
+        if abs(self.speed) > 0.01:  # Moving vehicle
+            tau_brake = -np.sign(self.speed) * tau_brake_cmd  # Oppose motion direction
+        else:  # Nearly stopped
+            tau_brake = -tau_brake_cmd  # Default to opposing forward motion
 
-        # store tire force and tire torque for wheel dynamics
-        self.tire_force = F_x
-        T_tire = F_x * wheel.radius
+        # 4. Net torque and attempted tyre force
+        tau_net = tau_drive + tau_brake
+        F_raw = tau_net / max(wheel.radius, 1e-6)
 
-        # wheel rotational dynamics
-        omega_dot = (T_net - T_tire) / max(wheel.inertia, 1e-6)
-        self.wheel_speed = self.wheel_speed + dt * omega_dot
-        # avoid hard clamping to zero; allow small positive min for numerical stability
-        self.wheel_speed = max(self.wheel_speed, 1e-6)
+        # 5. Friction limits
+        N_normal = body.mass * GRAVITY
+        F_fric_static = mu_s * N_normal
+        F_fric_kinetic = mu_k * N_normal
 
-        # compute slip (for diagnostics only)
+        # 6. External forces for holding logic
+        F_drag = 0.5 * body.air_density * body.drag_area * self.speed * abs(self.speed)
+        # Speed-dependent rolling resistance (goes to zero at zero speed)
+        v_threshold = 0.1  # m/s - speed below which rolling resistance goes to zero
+        roll_factor = min(1.0, abs(self.speed) / v_threshold)
+        F_roll = body.rolling_coeff * body.mass * GRAVITY * roll_factor
+        F_grade = body.mass * GRAVITY * np.sin(self._current_grade_rad if self._current_grade_rad is not None else body.grade_rad)
+        F_ext = - (F_drag + F_roll + F_grade)
+        F_req_to_hold = -F_ext  # tyre force needed to hold
+
+        # 7. Decide hold vs slip
+        brake_applied = tau_brake_cmd > 1e-3  # Check if brakes are actually applied
+
+        if abs(self.speed) <= v_lock_threshold and brake_applied:
+            # Nearly stopped with brakes applied: check if we can hold
+            if (abs(F_req_to_hold) <= F_fric_static and
+                abs(F_raw) >= abs(F_req_to_hold) * 0.8):  # Brake must be strong enough
+                # Can hold - set tyre force to exactly balance externals
+                self.tire_force = float(F_req_to_hold)
+                self.wheel_speed = 0.0
+                self.held_by_brakes = True
+            else:
+                # Cannot hold - kinetic friction limit from applied torque
+                self.tire_force = float(np.clip(F_raw, -F_fric_kinetic, F_fric_kinetic))
+                self.held_by_brakes = False
+        else:
+            # Moving or no brakes applied: kinetic friction limit
+            self.tire_force = float(np.clip(F_raw, -F_fric_kinetic, F_fric_kinetic))
+            self.held_by_brakes = False
+
+        # 8. Wheel rotational dynamics (if not held)
+        if not self.held_by_brakes:
+            T_tire = self.tire_force * wheel.radius
+            omega_dot = (tau_net - T_tire) / max(wheel.inertia, 1e-6)
+            self.wheel_speed = self.wheel_speed + dt * omega_dot
+            # Allow wheel to go to zero or negative (for reverse)
+            self.wheel_speed = max(self.wheel_speed, -1e-6)  # small negative allowed
+
+        # 9. Compute slip ratio (for diagnostics)
         wheel_linear_speed = self.wheel_speed * wheel.radius
         v_ref = max(abs(self.speed), wheel.v_eps)
         self.slip_ratio = (wheel_linear_speed - self.speed) / v_ref
 
         # vehicle longitudinal dynamics
         self.drag_force = 0.5 * body.air_density * body.drag_area * self.speed * abs(self.speed)
-        self.rolling_force = body.rolling_coeff * body.mass * GRAVITY
-        self.grade_force = body.mass * GRAVITY * np.sin(body.grade_rad)
+        # Speed-dependent rolling resistance (goes to zero at zero speed)
+        v_threshold = 0.1  # m/s - speed below which rolling resistance goes to zero
+        roll_factor = min(1.0, abs(self.speed) / v_threshold)
+        self.rolling_force = body.rolling_coeff * body.mass * GRAVITY * roll_factor
+        self.grade_force = body.mass * GRAVITY * np.sin(self._current_grade_rad if self._current_grade_rad is not None else body.grade_rad)
 
         # net force on vehicle
         self.net_force = self.tire_force - self.drag_force - self.rolling_force - self.grade_force
 
-        # acceleration and integrate
-        self.acceleration = self.net_force / max(body.mass, 1e-6)
-        self.speed = max(0.0, self.speed + dt * self.acceleration)
+        if self.held_by_brakes:
+            # Held by brakes - no acceleration, speed stays at zero
+            self.acceleration = 0.0
+            self.speed = 0.0
+        else:
+            # Normal dynamics
+            self.acceleration = self.net_force / max(body.mass, 1e-6)
+            self.speed = self.speed + dt * self.acceleration  # Allow negative speeds (reverse)
+
         self.position += dt * self.speed
 
 

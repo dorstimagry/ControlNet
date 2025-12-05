@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - fallback for classic gym
     from gym import spaces
 
 from utils.data_utils import ReferenceTrajectoryGenerator
+from generator.adapter import create_reference_generator
 from utils.dynamics import (
     RandomizationConfig,
     VehicleParams,
@@ -57,6 +58,10 @@ class LongitudinalEnvConfig:
     smooth_action_weight: float = 0.05
     accel_filter_alpha: float = 0.1  # Exponential smoothing factor for acceleration (0 = no smoothing, 1 = instant)
     base_reward_clip: float = 10000.0
+    # Deprecated parameters (kept for backward compatibility with config files)
+    force_initial_speed_zero: bool = False  # Ignored - new generator handles feasibility
+    post_feasibility_smoothing: bool = False  # Ignored - new generator handles feasibility
+    post_feasibility_alpha: float = 0.8  # Ignored - new generator handles feasibility
 
 
 class LongitudinalEnv(gym.Env):
@@ -70,15 +75,17 @@ class LongitudinalEnv(gym.Env):
         *,
         randomization: RandomizationConfig | None = None,
         reference_generator: ReferenceTrajectoryGenerator | ObservationFn | None = None,
+        generator_config: dict | None = None,
         seed: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config or LongitudinalEnvConfig()
         self.randomization = randomization or RandomizationConfig()
+        self.generator_config = generator_config
         self._rng = np.random.default_rng(seed)
 
         if reference_generator is None:
-            self.reference_generator = ReferenceTrajectoryGenerator(dt=self.config.dt)
+            # Generator will be initialized after preview_steps
             self._reference_callable: ObservationFn | None = None
         elif isinstance(reference_generator, ReferenceTrajectoryGenerator):
             self.reference_generator = reference_generator
@@ -88,6 +95,12 @@ class LongitudinalEnv(gym.Env):
             self._reference_callable = reference_generator
 
         self.preview_steps = max(int(round(self.config.preview_horizon_s / self.config.dt)), 1)
+        if reference_generator is None:
+            self.reference_generator = create_reference_generator(
+                dt=self.config.dt,
+                prediction_horizon=self.preview_steps,
+                generator_config=self.generator_config
+            )
 
         self.action_space = spaces.Box(
             low=np.array([self.config.action_low], dtype=np.float32),
@@ -101,6 +114,7 @@ class LongitudinalEnv(gym.Env):
         self.extended_random = ExtendedPlantRandomization()
         self.extended: ExtendedPlant | None = None
         self.reference: np.ndarray | None = None
+        self.grade_profile: np.ndarray | None = None
         self._speed_noise_std: float = 0.05
         self._accel_noise_std: float = 0.1
         self._ref_idx: int = 0
@@ -135,10 +149,16 @@ class LongitudinalEnv(gym.Env):
             if profile.ndim != 1 or profile.size < 2:
                 raise ValueError("reference_profile must be a 1-D sequence with at least two entries")
             self.reference = profile
+            # For custom reference profiles, assume flat grade
+            self.grade_profile = np.zeros(len(profile), dtype=np.float32)
         else:
             profile_length = int(options.get("profile_length", self.config.max_episode_steps))
             profile_length = max(profile_length, 4)
             self.reference = self._generate_reference(profile_length)
+        # Store reference profiles for backward compatibility
+        self._original_reference = self.reference.copy()
+        self._vehicle_caps = None  # Not used with new generator
+        self._feasible_reference = self.reference.copy()
 
         initial_speed = float(options.get("initial_speed", self.reference[0]))
         self.speed = max(0.0, initial_speed)
@@ -157,7 +177,13 @@ class LongitudinalEnv(gym.Env):
             self._last_state = None
 
         obs = self._build_observation()
-        info = {"reference_speed": float(self.reference[self._ref_idx])}
+        info = {
+            "reference_speed": float(self.reference[self._ref_idx]),
+            "profile_feasible": True,
+            "max_profile_adjustment": 0.0,
+            "original_reference": self.reference.copy(),
+            "feasible_reference": self.reference.copy(),
+        }
         return obs, info
 
     def step(self, action: float | np.ndarray):
@@ -167,7 +193,9 @@ class LongitudinalEnv(gym.Env):
         action_value = float(np.clip(action_scalar, self.config.action_low, self.config.action_high))
         plant_state: ExtendedPlantState
         if self.config.use_extended_plant and self.extended is not None:
-            plant_state = self.extended.step(action_value, self.config.dt, self.config.plant_substeps)
+            # Get current grade for this time step
+            current_grade = float(self.grade_profile[self._ref_idx]) if self.grade_profile is not None else None
+            plant_state = self.extended.step(action_value, self.config.dt, self.config.plant_substeps, grade_rad=current_grade)
             self.speed = plant_state.speed
             self.position = plant_state.position
             self._last_state = plant_state
@@ -304,9 +332,20 @@ class LongitudinalEnv(gym.Env):
     def _generate_reference(self, length: int) -> np.ndarray:
         if self._reference_callable is not None:
             profile = self._reference_callable(length, self._rng)
+            # For callable references, assume flat grade
+            self.grade_profile = np.zeros(length, dtype=np.float32)
         else:
             assert self.reference_generator is not None
-            profile = self.reference_generator.sample(length, self._rng)
+            result = self.reference_generator.sample(length, self._rng)
+            if isinstance(result, tuple):
+                # New interface: returns (speed_profile, grade_profile)
+                profile, grade_profile = result
+                self.grade_profile = np.asarray(grade_profile, dtype=np.float32)
+            else:
+                # Legacy interface: only speed profile
+                profile = result
+                self.grade_profile = np.zeros(length, dtype=np.float32)
+
         if not isinstance(profile, np.ndarray):
             profile = np.asarray(profile, dtype=np.float32)
         return profile.astype(np.float32)

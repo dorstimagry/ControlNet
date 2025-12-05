@@ -56,6 +56,7 @@ DiffDynamics/
 - **Mass Range**: 1500-6000 kg (light cars to heavy trucks)
 - **Motor Power**: 200-800V, 0.05-0.5Ω, 0.1-0.4 Nm/A constants
 - **Gear Ratio**: 4:1 to 20:1 reduction
+- **Rolling Resistance**: Speed-dependent (goes to zero at zero speed)
 - **Guaranteed Performance**: All vehicles can achieve 2.5-4.0 m/s² acceleration
 
 ### Control Architecture
@@ -229,6 +230,9 @@ env:
 ```yaml
 env:
   accel_filter_alpha: 0.2          # Acceleration filtering (0-1)
+  force_initial_speed_zero: false    # Force initial target speed to 0
+  post_feasibility_smoothing: false   # Apply additional smoothing after feasibility projection
+  post_feasibility_alpha: 0.8        # Smoothing factor for post-feasibility smoothing (0-1)
   horizon_penalty_decay: 0.95      # Future penalty exponential decay
   use_extended_plant: true         # Use DC motor dynamics
   plant_substeps: 5                # Integration substeps
