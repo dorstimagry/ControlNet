@@ -11,6 +11,7 @@ from typing import Optional
 import numpy as np
 import torch
 import yaml
+from tqdm import tqdm
 
 from env.longitudinal_env import LongitudinalEnv, LongitudinalEnvConfig
 from evaluation.policy_loader import load_policy_from_checkpoint, select_action
@@ -74,7 +75,7 @@ def run_closed_loop_evaluation(
     per_episode_metrics = []
     vehicle_params_log = []
 
-    for episode in range(episodes):
+    for episode in tqdm(range(episodes), desc="Evaluating episodes"):
         obs, _ = env.reset()
 
         # Capture vehicle parameters for this episode
@@ -157,7 +158,7 @@ def run_closed_loop_evaluation(
             V_maxes.append(float(info.get("V_max", 800.0)))  # Default fallback
             brake_torques.append(float(info.get("brake_torque", 0.0)))
             brake_torque_maxes.append(float(info.get("brake_torque_max", 10000.0)))  # Default fallback
-            motor_voltages.append(float(info.get("motor_voltage", 0.0)))
+            motor_voltages.append(float(info.get("back_emf_voltage", 0.0)))
             motor_currents.append(float(info.get("motor_current", 0.0)))
             slip_ratios.append(float(info.get("slip_ratio", 0.0)))
             policy_means.append(stats["pre_tanh_mean"])
@@ -218,7 +219,7 @@ def run_closed_loop_evaluation(
                 "V_max": V_maxes,
                 "brake_torque": brake_torques,
                 "brake_torque_max": brake_torque_maxes,
-                "motor_voltage": motor_voltages,
+                "back_emf_voltage": motor_voltages,
                 "motor_current": motor_currents,
                 "slip_ratio": slip_ratios,
                 "drive_torque": drive_torques,

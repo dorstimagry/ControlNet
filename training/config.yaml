@@ -7,10 +7,11 @@ env:
   accel_filter_alpha: 0.2   # Exponential smoothing factor for acceleration (0=no smoothing, 1=instant)
   action_weight: 0.01       # Penalty weight for action magnitude (reduces aggressive control)
   brake_weight: 0.0         # Penalty weight for brake usage (set to 0 to disable)
+  negative_speed_weight: 1.0   # Penalty weight for negative vehicle speeds (prevents reverse)
   horizon_penalty_weight: 0.0  # Weight for future horizon tracking penalties
   horizon_penalty_decay: 0.95  # Exponential decay factor for future penalties (0.9-1.0)
-  jerk_weight: 0.1          # Penalty weight for acceleration changes (smoothness)
-  smooth_action_weight: 0.25 # Penalty weight for action changes (stability)
+  jerk_weight: 0.5          # Penalty weight for acceleration changes (smoothness)
+  smooth_action_weight: 5.0 # Penalty weight for action changes (stability)
   track_weight: 1.0         # Weight for speed tracking error in reward
   voltage_weight: 0.0       # Penalty weight for motor voltage (set to 0 to disable)
 
@@ -74,8 +75,8 @@ generator:
 
   # Road grade generation parameters (Ornstein-Uhlenbeck process)
   ds: 1.0                  # Spatial grid step size (meters) - resolution of grade map
-  l_corr: 150.0             # Spatial correlation length (meters) - road segment smoothness
-  sigma_g_stat: 0.025      # Grade standard deviation (radians) - ~0.29° typical variation
+  l_corr: 300.0             # Spatial correlation length (meters) - road segment smoothness
+  sigma_g_stat: 0.02      # Grade standard deviation (radians) - ~0.29° typical variation
   g_min: -0.08             # Minimum grade angle (radians) - ~ -4.6° max downhill
   g_max: 0.08              # Maximum grade angle (radians) - ~ +4.6° max uphill
 
@@ -91,7 +92,7 @@ vehicle_randomization:
   motor_Vmax_range: [200.0, 800.0]     # V - motor max voltage
   motor_R_range: [0.05, 0.5]           # Ω - motor resistance
   motor_K_range: [0.1, 0.4]            # Nm/A - motor torque constant
-  motor_Bm_range: [0.0001, 0.05]       # Nm·s/rad - motor viscous damping
+  motor_Bm_range: [0.00001, 0.005]     # Nm·s/rad - motor viscous damping
 
   # Brake parameters
   brake_tau_range: [0.04, 0.12]        # seconds - brake time constant

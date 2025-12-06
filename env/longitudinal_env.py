@@ -56,6 +56,7 @@ class LongitudinalEnvConfig:
     voltage_weight: float = 1e-4
     brake_weight: float = 1e-3
     smooth_action_weight: float = 0.05
+    negative_speed_weight: float = 1.0  # Penalty weight for negative vehicle speeds
     accel_filter_alpha: float = 0.1  # Exponential smoothing factor for acceleration (0 = no smoothing, 1 = instant)
     base_reward_clip: float = 10000.0
     # Deprecated parameters (kept for backward compatibility with config files)
@@ -234,13 +235,19 @@ class LongitudinalEnv(gym.Env):
                 position=self.position,
                 acceleration=accel,
                 wheel_speed=self.speed / 0.3,
-                throttle_angle=throttle_cmd,
-                throttle_rate=0.0,
                 brake_torque=brake_cmd * 1000.0,
                 slip_ratio=0.0,
                 action=action_value,
                 motor_current=0.0,
-                motor_voltage=0.0,
+                back_emf_voltage=0.0,
+                V_cmd=throttle_cmd * motor_V_max if 'motor_V_max' in globals() else 0.0,
+                drive_torque=0.0,
+                tire_force=0.0,
+                drag_force=drag_force,
+                rolling_force=rolling_force,
+                grade_force=grade_force_value,
+                net_force=net_force,
+                held_by_brakes=False,
             )
             self._last_state = plant_state
 
@@ -273,8 +280,11 @@ class LongitudinalEnv(gym.Env):
         reward -= self.config.action_weight * (abs(action_value))
         reward -= self.config.smooth_action_weight * abs(action_value - self._prev_action)
         if self.config.use_extended_plant and plant_state is not None:
-            reward -= self.config.voltage_weight * (plant_state.motor_voltage**2)
             reward -= self.config.brake_weight * abs(plant_state.brake_torque)
+
+        # Negative speed penalty
+        if self.speed < 0.0:
+            reward -= self.config.negative_speed_weight * abs(self.speed)
         reward = float(np.clip(reward, -self.config.base_reward_clip, self.config.base_reward_clip))
 
         self.prev_speed = self.speed
@@ -304,7 +314,7 @@ class LongitudinalEnv(gym.Env):
             "brake_torque": plant_state.brake_torque,
             "brake_torque_max": self.extended_params.brake.T_br_max,  # Maximum brake torque
             "slip_ratio": plant_state.slip_ratio,
-            "motor_voltage": plant_state.motor_voltage,
+            "back_emf_voltage": plant_state.back_emf_voltage,
             "motor_current": plant_state.motor_current,
             "V_cmd": plant_state.V_cmd,
             "V_max": self.extended_params.motor.V_max,  # Max motor voltage for percentage calculation

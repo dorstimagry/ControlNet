@@ -58,7 +58,13 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     grade_force = _to_numpy(trace.get("grade_force", np.zeros_like(time)))
     net_force = _to_numpy(trace.get("net_force", np.zeros_like(time)))
 
-    fig, axes = plt.subplots(8, 1, figsize=(12, 24), sharex=True)
+    # Motor data
+    V_cmd = _to_numpy(trace.get("V_cmd", np.zeros_like(time)))  # input motor voltage
+    back_emf_voltage = _to_numpy(trace.get("back_emf_voltage", np.zeros_like(time)))  # back-EMF voltage
+    V_max = _to_numpy(trace.get("V_max", np.zeros_like(time)))
+    effective_voltage = V_cmd - back_emf_voltage  # effective motor voltage
+
+    fig, axes = plt.subplots(9, 1, figsize=(12, 27), sharex=True)
 
     # 1. Speed and ref speed
     axes[0].plot(time, speed, label="Speed")
@@ -117,18 +123,30 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     axes[6].grid(alpha=0.3)
     axes[6].set_title("Force Balance: External + Tire = Net")
 
-    # 8. Policy mu post-tanh with 68th percentile band
+    # 8. Motor state (voltages)
+    axes[7].plot(time, V_cmd, label="Input voltage (V)", color="#2ca02c", linewidth=2)
+    axes[7].plot(time, back_emf_voltage, label="Back-EMF (V)", color="#d62728", linewidth=2)
+    axes[7].plot(time, effective_voltage, label="Effective voltage (V)", color="#1f77b4", linewidth=2)
+    # Add horizontal line for max voltage (use first value since it's constant per episode)
+    if len(V_max) > 0:
+        axes[7].axhline(y=V_max[0], color="#ff7f0e", linestyle="--", linewidth=2, label=f"Max voltage ({V_max[0]:.1f}V)")
+    axes[7].set_ylabel("Voltage (V)")
+    axes[7].legend(loc="upper right")
+    axes[7].grid(alpha=0.3)
+    axes[7].set_title("Motor Electrical State")
+
+    # 9. Policy mu post-tanh with 68th percentile band
     policy_std = np.exp(policy_log_std)  # Convert log std to std
     policy_mean_tanh = np.tanh(policy_mean)  # Post-tanh mean
     y_low, y_high = tanh_band(policy_mean, policy_std, p=0.68)  # 68th percentile band
 
-    axes[7].plot(time, policy_mean_tanh, label="Policy μ (post-tanh)", color="#1f77b4", linewidth=2)
-    axes[7].fill_between(time, y_low, y_high, alpha=0.3, color="#1f77b4", label="68th percentile")
-    axes[7].set_ylabel("Policy μ (post-tanh)")
-    axes[7].set_xlabel("Time (s)")
-    axes[7].legend(loc="upper right")
-    axes[7].grid(alpha=0.3)
-    axes[7].set_title("Policy Output Distribution")
+    axes[8].plot(time, policy_mean_tanh, label="Policy μ (post-tanh)", color="#1f77b4", linewidth=2)
+    axes[8].fill_between(time, y_low, y_high, alpha=0.3, color="#1f77b4", label="68th percentile")
+    axes[8].set_ylabel("Policy μ (post-tanh)")
+    axes[8].set_xlabel("Time (s)")
+    axes[8].legend(loc="upper right")
+    axes[8].grid(alpha=0.3)
+    axes[8].set_title("Policy Output Distribution")
 
     fig.suptitle(f"Sequence diagnostics: {trace.get('sequence_id', 'unknown')}")
     fig.tight_layout(rect=(0, 0.02, 1, 0.98))
