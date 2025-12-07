@@ -7,6 +7,45 @@ from .generator import BatchTargetGenerator, GeneratorConfig, generate_batch_tar
 from .feasibility import VehicleCapabilities
 
 
+def extended_params_to_vehicle_capabilities(extended_params, device: torch.device = None) -> VehicleCapabilities:
+    """Convert ExtendedPlantParams to VehicleCapabilities for feasibility checking.
+    
+    Args:
+        extended_params: ExtendedPlantParams object from dynamics
+        device: Torch device (defaults to CPU)
+        
+    Returns:
+        VehicleCapabilities object for feasibility checking
+    """
+    if device is None:
+        device = torch.device('cpu')
+    
+    # Calculate max current from V_max and R (stall current)
+    i_max = extended_params.motor.V_max / extended_params.motor.R
+    
+    # Get gearbox efficiency (assume it's in the params, or use default)
+    # Note: eta_gb is not directly in ExtendedPlantParams, so we'll use a default
+    # This should ideally be passed separately or added to ExtendedPlantParams
+    eta_gb = 0.9  # Default gearbox efficiency
+    
+    return VehicleCapabilities(
+        m=torch.tensor([extended_params.body.mass], device=device),
+        r_w=torch.tensor([extended_params.wheel.radius], device=device),
+        gear_ratio=torch.tensor([extended_params.motor.gear_ratio], device=device),
+        eta_gb=torch.tensor([eta_gb], device=device),  # TODO: Add to ExtendedPlantParams
+        K_t=torch.tensor([extended_params.motor.K_t], device=device),
+        K_e=torch.tensor([extended_params.motor.K_e], device=device),
+        R=torch.tensor([extended_params.motor.R], device=device),
+        i_max=torch.tensor([i_max], device=device),
+        V_max=torch.tensor([extended_params.motor.V_max], device=device),
+        b=torch.tensor([extended_params.motor.b], device=device),
+        T_brake_max=torch.tensor([extended_params.brake.T_br_max], device=device),
+        mu=torch.tensor([extended_params.brake.mu], device=device),
+        C_dA=torch.tensor([extended_params.body.drag_area], device=device),  # Includes rho
+        C_r=torch.tensor([extended_params.body.rolling_coeff], device=device)
+    )
+
+
 class SingleEpisodeGenerator:
     """Adapter to generate single episodes from the batch generator."""
 
@@ -28,12 +67,13 @@ class SingleEpisodeGenerator:
         self.device = device or torch.device('cpu')
         self.generator = BatchTargetGenerator(batch_config, batch_size=1, episode_length=1000, device=device)
 
-    def sample(self, length: int, rng: np.random.Generator | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def sample(self, length: int, rng: np.random.Generator | None = None, vehicle: VehicleCapabilities | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Generate a single reference profile and grade profile of given length.
 
         Args:
             length: Length of the profile in steps
             rng: Random number generator (unused, kept for compatibility)
+            vehicle: Optional VehicleCapabilities object. If None, uses default vehicle.
 
         Returns:
             Tuple of (speed_profile, grade_profile) as numpy arrays [length]
@@ -60,12 +100,14 @@ class SingleEpisodeGenerator:
             l_corr=self.batch_config.l_corr,
             sigma_g_stat=self.batch_config.sigma_g_stat,
             g_min=self.batch_config.g_min,
-            g_max=self.batch_config.g_max
+            g_max=self.batch_config.g_max,
+            # Speed limit safety factor (propagate from batch config)
+            speed_limit_safety_factor=self.batch_config.speed_limit_safety_factor
         )
 
-        # Create a dummy vehicle with reasonable parameters
-        # In practice, this should be passed from the environment
-        vehicle = self._create_default_vehicle()
+        # Use provided vehicle or create default
+        if vehicle is None:
+            vehicle = self._create_default_vehicle()
 
         # Generate batch and extract first (only) episode
         generator = BatchTargetGenerator(single_config, batch_size=1, episode_length=length, device=self.device)
@@ -94,6 +136,7 @@ class SingleEpisodeGenerator:
             R=torch.tensor([0.1], device=self.device),
             i_max=torch.tensor([200.0], device=self.device),
             V_max=torch.tensor([400.0], device=self.device),
+            b=torch.tensor([1e-3], device=self.device),  # Motor viscous damping (Nm·s/rad)
             T_brake_max=torch.tensor([2000.0], device=self.device),
             mu=torch.tensor([0.8], device=self.device),
             C_dA=torch.tensor([0.6], device=self.device),  # Includes rho
@@ -139,7 +182,9 @@ def create_reference_generator(
             l_corr=generator_config.get('l_corr', 50.0),
             sigma_g_stat=generator_config.get('sigma_g_stat', 0.002),
             g_min=generator_config.get('g_min', -0.08),
-            g_max=generator_config.get('g_max', 0.08)
+            g_max=generator_config.get('g_max', 0.08),
+            # Speed limit safety factor
+            speed_limit_safety_factor=generator_config.get('speed_limit_safety_factor', 0.75)
         )
     else:
         config = GeneratorConfig(

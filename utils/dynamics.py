@@ -103,12 +103,15 @@ def longitudinal_acceleration(speed: float, commanded_accel: float, params: Vehi
 
 @dataclass(slots=True)
 class MotorParams:
-    R: float = 0.2  # motor resistance (Ω)
+    R: float = 0.2  # armature resistance (Ω)
+    L: float = 1e-3  # armature inductance (H) - CTMS model
     K_e: float = 0.2  # back-EMF constant (V/(rad/s))
     K_t: float = 0.2  # torque constant (Nm/A)
-    B_m: float = 1e-3  # motor damping (Nm/(rad/s))
+    b: float = 1e-3  # viscous friction (Nm·s/rad) - was B_m
+    J: float = 1e-3  # rotor inertia (kg·m²) - CTMS model
     V_max: float = 400.0  # max motor voltage (V)
     gear_ratio: float = 10.0  # gear reduction ratio
+    eta_gb: float = 0.9  # gearbox efficiency
 
 
 @dataclass(slots=True)
@@ -146,37 +149,49 @@ class ExtendedPlantParams:
 
 @dataclass(slots=True)
 class ExtendedPlantRandomization:
-    """Configuration for randomizing extended plant parameters."""
+    """Configuration for randomizing extended plant parameters.
+    
+    Ranges are based on realistic vehicle/motor specifications.
+    Use log-uniform sampling for params spanning orders of magnitude (R, L, K_t, b, J_m).
+    Use uniform sampling for other parameters.
+    """
 
     # Basic vehicle parameters
-    mass_range: Tuple[float, float] = (1500.0, 3500.0)  # kg
-    drag_area_range: Tuple[float, float] = (0.55, 0.85)  # m²
-    rolling_coeff_range: Tuple[float, float] = (0.008, 0.02)
-    actuator_tau_range: Tuple[float, float] = (0.05, 0.30)  # seconds
-    grade_deg_range: Tuple[float, float] = (-5.0, 5.0)  # degrees
+    mass_range: Tuple[float, float] = (1500.0, 6000.0)  # kg - vehicle mass (per doc)
+    drag_area_range: Tuple[float, float] = (0.2, 0.8)   # CdA (m²) - drag coefficient * area
+    rolling_coeff_range: Tuple[float, float] = (0.007, 0.015)  # C_rr - rolling resistance
+    actuator_tau_range: Tuple[float, float] = (0.05, 0.30)  # seconds - actuator time constant
+    grade_deg_range: Tuple[float, float] = (-5.7, 5.7)  # degrees - ±10% grade
 
-    # Motor parameters
-    motor_Vmax_range: Tuple[float, float] = (200.0, 800.0)  # V
-    motor_R_range: Tuple[float, float] = (0.05, 0.5)  # Ω
-    motor_K_range: Tuple[float, float] = (0.1, 0.4)  # Nm/A
-    motor_Bm_range: Tuple[float, float] = (1e-5, 5e-3)  # Nm·s/rad
+    # Motor electrical parameters (log-uniform recommended for R, L, K_t)
+    motor_Vmax_range: Tuple[float, float] = (200.0, 800.0)  # V - motor max voltage
+    motor_R_range: Tuple[float, float] = (0.02, 0.6)  # Ω - armature resistance (log-uniform)
+    motor_L_range: Tuple[float, float] = (1e-4, 1e-2)  # H - armature inductance (log-uniform)
+    motor_K_range: Tuple[float, float] = (0.05, 0.4)  # Nm/A and V·s/rad - K_t = K_e (log-uniform)
+    motor_b_range: Tuple[float, float] = (1e-6, 5e-3)  # Nm·s/rad - viscous friction (log-uniform)
+    motor_J_range: Tuple[float, float] = (1e-4, 1e-2)  # kg·m² - rotor inertia (log-uniform)
 
     # Gearbox
-    gear_ratio_range: Tuple[float, float] = (4.0, 20.0)
+    gear_ratio_range: Tuple[float, float] = (4.0, 20.0)  # N - gear reduction ratio
 
     # Brake parameters
-    brake_tau_range: Tuple[float, float] = (0.04, 0.12)  # seconds
-    brake_Tmax_range: Tuple[float, float] = (5000.0, 10000.0)  # Nm
-    brake_p_range: Tuple[float, float] = (0.6, 2.5)
-    brake_kappa_range: Tuple[float, float] = (0.02, 0.25)
-    mu_range: Tuple[float, float] = (0.5, 1.0)
+    brake_tau_range: Tuple[float, float] = (0.04, 0.12)  # seconds - brake time constant
+    brake_Tmax_range: Tuple[float, float] = (5000.0, 60000.0)  # Nm - max brake torque at wheel
+    brake_p_range: Tuple[float, float] = (1.0, 1.8)  # brake exponent (per doc)
+    brake_kappa_range: Tuple[float, float] = (0.02, 0.25)  # brake slip constant
+    mu_range: Tuple[float, float] = (0.7, 1.0)  # tire friction coefficient
 
     # Wheel parameters
-    wheel_radius_range: Tuple[float, float] = (0.25, 0.45)  # m
-    wheel_inertia_range: Tuple[float, float] = (0.5, 4.0)  # kg·m²
+    wheel_radius_range: Tuple[float, float] = (0.26, 0.38)  # m - typical passenger wheel radii
+    wheel_inertia_range: Tuple[float, float] = (0.5, 5.0)  # kg·m² - wheel + rotating assembly
 
     # Efficiency
-    eta_gb_range: Tuple[float, float] = (0.80, 0.98)
+    eta_gb_range: Tuple[float, float] = (0.85, 0.98)  # gearbox efficiency
+    
+    # Feasibility thresholds (for rejection sampling)
+    min_accel_from_rest: float = 2.5  # m/s² - minimum required acceleration at standstill
+    min_brake_decel: float = 4.0  # m/s² - minimum braking deceleration
+    min_top_speed: float = 20.0  # m/s - minimum achievable top speed
 
     @classmethod
     def from_config(cls, config: dict) -> 'ExtendedPlantRandomization':
@@ -186,107 +201,306 @@ class ExtendedPlantRandomization:
 
         vr_config = config['vehicle_randomization']
         return cls(
-            mass_range=tuple(vr_config.get('mass_range', (1500.0, 3500.0))),
-            drag_area_range=tuple(vr_config.get('drag_area_range', (0.55, 0.85))),
-            rolling_coeff_range=tuple(vr_config.get('rolling_coeff_range', (0.008, 0.02))),
+            mass_range=tuple(vr_config.get('mass_range', (1500.0, 6000.0))),
+            drag_area_range=tuple(vr_config.get('drag_area_range', (0.2, 0.8))),
+            rolling_coeff_range=tuple(vr_config.get('rolling_coeff_range', (0.007, 0.015))),
             actuator_tau_range=tuple(vr_config.get('actuator_tau_range', (0.05, 0.30))),
-            grade_deg_range=tuple(vr_config.get('grade_range_deg', (-5.0, 5.0))),
+            grade_deg_range=tuple(vr_config.get('grade_range_deg', (-5.7, 5.7))),
             motor_Vmax_range=tuple(vr_config.get('motor_Vmax_range', (200.0, 800.0))),
-            motor_R_range=tuple(vr_config.get('motor_R_range', (0.05, 0.5))),
-            motor_K_range=tuple(vr_config.get('motor_K_range', (0.1, 0.4))),
-            motor_Bm_range=tuple(vr_config.get('motor_Bm_range', (1e-4, 5e-2))),
+            motor_R_range=tuple(vr_config.get('motor_R_range', (0.02, 0.6))),
+            motor_L_range=tuple(vr_config.get('motor_L_range', (1e-4, 1e-2))),
+            motor_K_range=tuple(vr_config.get('motor_K_range', (0.05, 0.4))),
+            # Support both old 'motor_Bm_range' and new 'motor_b_range' keys
+            motor_b_range=tuple(vr_config.get('motor_b_range', vr_config.get('motor_Bm_range', (1e-6, 5e-3)))),
+            motor_J_range=tuple(vr_config.get('motor_J_range', (1e-4, 1e-2))),
             gear_ratio_range=tuple(vr_config.get('gear_ratio_range', (4.0, 20.0))),
             brake_tau_range=tuple(vr_config.get('brake_tau_range', (0.04, 0.12))),
-            brake_Tmax_range=tuple(vr_config.get('brake_Tmax_range', (5000.0, 10000.0))),
-            brake_p_range=tuple(vr_config.get('brake_p_range', (0.6, 2.5))),
+            brake_Tmax_range=tuple(vr_config.get('brake_Tmax_range', (5000.0, 60000.0))),
+            brake_p_range=tuple(vr_config.get('brake_p_range', (1.0, 1.8))),
             brake_kappa_range=tuple(vr_config.get('brake_kappa_range', (0.02, 0.25))),
-            mu_range=tuple(vr_config.get('mu_range', (0.5, 1.0))),
-            wheel_radius_range=tuple(vr_config.get('wheel_radius_range', (0.25, 0.45))),
-            wheel_inertia_range=tuple(vr_config.get('wheel_inertia_range', (0.5, 4.0))),
-            eta_gb_range=tuple(vr_config.get('eta_gb_range', (0.80, 0.98))),
+            mu_range=tuple(vr_config.get('mu_range', (0.7, 1.0))),
+            wheel_radius_range=tuple(vr_config.get('wheel_radius_range', (0.26, 0.38))),
+            wheel_inertia_range=tuple(vr_config.get('wheel_inertia_range', (0.5, 5.0))),
+            eta_gb_range=tuple(vr_config.get('eta_gb_range', (0.85, 0.98))),
+            # Feasibility thresholds
+            min_accel_from_rest=vr_config.get('min_accel_from_rest', 2.5),
+            min_brake_decel=vr_config.get('min_brake_decel', 4.0),
+            min_top_speed=vr_config.get('min_top_speed', 20.0),
         )
 
 
+def compute_vehicle_capabilities(
+    V_max: float, R: float, K_e: float, K_t: float, b: float, 
+    gear_ratio: float, eta_gb: float, r_w: float, mass: float,
+    CdA: float, C_rr: float, T_brake_max: float
+) -> dict:
+    """Compute derived vehicle capabilities for feasibility checking.
+    
+    Based on new_params_randomization.md specifications.
+    
+    Returns:
+        Dictionary with:
+        - i_stall: Stall current (A)
+        - tau_wheel_drive_max: Max drive torque at wheel (Nm)
+        - F_drive_max0: Max drive force at standstill (N)
+        - v_no_load_max: Max no-load speed (m/s) - back-EMF limit
+        - v_ss_level: Steady-state max speed on level ground (m/s)
+        - a_max_from_rest: Max acceleration from standstill (m/s²)
+        - a_brake_max: Max braking deceleration magnitude (m/s²)
+    """
+    g = GRAVITY
+    
+    # Stall current (at zero speed, V_cmd = V_max)
+    i_stall = V_max / max(R, 1e-9)
+    
+    # Stall motor shaft torque
+    tau_m_stall = K_t * i_stall
+    
+    # Stall wheel torque (accounting for gearbox)
+    tau_wheel_drive_max = eta_gb * gear_ratio * tau_m_stall
+    
+    # Max drive force at standstill
+    F_drive_max0 = tau_wheel_drive_max / max(r_w, 1e-6)
+    
+    # No-load max speed (back-EMF limit): V_max = K_e * omega_m
+    omega_m_no_load = V_max / max(K_e, 1e-9)
+    v_no_load_max = (omega_m_no_load / gear_ratio) * r_w
+    
+    # Resistive forces at standstill
+    F_roll_0 = C_rr * mass * g
+    
+    # Max acceleration from rest (on level ground, no drag yet)
+    a_max_from_rest = (F_drive_max0 - F_roll_0) / mass
+    
+    # Steady-state max speed under full throttle (on level ground)
+    # Solve: F_drive_avail(v) = F_resist(v) numerically
+    v_ss_level = _compute_steady_state_speed(
+        V_max, R, K_e, K_t, b, gear_ratio, eta_gb, r_w, mass, CdA, C_rr, grade=0.0
+    )
+    
+    # Max braking deceleration (at low speed on level ground)
+    # Brake force + resistive forces
+    F_brake_max = T_brake_max / max(r_w, 1e-6)
+    # At low speed, resistive forces are minimal, so approx:
+    a_brake_max = F_brake_max / mass
+    
+    return {
+        'i_stall': i_stall,
+        'tau_wheel_drive_max': tau_wheel_drive_max,
+        'F_drive_max0': F_drive_max0,
+        'v_no_load_max': v_no_load_max,
+        'v_ss_level': v_ss_level,
+        'a_max_from_rest': a_max_from_rest,
+        'a_brake_max': a_brake_max,
+    }
+
+
+def _compute_steady_state_speed(
+    V_max: float, R: float, K_e: float, K_t: float, b: float,
+    gear_ratio: float, eta_gb: float, r_w: float, mass: float,
+    CdA: float, C_rr: float, grade: float = 0.0, tol: float = 0.01
+) -> float:
+    """Compute steady-state max speed under full throttle using bisection.
+    
+    Finds v where F_drive_avail(v) = F_resist(v, grade).
+    """
+    g = GRAVITY
+    
+    def F_drive_avail(v: float) -> float:
+        """Drive force available at speed v."""
+        omega_m = gear_ratio * v / max(r_w, 1e-6)
+        i_max_at_v = max(0.0, (V_max - K_e * omega_m) / max(R, 1e-9))
+        tau_m_net = max(0.0, K_t * i_max_at_v - b * omega_m)
+        tau_wheel = eta_gb * gear_ratio * tau_m_net
+        return tau_wheel / max(r_w, 1e-6)
+    
+    def F_resist(v: float) -> float:
+        """Resistive forces at speed v and grade."""
+        F_aero = CdA * v * v
+        F_roll = C_rr * mass * g * np.cos(grade)
+        F_grade = mass * g * np.sin(grade)
+        return F_aero + F_roll + F_grade
+    
+    # No-load max speed upper bound
+    omega_m_no_load = V_max / max(K_e, 1e-9)
+    v_hi = (omega_m_no_load / gear_ratio) * r_w
+    v_lo = 0.0
+    
+    # Check if starting condition is feasible
+    if F_drive_avail(0.0) < F_resist(0.0):
+        return 0.0  # Can't even start
+    
+    # Bisection to find equilibrium
+    for _ in range(60):
+        v_mid = 0.5 * (v_lo + v_hi)
+        if F_drive_avail(v_mid) >= F_resist(v_mid):
+            v_lo = v_mid
+        else:
+            v_hi = v_mid
+        if v_hi - v_lo < tol:
+            break
+    
+    return v_lo
+
+
+def compute_max_accel_at_speed(
+    v: float, grade: float,
+    V_max: float, R: float, K_e: float, K_t: float, b: float,
+    gear_ratio: float, eta_gb: float, r_w: float, mass: float,
+    CdA: float, C_rr: float
+) -> float:
+    """Compute maximum feasible acceleration at given speed and grade.
+    
+    Uses the no-regen model: i >= 0 always.
+    """
+    g = GRAVITY
+    
+    # Motor angular speed
+    omega_m = gear_ratio * v / max(r_w, 1e-6)
+    
+    # Max current at this speed (no-regen: clamp to 0)
+    i_max_at_v = max(0.0, (V_max - K_e * omega_m) / max(R, 1e-9))
+    
+    # Motor shaft torque (accounting for viscous)
+    tau_m_net = max(0.0, K_t * i_max_at_v - b * omega_m)
+    
+    # Wheel drive torque and force
+    tau_wheel = eta_gb * gear_ratio * tau_m_net
+    F_drive = tau_wheel / max(r_w, 1e-6)
+    
+    # Resistive forces
+    F_aero = CdA * v * abs(v)
+    F_roll = C_rr * mass * g * np.cos(grade)
+    F_grade = mass * g * np.sin(grade)
+    F_resist = F_aero + F_roll + F_grade
+    
+    # Net force and acceleration
+    F_net = F_drive - F_resist
+    a_max = F_net / mass
+    
+    return a_max
+
+
 def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomization) -> ExtendedPlantParams:
-    """Sample plant parameters for the extended dynamics with rejection sampling for acceleration capability."""
+    """Sample plant parameters for the extended dynamics with rejection sampling.
+    
+    Uses log-uniform sampling for electrical/mechanical params that span orders of magnitude.
+    Rejection sampling ensures:
+    - Sufficient acceleration capability from standstill
+    - Sufficient braking capability
+    - Reasonable top speed
+    
+    Based on new_params_randomization.md specifications.
+    """
 
-    # Sample additional parameters
-    wheel_radius = float(rng.uniform(*rand.wheel_radius_range))  # m - wheel radius
-    eta_gb = float(rng.uniform(*rand.eta_gb_range))  # gearbox efficiency
+    def _log_uniform(lo: float, hi: float) -> float:
+        """Sample from log-uniform distribution."""
+        return float(10 ** rng.uniform(np.log10(lo), np.log10(hi)))
 
-    # Rejection sampling loop to ensure 2.5-4.0 m/s² acceleration capability
-    max_attempts = 100
+    # Rejection sampling loop
+    max_attempts = 200
     for attempt in range(max_attempts):
-        # Sample mass and target acceleration
+        # Sample vehicle parameters (uniform)
         mass = float(rng.uniform(*rand.mass_range))
-        a_target = float(rng.uniform(2.5, 4.0))  # m/s²
-
-        # Compute required wheel torque for target acceleration
-        F_required = a_target * mass
-        T_req = F_required * wheel_radius
-
-        # Sample motor parameters
+        CdA = float(rng.uniform(*rand.drag_area_range))
+        C_rr = float(rng.uniform(*rand.rolling_coeff_range))
+        
+        # Sample wheel parameters
+        wheel_radius = float(rng.uniform(*rand.wheel_radius_range))
+        wheel_inertia = _log_uniform(*rand.wheel_inertia_range)
+        
+        # Sample motor electrical parameters
+        # V_max - uniform (user requirement)
         V_max = float(rng.uniform(*rand.motor_Vmax_range))
-        R = float(rng.uniform(*rand.motor_R_range))
-        K_t = float(rng.uniform(*rand.motor_K_range))
-        K_e = K_t  # SI units: K_e = K_t
-        # Sample motor viscous damping (log-uniform as recommended)
-        B_m = 10 ** rng.uniform(np.log10(rand.motor_Bm_range[0]), np.log10(rand.motor_Bm_range[1]))
+        # R - log-uniform (spans orders of magnitude)
+        R = _log_uniform(*rand.motor_R_range)
+        # L - log-uniform
+        L = _log_uniform(*rand.motor_L_range)
+        # K_t, K_e - log-uniform (SI: K_t = K_e)
+        K_t = _log_uniform(*rand.motor_K_range)
+        K_e = K_t  # SI units: K_e = K_t for DC motor
+        # b - log-uniform (viscous friction)
+        b = _log_uniform(*rand.motor_b_range)
+        # J - log-uniform (rotor inertia)
+        J = _log_uniform(*rand.motor_J_range)
+        
+        # Gearbox parameters (uniform)
         gear_ratio = float(rng.uniform(*rand.gear_ratio_range))
-
-        # Validate B_m sampling
-        assert rand.motor_Bm_range[0] <= B_m <= rand.motor_Bm_range[1], f"B_m {B_m} out of range {rand.motor_Bm_range}"
-        assert B_m >= 0, f"B_m {B_m} must be non-negative"
-
-        # Relative magnitude check: viscous torque should be much smaller than electromagnetic torque
-        omega_ref = 400.0  # rad/s (≈ 3800 rpm)
-        I_ref = 100.0       # A (reasonable reference current)
-        tau_visc = B_m * omega_ref
+        eta_gb = float(rng.uniform(*rand.eta_gb_range))
+        
+        # Brake parameters
+        T_brake_max = float(rng.uniform(*rand.brake_Tmax_range))
+        
+        # Compute vehicle capabilities
+        caps = compute_vehicle_capabilities(
+            V_max=V_max, R=R, K_e=K_e, K_t=K_t, b=b,
+            gear_ratio=gear_ratio, eta_gb=eta_gb, r_w=wheel_radius, mass=mass,
+            CdA=CdA, C_rr=C_rr, T_brake_max=T_brake_max
+        )
+        
+        # Feasibility checks per new_params_randomization.md section 9
+        # Check 1: Minimum acceleration from rest
+        if caps['a_max_from_rest'] < rand.min_accel_from_rest:
+            continue
+        
+        # Check 2: Minimum top speed (no-load or steady-state)
+        if caps['v_no_load_max'] < rand.min_top_speed:
+            continue
+        if caps['v_ss_level'] < rand.min_top_speed * 0.8:  # Allow some margin
+            continue
+        
+        # Check 3: Minimum braking deceleration
+        if caps['a_brake_max'] < rand.min_brake_decel:
+            continue
+        
+        # Sanity check: viscous torque should be small compared to EM torque
+        omega_ref = 300.0  # rad/s reference
+        I_ref = min(V_max / R, 500.0)  # capped reference current
+        tau_visc = b * omega_ref
         tau_em = K_t * I_ref
-        assert tau_visc < 0.2 * tau_em, f"Viscous torque {tau_visc:.4f} too large compared to EM torque {tau_em:.4f}"
-
-        # Compute theoretical stall torque
+        if tau_visc > 0.2 * tau_em:
+            continue  # Viscous damping too high
+        
+        # Sanity check: reasonable stall current (cap at 2000A for realism)
         i_stall = V_max / R
-        tau_m_stall = K_t * i_stall
-        T_wheel_stall = tau_m_stall * gear_ratio * eta_gb
+        if i_stall > 2000.0:
+            continue
+        
+        # All checks passed - create parameter objects
+        body = BodyParams(
+            mass=mass,
+            drag_area=CdA,
+            rolling_coeff=C_rr,
+            grade_rad=np.deg2rad(float(rng.uniform(*rand.grade_deg_range))),
+        )
+        motor = MotorParams(
+            R=R,
+            L=L,
+            K_e=K_e,
+            K_t=K_t,
+            b=float(b),
+            J=J,
+            V_max=V_max,
+            gear_ratio=gear_ratio,
+            eta_gb=eta_gb,
+        )
+        brake = BrakeParams(
+            T_br_max=T_brake_max,
+            p_br=float(rng.uniform(*rand.brake_p_range)),
+            tau_br=float(rng.uniform(*rand.brake_tau_range)),
+            kappa_c=_log_uniform(*rand.brake_kappa_range),
+            mu=float(rng.uniform(*rand.mu_range)),
+        )
+        wheel = WheelParams(
+            radius=wheel_radius,
+            inertia=wheel_inertia,
+            v_eps=0.1,  # keep fixed
+        )
+        return ExtendedPlantParams(motor=motor, brake=brake, body=body, wheel=wheel)
 
-        # Check if stall torque meets requirements (90%-130% of required)
-        if 0.9 * T_req <= T_wheel_stall <= 1.3 * T_req:
-            # Parameters accepted - create the parameter objects
-            body = BodyParams(
-                mass=mass,
-                drag_area=float(rng.uniform(*rand.drag_area_range)),
-                rolling_coeff=float(rng.uniform(*rand.rolling_coeff_range)),
-                grade_rad=np.deg2rad(float(rng.uniform(*rand.grade_deg_range))),
-            )
-            motor = MotorParams(
-                R=R,
-                K_e=K_e,
-                K_t=K_t,
-                B_m=float(B_m),  # sampled damping
-                V_max=V_max,
-                gear_ratio=gear_ratio,
-            )
-            brake = BrakeParams(
-                T_br_max=float(rng.uniform(*rand.brake_Tmax_range)),
-                p_br=float(rng.uniform(*rand.brake_p_range)),
-                tau_br=float(rng.uniform(*rand.brake_tau_range)),
-                kappa_c=float(10 ** rng.uniform(np.log10(rand.brake_kappa_range[0]), np.log10(rand.brake_kappa_range[1]))),  # log-uniform
-                mu=float(rng.uniform(*rand.mu_range)),
-            )
-            # Sample wheel parameters
-            wheel_inertia = float(10 ** rng.uniform(np.log10(rand.wheel_inertia_range[0]), np.log10(rand.wheel_inertia_range[1])))  # log-uniform
-            wheel = WheelParams(
-                radius=wheel_radius,
-                inertia=wheel_inertia,
-                v_eps=0.1,  # keep fixed
-            )
-            return ExtendedPlantParams(motor=motor, brake=brake, body=body, wheel=wheel)
-
-        # If parameters don't meet requirements, continue to next attempt
-
-    # Fallback if rejection sampling fails (shouldn't happen with reasonable ranges)
-    raise RuntimeError(f"Could not find suitable parameters after {max_attempts} attempts")
+    # Fallback if rejection sampling fails
+    raise RuntimeError(f"Could not find suitable parameters after {max_attempts} attempts. "
+                       f"Consider adjusting parameter ranges in ExtendedPlantRandomization.")
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +517,7 @@ class ExtendedPlantState:
     slip_ratio: float
     action: float
     motor_current: float
+    motor_omega: float  # motor shaft angular speed (rad/s) - CTMS model
     back_emf_voltage: float  # back-EMF voltage (K_e * omega_m)
     V_cmd: float  # commanded voltage (input motor voltage)
     # Forces and torques
@@ -313,6 +528,7 @@ class ExtendedPlantState:
     grade_force: float
     net_force: float
     held_by_brakes: bool  # True when vehicle is held at rest by brakes/static friction
+    coupling_enabled: bool  # True when motor is coupled to wheel (False during braking)
 
 
 class ExtendedPlant:
@@ -332,7 +548,9 @@ class ExtendedPlant:
         self.wheel_omega_prev = self.wheel_omega  # saved from previous substep
         self.brake_torque = 0.0
         self.motor_current = 0.0
-        self.back_emf_voltage = 0.0  # back-EMF voltage
+        # Initialize motor angular speed (CTMS model) - synced to wheel initially
+        self.motor_omega = self.wheel_omega * self.params.motor.gear_ratio  # motor shaft rad/s
+        self.back_emf_voltage = self.params.motor.K_e * self.motor_omega  # back-EMF voltage
         self.V_cmd = 0.0  # commanded voltage (input motor voltage)
         self.last_action = 0.0
         self.slip_ratio = 0.0
@@ -349,6 +567,9 @@ class ExtendedPlant:
         self.motor_current_prev = 0.0
         self.tau_m_prev = 0.0
         self.drive_torque_prev = 0.0
+        # Initialize coupling state (motor coupled to wheel)
+        self._coupling_enabled = True
+        self._coupling_enabled_prev = True
         return self.state
 
     # ------------------------------------------------------------------
@@ -363,6 +584,7 @@ class ExtendedPlant:
             slip_ratio=self.slip_ratio,
             action=self.last_action,
             motor_current=self.motor_current,
+            motor_omega=self.motor_omega,
             back_emf_voltage=self.back_emf_voltage,
             V_cmd=self.V_cmd,
             drive_torque=self.drive_torque,
@@ -372,6 +594,7 @@ class ExtendedPlant:
             grade_force=self.grade_force,
             net_force=self.net_force,
             held_by_brakes=self.held_by_brakes,
+            coupling_enabled=self._coupling_enabled,
         )
 
     # ------------------------------------------------------------------
@@ -391,244 +614,249 @@ class ExtendedPlant:
 
     # ------------------------------------------------------------------
     def _substep(self, action: float, dt: float) -> None:
+        """Single-DOF rigid coupling model: motor always coupled to wheel via gearbox.
+        
+        Based on coupling.md specification:
+        - Motor always coupled to wheels (single rotational DOF)
+        - Brake acts as torque at wheel, reflected to motor shaft
+        - No regeneration: negative current clamped to zero
+        - Uses combined inertia J_eq = J_m + (J_w + m*r_w²) / N²
+        - omega_m is the single source of truth; speed derived from it
+        """
         motor = self.params.motor
         brake_params = self.params.brake
         wheel = self.params.wheel
         body = self.params.body
 
-        # Action → motor voltage mapping (no regen)
+        # ===== ACTION MAPPING =====
         u = action
         u_th = max(0, u)  # throttle: u > 0
-        self.V_cmd = u_th * motor.V_max  # commanded voltage
+        self.V_cmd = u_th * motor.V_max  # commanded voltage (positive forward)
 
         # For braking (u < 0) or coasting (u = 0), motor voltage = 0 (no regen)
         if u <= 0:
             self.V_cmd = 0.0
 
-        # Split action for braking (only when u < 0)
-        brake_cmd = max(-u, 0.0)  # brake: u < 0
+        # Brake command from negative action
+        brake_cmd = max(-u, 0.0)
 
-        # ===== BRAKE TORQUE COMPUTATION (needed for motor coupling) =====
-        # Compute brake torque (opposes current motion direction)
-        # For stable behavior, brake torque should always oppose the vehicle's current motion
-        tau_brake_cmd = max(self.brake_torque, 0.0)  # magnitude (ensure non-negative)
-        if abs(self.speed) > 0.01:  # Moving vehicle
-            tau_brake = -np.sign(self.speed) * tau_brake_cmd  # Oppose motion direction
-        else:  # Nearly stopped
-            tau_brake = -tau_brake_cmd  # Default to opposing forward motion
-
-        # ===== FRICTION LIMITS (needed for motor coupling) =====
-        # Constants for hold/slip logic
-        mu_s = brake_params.mu * 1.05  # static friction (slightly higher than kinetic)
-        mu_k = brake_params.mu          # kinetic friction
-        N_normal = body.mass * GRAVITY
-        F_fric_static = mu_s * N_normal
-        F_fric_kinetic = mu_k * N_normal
-
-        # Parameters for wheel dynamics (needed for motor coupling)
-        B_w = 1e-3  # small viscous damping on wheel (Nm s / rad) - helps numeric stability
-
-        # ===== DC MOTOR MODEL WITH INNER COUPLING =====
-        # Inner motor↔mechanics coupling iteration (cheap fixed-point)
-
-        # Parameters
-        allow_regen = False  # set to True if regeneration is allowed
-        eta_gb = 0.9  # gearbox efficiency (fixed)
-        r_w = wheel.radius
-        I_w = wheel.inertia
-        gear = motor.gear_ratio
-        K_t = motor.K_t
-        K_e = motor.K_e
+        # ===== MOTOR PARAMETERS =====
+        L = motor.L
         R = motor.R
-        B_m = motor.B_m
+        K_e = motor.K_e
+        K_t = motor.K_t
+        b = motor.b  # viscous friction
+        J_m = motor.J  # motor rotor inertia
+        N = motor.gear_ratio
+        eta = motor.eta_gb
+        r_w = wheel.radius
+        J_w = wheel.inertia
 
-        # 1) compute motor torque from current wheel state
-        omega_old = self.wheel_omega
-        omega_m_old = gear * omega_old
-        I_old = (self.V_cmd - K_e * omega_m_old) / max(R, 1e-9)
-        if not allow_regen:
-            I_old = max(I_old, 0.0)
-        tau_m_old = K_t * I_old - B_m * omega_m_old
-        drive_torque_old = gear * tau_m_old * eta_gb
+        # Combined inertia at motor shaft for single-DOF rigid coupling:
+        # J_eff = J_m + (J_w + m * r_w^2) / N^2
+        # 
+        # The wheel and vehicle mass inertias are DIVIDED by N² (not multiplied)
+        # because when the motor spins N times faster than the wheel, the 
+        # reflected inertia is reduced by N² (from energy conservation).
+        # 
+        # Energy: 0.5 * J_w * ω_w² = 0.5 * J_w * (ω_m/N)² = 0.5 * (J_w/N²) * ω_m²
+        # Similarly for vehicle mass: 0.5 * m * v² = 0.5 * (m*r_w²/N²) * ω_m²
+        J_eq = J_m + (J_w + body.mass * r_w ** 2) / (N ** 2)
 
-        # Debug logging for passive torque (optional)
-        debug_motor = False  # set to True for debugging
-        if debug_motor:
-            tau_viscous = -B_m * omega_m_old
-            tau_em = K_t * I_old
-            print(f"[B_m] B_m={B_m:.3e}, omega_m={omega_m_old:.2f}, "
-                  f"tau_viscous={tau_viscous:.4f}, tau_em={tau_em:.4f}")
+        # Current limits
+        I_max = motor.V_max / max(R, 1e-9)  # Stall current
+        allow_regen = False
 
-        # 2) tentative mechanical response using drive_torque_old
-        tau_net_tent = drive_torque_old + tau_brake  # tau_brake computed earlier
-        F_attempt_tent = tau_net_tent / max(r_w, 1e-9)
-        F_tire_tent = float(np.clip(F_attempt_tent, -F_fric_kinetic, F_fric_kinetic))
-        T_contact_tent = F_tire_tent * r_w
-        omega_dot_tent = (tau_net_tent - T_contact_tent - B_w * omega_old) / max(I_w, 1e-9)
-        omega_tent = omega_old + dt * omega_dot_tent
+        # ===== KINEMATICS FROM MOTOR STATE =====
+        # omega_m is the single source of truth
+        omega_m = self.motor_omega
+        omega_w = omega_m / N  # wheel angular speed
+        v_from_rot = omega_w * r_w  # vehicle speed derived from rotation
 
-        # 3) recompute motor torque at tentative omega
-        omega_m_tent = gear * omega_tent
-        I_tent = (self.V_cmd - K_e * omega_m_tent) / max(R, 1e-9)
-        if not allow_regen:
-            I_tent = max(I_tent, 0.0)
-        tau_m_tent = K_t * I_tent - B_m * omega_m_tent
+        # ===== COMPUTE TIRE FORCE =====
+        # Tire force opposes motion (positive when opposing forward)
+        # Use friction model based on current state
+        mu_k = brake_params.mu
+        N_normal = body.mass * GRAVITY
+        F_fric_max = mu_k * N_normal
 
-        # 4) average torques (fixed-point update)
-        tau_m = 0.5 * (tau_m_old + tau_m_tent)
-        self.drive_torque = gear * tau_m * eta_gb
+        # External resistive forces (for tire force calculation)
+        F_drag = 0.5 * body.air_density * body.drag_area * v_from_rot * abs(v_from_rot)
+        v_threshold = 0.1
+        roll_factor = min(1.0, abs(v_from_rot) / v_threshold)
+        F_roll = body.rolling_coeff * body.mass * GRAVITY * roll_factor
+        grade_rad = self._current_grade_rad if self._current_grade_rad is not None else body.grade_rad
+        F_grade = body.mass * GRAVITY * np.sin(grade_rad)
 
-        # Store motor electrical quantities for diagnostics
-        self.back_emf_voltage = K_e * omega_m_old  # use old for consistency with current approach
-        self.motor_current = (self.V_cmd - self.back_emf_voltage) / max(R, 1e-9)
-        if not allow_regen:
-            self.motor_current = max(self.motor_current, 0.0)
+        # Tire force is what the ground applies to accelerate the vehicle
+        # F_tire = m * a + F_resist (to achieve acceleration a)
+        # In steady state or quasi-static, F_tire balances resistive forces
+        # For now, compute based on what the motor can provide minus resistances
+        # This will be updated iteratively
 
-        # Save previous states for next substep coupling
-        self.tau_m_prev = tau_m
-        self.motor_current_prev = self.motor_current
-        self.drive_torque_prev = self.drive_torque
-
-        # ===== BRAKE DYNAMICS =====
+        # ===== COMPUTE BRAKE TORQUE AT WHEEL =====
+        # Brake dynamics (first-order lag)
         T_br_cmd = brake_params.T_br_max * (brake_cmd ** brake_params.p_br)
         self.brake_torque += dt / max(brake_params.tau_br, 1e-4) * (T_br_cmd - self.brake_torque)
 
-        # ===== PHYSICS-ROOTED HOLD & SLIP BRAKING MODEL =====
+        # Brake torque magnitude
+        tau_brake_mag = max(self.brake_torque, 0.0)
 
-        # Constants for hold/slip logic
-        v_lock_threshold = 0.05  # m/s - speed below which we consider "stopped"
-
-        # 1. Compute drive torque and brake command
-        tau_drive = self.drive_torque  # already signed (positive = forward)
-        tau_brake_cmd = max(self.brake_torque, 0.0)  # magnitude (ensure non-negative)
-
-        # 2. Compute brake torque (opposes current motion direction)
-        # For stable behavior, brake torque should always oppose the vehicle's current motion
-        # This prevents oscillations and ensures braking always slows the vehicle
-        if abs(self.speed) > 0.01:  # Moving vehicle
-            tau_brake = -np.sign(self.speed) * tau_brake_cmd  # Oppose motion direction
-        else:  # Nearly stopped
-            tau_brake = -tau_brake_cmd  # Default to opposing forward motion
-
-        # 4. Net torque and attempted tyre force
-        tau_net = tau_drive + tau_brake
-        F_raw = tau_net / max(wheel.radius, 1e-6)
-
-        # 5. Friction limits (already computed earlier)
-
-        # 6. External forces for holding logic
-        F_drag = 0.5 * body.air_density * body.drag_area * self.speed * abs(self.speed)
-        # Speed-dependent rolling resistance (goes to zero at zero speed)
-        v_threshold = 0.1  # m/s - speed below which rolling resistance goes to zero
-        roll_factor = min(1.0, abs(self.speed) / v_threshold)
-        F_roll = body.rolling_coeff * body.mass * GRAVITY * roll_factor
-        F_grade = body.mass * GRAVITY * np.sin(self._current_grade_rad if self._current_grade_rad is not None else body.grade_rad)
-        F_ext = - (F_drag + F_roll + F_grade)
-        F_req_to_hold = -F_ext  # tyre force needed to hold
-
-        # 7. Decide hold vs slip
-        brake_applied = tau_brake_cmd > 1e-3  # Check if brakes are actually applied
-
-        if abs(self.speed) <= v_lock_threshold and brake_applied:
-            # Nearly stopped with brakes applied: check if we can hold
-            if (abs(F_req_to_hold) <= F_fric_static and
-                abs(F_raw) >= abs(F_req_to_hold) * 0.8):  # Brake must be strong enough
-                # Can hold - set tyre force to exactly balance externals
-                self.tire_force = float(F_req_to_hold)
-                self.wheel_speed = 0.0
-                self.held_by_brakes = True
+        # Brake torque opposes current motion direction
+        # Sign convention: positive torque in motor equation accelerates motor forward
+        # So brake should apply negative torque if moving forward, positive if backward
+        # At rest, brake should hold the vehicle
+        v_hold = 0.5  # velocity threshold for "nearly stopped" - wider for stability
+        v_eps = 0.05  # smooth transition zone
+        
+        if abs(v_from_rot) < v_hold and tau_brake_mag > 100.0:
+            # Nearly stopped with brakes applied: clamp motor omega to zero
+            # This prevents oscillation at zero crossing
+            self.held_by_brakes = True
+            # Use a smooth factor that ramps brake effect to zero near zero speed
+            # to prevent discontinuous torque jumps
+            speed_factor = min(1.0, abs(v_from_rot) / max(v_eps, 1e-6))
+            if v_from_rot > 0:
+                tau_brake_wheel = tau_brake_mag * speed_factor
+            elif v_from_rot < 0:
+                tau_brake_wheel = -tau_brake_mag * speed_factor
             else:
-                # Cannot hold - kinetic friction limit from applied torque
-                self.tire_force = float(np.clip(F_raw, -F_fric_kinetic, F_fric_kinetic))
-                self.held_by_brakes = False
-        else:
-            # Moving or no brakes applied: kinetic friction limit
-            self.tire_force = float(np.clip(F_raw, -F_fric_kinetic, F_fric_kinetic))
+                tau_brake_wheel = 0.0
+        elif v_from_rot > v_eps:
+            # Moving forward: brake opposes forward motion
+            tau_brake_wheel = tau_brake_mag
             self.held_by_brakes = False
-
-        # 8. Wheel rotational dynamics with stick/slip behavior
-
-        # Parameters (tunable)
-        B_w = 1e-3  # small viscous damping on wheel (Nm s / rad) - helps numeric stability
-        slip_eps = 1e-3  # m/s threshold to decide slip vs stick (small)
-
-        # Compute wheel linear speed and slip candidate
-        wheel_v = self.wheel_omega * wheel.radius  # m/s linear rim speed
-        v_rel = wheel_v - self.speed               # positive if wheel trying to drive faster than vehicle
-
-        # Determine contact torque and whether we're slipping
-        # (F_attempt is the tyre force that would be produced if full shaft torque transmitted)
-        F_attempt = tau_net / max(wheel.radius, 1e-6)  # N, attempted tyre force from shaft torque
-
-        # Friction limits already computed: F_fric_static, F_fric_kinetic
-
-        # Decide if wheel is sliding: if wheel linear speed differs from vehicle speed beyond slip_eps OR applied torque exceeds static friction
-        is_sliding = False
-        # If wheel is nearly at same linear speed as vehicle, and required tyre force to hold <= static friction, then it's sticking.
-        if abs(v_rel) > slip_eps:
-            # clear sliding: wheel and vehicle speeds diverge
-            is_sliding = True
-        else:
-            # wheel and vehicle locked kinematically -> check if required tyre force to satisfy net translational dynamics <= static friction
-            # External forces computed above: F_ext = -(F_drag + F_roll + F_grade)
-            # F_req_to_hold computed above: tyre force needed to hold vehicle (signed)
-            # If the current attempted force would exceed static friction, slip will occur
-            if abs(F_attempt) > F_fric_static + 1e-9:
-                is_sliding = True
-            else:
-                is_sliding = False
-
-        # Now branch on sliding vs sticking
-        if is_sliding:
-            # SLIDE: tyre force saturates at kinetic friction magnitude (direction opposes slip)
-            # Determine transmitted tyre force from torque attempt but saturated by kinetic friction
-            F_tire = float(np.clip(F_attempt, -F_fric_kinetic, F_fric_kinetic))
-            self.tire_force = F_tire
-            # Contact torque at wheel
-            T_contact = self.tire_force * wheel.radius
-
-            # Integrate wheel rotational dynamics with small viscous damping
-            omega_dot = (tau_net - T_contact - B_w * self.wheel_omega) / max(wheel.inertia, 1e-6)
-            self.wheel_omega = self.wheel_omega + dt * omega_dot
-            # Update vehicle longitudinal dynamics as usual using self.tire_force (already set)
+        elif v_from_rot < -v_eps:
+            # Moving backward: brake opposes backward motion
+            tau_brake_wheel = -tau_brake_mag
             self.held_by_brakes = False
-
         else:
-            # STICK (no slip) — enforce kinematic constraint: wheel linear speed matches vehicle speed
-            # The tyre force is determined by the shaft torque (F_attempt), but cannot exceed static friction
-            # If F_attempt exceeds static friction, we should have detected slip above, so this shouldn't happen
-            self.tire_force = float(np.clip(F_attempt, -F_fric_static, F_fric_static))
-            # No rotational acceleration at the wheel (it rotates with the vehicle)
-            # held_by_brakes remains as set earlier by brake logic above (if holding, True; else False)
+            # In transition zone: smooth interpolation
+            speed_factor = v_from_rot / v_eps  # -1 to +1
+            tau_brake_wheel = tau_brake_mag * speed_factor
+            self.held_by_brakes = tau_brake_mag > 100.0
 
-        # vehicle longitudinal dynamics
-        self.drag_force = 0.5 * body.air_density * body.drag_area * self.speed * abs(self.speed)
-        # Speed-dependent rolling resistance (goes to zero at zero speed)
-        v_threshold = 0.1  # m/s - speed below which rolling resistance goes to zero
-        roll_factor = min(1.0, abs(self.speed) / v_threshold)
-        self.rolling_force = body.rolling_coeff * body.mass * GRAVITY * roll_factor
-        self.grade_force = body.mass * GRAVITY * np.sin(self._current_grade_rad if self._current_grade_rad is not None else body.grade_rad)
+        # ===== COMPUTE TIRE CONTACT TORQUE =====
+        # Tire contact torque at wheel (positive opposes forward motion)
+        # T_tire = F_resist * r_w where F_resist opposes motion
+        T_tire = (F_drag + F_roll + F_grade) * r_w  # Resistive torque at wheel
 
-        # net force on vehicle
+        # ===== REFLECT WHEEL TORQUES TO MOTOR SHAFT =====
+        # Total wheel opposing torque (at rest, only resistive loads)
+        tau_wheel_opp = tau_brake_wheel + T_tire
+        # Reflected to motor shaft
+        tau_reflected = tau_wheel_opp / max(eta * N, 1e-12)
+
+        # ===== ELECTRICAL INTEGRATION =====
+        # Use internal substeps for motor integration
+        motor_substeps = max(1, int(dt / (L / R / 10) + 1))
+        motor_substeps = min(motor_substeps, 20)
+        dt_motor = dt / motor_substeps
+
+        i_curr = self.motor_current
+        omega_m_curr = self.motor_omega
+
+        # Track initial omega sign for zero-crossing detection
+        omega_initial_sign = np.sign(omega_m_curr) if abs(omega_m_curr) > 1e-6 else 0
+        
+        for _ in range(motor_substeps):
+            # Electrical: L di/dt = V - R*i - K_e*ω_m
+            di_dt = (self.V_cmd - R * i_curr - K_e * omega_m_curr) / max(L, 1e-12)
+            i_new = i_curr + dt_motor * di_dt
+
+            # NO REGEN: clamp negative current to zero
+            if not allow_regen:
+                i_new = max(i_new, 0.0)
+            i_new = min(i_new, I_max)
+
+            # Mechanical: J_eq dω_m/dt = K_t*i - b*ω_m - τ_reflected
+            tau_m_shaft = K_t * i_new
+            domega_dt = (tau_m_shaft - b * omega_m_curr - tau_reflected) / max(J_eq, 1e-12)
+            omega_m_new = omega_m_curr + dt_motor * domega_dt
+
+            # Prevent sign change when brakes are applied (would cause oscillation)
+            # If braking and omega is about to cross zero, clamp to zero
+            if brake_cmd > 0.1:
+                if omega_initial_sign > 0 and omega_m_new < 0:
+                    omega_m_new = 0.0
+                elif omega_initial_sign < 0 and omega_m_new > 0:
+                    omega_m_new = 0.0
+            
+            # Clamp motor omega to reasonable range
+            omega_m_max = motor.V_max / max(K_e, 1e-9) * 1.5
+            omega_m_new = float(np.clip(omega_m_new, -omega_m_max, omega_m_max))
+
+            i_curr = i_new
+            omega_m_curr = omega_m_new
+
+        # ===== UPDATE MOTOR STATE =====
+        self.motor_current = float(i_curr)
+        self.motor_omega = float(omega_m_curr)
+        self.back_emf_voltage = K_e * self.motor_omega
+
+        # ===== COMPUTE DRIVE TORQUE AT WHEEL =====
+        tau_m_shaft = K_t * self.motor_current
+        tau_drive_wheel = eta * N * tau_m_shaft  # positive forward
+
+        # Save for diagnostics
+        self.drive_torque = float(tau_drive_wheel)
+        self.tau_m_prev = tau_m_shaft
+        self.motor_current_prev = self.motor_current
+        self.drive_torque_prev = self.drive_torque
+
+        # ===== COMPUTE TIRE FORCE AND NET FORCE =====
+        F_drive = tau_drive_wheel / r_w  # positive forward
+
+        # Tire force is net of drive and brake at wheel
+        # tau_brake_wheel is signed (positive opposes forward, negative opposes backward)
+        # F_brake = tau_brake_wheel / r_w (signed brake force at tire contact patch)
+        F_brake = tau_brake_wheel / r_w
+        
+        # Tire force = Drive - Brake (both signed)
+        F_tire_raw = F_drive - F_brake
+        
+        # Apply friction limit
+        self.tire_force = float(np.clip(F_tire_raw, -F_fric_max, F_fric_max))
+
+        # Net longitudinal force
+        self.drag_force = F_drag
+        self.rolling_force = F_roll
+        self.grade_force = F_grade
         self.net_force = self.tire_force - self.drag_force - self.rolling_force - self.grade_force
 
-        if self.held_by_brakes:
-            # Held by brakes - no acceleration, speed stays at zero
+        # ===== DERIVE VEHICLE STATE FROM MOTOR (SINGLE SOURCE OF TRUTH) =====
+        # Speed comes directly from omega_m
+        v_old = self.speed
+        v_new = (self.motor_omega / N) * r_w
+        
+        # ===== HELD BY BRAKES / ZERO SPEED CLAMPING =====
+        # If brakes are applied and speed is very low, clamp to zero to prevent oscillation
+        v_hold_clamp = 0.3  # threshold for clamping to zero when brakes applied
+        if brake_cmd > 0.1 and abs(v_new) < v_hold_clamp:
+            # Clamp motor omega to zero (vehicle held)
+            self.motor_omega = 0.0
+            self.motor_current = 0.0
+            v_new = 0.0
+            self.held_by_brakes = True
             self.acceleration = 0.0
-            self.speed = 0.0
-            # In stick mode when held, wheel speed should also be zero
-            self.wheel_omega = 0.0
         else:
-            # Normal dynamics
-            self.acceleration = self.net_force / max(body.mass, 1e-6)
-            self.speed = self.speed + dt * self.acceleration  # Allow negative speeds (reverse)
-            # In stick mode, wheel angular speed should match vehicle linear speed
-            if not is_sliding:  # Only update if we're still in stick mode after speed update
-                self.wheel_omega = self.speed / max(wheel.radius, 1e-6)
+            self.held_by_brakes = False
+            # Compute acceleration from actual speed change (single-DOF consistent)
+            self.acceleration = (v_new - v_old) / max(dt, 1e-6)
+        
+        self.speed = float(v_new)
 
-        self.position += dt * self.speed
+        # Wheel omega follows motor
+        self.wheel_omega = self.motor_omega / N
 
-        # 9. Compute slip ratio (for diagnostics) - now that speed is updated
+        # Update position
+        self.position += self.speed * dt
+
+        # Coupling is always enabled in single-DOF model
+        self._coupling_enabled = True
+
+        # Compute slip ratio (for diagnostics)
+        # In single-DOF model, wheel and vehicle are rigidly coupled, so slip is minimal
         wheel_linear_speed = self.wheel_omega * wheel.radius
         v_ref = max(abs(self.speed), wheel.v_eps)
         self.slip_ratio = (wheel_linear_speed - self.speed) / v_ref

@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover - fallback for classic gym
     from gym import spaces
 
 from utils.data_utils import ReferenceTrajectoryGenerator
-from generator.adapter import create_reference_generator
+from generator.adapter import create_reference_generator, extended_params_to_vehicle_capabilities
 from utils.dynamics import (
     RandomizationConfig,
     VehicleParams,
@@ -350,7 +350,13 @@ class LongitudinalEnv(gym.Env):
             self.grade_profile = np.zeros(length, dtype=np.float32)
         else:
             assert self.reference_generator is not None
-            result = self.reference_generator.sample(length, self._rng)
+            # Convert extended_params to VehicleCapabilities if available
+            vehicle = None
+            if self.extended_params is not None:
+                import torch
+                device = torch.device('cpu')  # Generator uses CPU by default
+                vehicle = extended_params_to_vehicle_capabilities(self.extended_params, device=device)
+            result = self.reference_generator.sample(length, self._rng, vehicle=vehicle)
             if isinstance(result, tuple):
                 # New interface: returns (speed_profile, grade_profile)
                 profile, grade_profile = result

@@ -16,7 +16,12 @@ from generator.samplers import (
     sample_grade_at_positions,
     positions_from_speed
 )
-from generator.feasibility import VehicleCapabilities
+from generator.feasibility import (
+    VehicleCapabilities,
+    FeasibilityParams,
+    project_window_to_feasible,
+    compute_feasible_accelerations,
+)
 
 
 @dataclass
@@ -51,6 +56,9 @@ class GeneratorConfig:
     sigma_g_stat: float = 0.002  # Stationary grade std dev (radians)
     g_min: float = -0.08  # Min grade (radians, ~ -4.6°)
     g_max: float = 0.08  # Max grade (radians, ~ +4.6°)
+
+    # Speed limit safety factor
+    speed_limit_safety_factor: float = 0.75  # Multiplier for max feasible speed (0.75 = 25% reduction)
 
 
 class BatchTargetGenerator:
@@ -100,6 +108,7 @@ class BatchTargetGenerator:
             R=torch.full((self.batch_size,), 0.1, device=self.device),
             i_max=torch.full((self.batch_size,), 200.0, device=self.device),
             V_max=torch.full((self.batch_size,), 400.0, device=self.device),
+            b=torch.full((self.batch_size,), 1e-3, device=self.device),  # Motor viscous damping (Nm·s/rad)
             T_brake_max=torch.full((self.batch_size,), 2000.0, device=self.device),
             mu=torch.full((self.batch_size,), 0.8, device=self.device),
             C_dA=torch.full((self.batch_size,), 0.6, device=self.device),
@@ -193,6 +202,13 @@ class BatchTargetGenerator:
 
         # Compute vehicle-specific LPF rate limits based on feasibility constraints
         rate_max, rate_neg_max = self._compute_vehicle_lpf_limits(vehicle)
+        
+        # Pre-compute max feasible speed once (cached for efficiency)
+        # Apply configurable safety margin for conservative operation
+        from generator.feasibility import compute_max_feasible_speed
+        v_max_theoretical = compute_max_feasible_speed(vehicle)  # [B]
+        v_max_feasible = self.config.speed_limit_safety_factor * v_max_theoretical
+        zero_tensor = torch.tensor(0.0, device=self.device)  # Reusable zero tensor
 
         # Initialize LPF states for each batch element with vehicle-specific limits
         # Convert scalar jerk_max to tensor
@@ -209,8 +225,13 @@ class BatchTargetGenerator:
             device=self.device
         )
 
+        # Reuse feasibility parameters across steps
+        feasibility_params = FeasibilityParams()
+
         # Initialize event states
-        eventual_target = sample_initial_targets(B, self.generator_params, self.device)
+        # Constrain initial targets to max feasible speed
+        eventual_target_raw = sample_initial_targets(B, self.generator_params, self.device)
+        eventual_target = torch.clamp(eventual_target_raw, min=zero_tensor, max=v_max_feasible)
         arrival_deadline = sample_initial_arrival_deadlines(B, self.generator_params, self.device)
         current_event_start = lpf.y.clone()
         start_time = torch.zeros(B, device=self.device)
@@ -243,7 +264,10 @@ class BatchTargetGenerator:
             # Sample new targets and deadlines for changing episodes
             if coin.any():
                 num_changes = coin.sum().item()
-                new_targets = sample_eventual_targets(num_changes, self.generator_params, self.device)
+                new_targets_raw = sample_eventual_targets(num_changes, self.generator_params, self.device)
+                # Constrain new targets to max feasible speed (per batch element)
+                v_max_for_changes = v_max_feasible[coin]
+                new_targets = torch.clamp(new_targets_raw, min=zero_tensor, max=v_max_for_changes)
                 new_deadlines = t_now + sample_arrival_times(num_changes, self.generator_params, self.device)
 
                 # Update only the episodes that change
@@ -258,7 +282,8 @@ class BatchTargetGenerator:
             reached_mask = torch.abs(lpf.y - eventual_target) <= tolerance
 
             # For reached targets, keep current target (ignore timer)
-            u_target = eventual_target.clone()
+            # Constrain u_target to max feasible speed to ensure LPF naturally stays below limit
+            u_target = torch.clamp(eventual_target.clone(), min=zero_tensor, max=v_max_feasible)
 
             # Stochastic acceleration and jerk sampling
             # Compute current feasibility bounds at current LPF output y
@@ -338,8 +363,8 @@ class BatchTargetGenerator:
             # Update LPF by one policy step
             lpf.update(u_target)
 
-            # Ensure non-negative speeds (clamp LPF output to prevent negative speeds)
-            lpf.y = torch.clamp(lpf.y, min=0.0)
+            # Ensure speeds stay within feasible bounds (non-negative and below max feasible speed)
+            lpf.y = torch.clamp(lpf.y, min=zero_tensor, max=v_max_feasible)
 
             # Restore original bounds (they'll be set again next step)
             lpf.rate_max = original_rate_max
@@ -358,12 +383,46 @@ class BatchTargetGenerator:
                     y_h, r_h, u_target, lpf.dt, lpf.wc, lpf.zeta,
                     rate_max, rate_neg_max, jerk_bound, lpf.device
                 )
-                # Ensure non-negative speeds in lookahead
-                y_h = torch.clamp(y_h, min=0.0)
+                # Ensure speeds stay within feasible bounds during lookahead
+                y_h = torch.clamp(y_h, min=zero_tensor, max=v_max_feasible)
                 raw_window[:, h] = y_h
 
-            # Store raw LPF output directly (LPF now enforces feasibility constraints)
-            targets[:, t, :] = raw_window
+            # Since we've constrained targets, LPF input, and LPF output during generation,
+            # the raw_window should already respect the max feasible speed limit.
+            # We now add a fast path: if raw_window already satisfies acceleration bounds,
+            # we skip the expensive projection. Otherwise, we project to the feasible set.
+            grade_window = grades[:, t:t+H] if t + H <= grades.shape[1] else grades[:, t:]
+            if grade_window.shape[1] < H:
+                # Pad with last grade value if needed
+                padding = torch.zeros(B, H - grade_window.shape[1], device=self.device)
+                padding[:] = grade_window[:, -1:].expand(-1, H - grade_window.shape[1])
+                grade_window = torch.cat([grade_window, padding], dim=1)
+
+            # Fast feasibility check: compute accelerations and see if they are within bounds
+            # Raw accelerations from current LPF state and window
+            v_with_current = torch.cat([lpf.y.unsqueeze(-1), raw_window], dim=-1)  # [B, H+1]
+            a_raw = (v_with_current[:, 1:] - v_with_current[:, :-1]) / self.config.dt  # [B, H]
+
+            # Feasible acceleration bounds over the window
+            a_brake_min, a_drive_max = compute_feasible_accelerations(
+                raw_window, grade_window, vehicle, feasibility_params
+            )
+
+            # Check if all accelerations are within feasible bounds (with small tolerance)
+            tol = 1e-5
+            within_lower = a_raw >= (a_brake_min - tol)
+            within_upper = a_raw <= (a_drive_max + tol)
+            all_feasible = bool(torch.all(within_lower & within_upper))
+
+            if all_feasible:
+                feasible_window = raw_window
+            else:
+                # Apply feasibility projection only when needed
+                feasible_window = project_window_to_feasible(
+                    raw_window, grade_window, vehicle, self.config.dt, feasibility_params
+                )
+
+            targets[:, t, :] = feasible_window
 
             # Advance time
             t_now += self.config.dt

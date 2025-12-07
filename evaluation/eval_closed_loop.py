@@ -52,6 +52,7 @@ def run_closed_loop_evaluation(
     policy, env_cfg, _ = load_policy_from_checkpoint(checkpoint, device=device)
 
     # Override environment config if specified
+    raw_config = {}
     if config_path is not None:
         with config_path.open() as fh:
             raw_config = yaml.safe_load(fh)
@@ -93,7 +94,7 @@ def run_closed_loop_evaluation(
             "motor_R": float(env.extended_params.motor.R),
             "motor_K_t": float(env.extended_params.motor.K_t),
             "motor_K_e": float(env.extended_params.motor.K_e),
-            "motor_B_m": float(env.extended_params.motor.B_m),
+            "motor_b": float(env.extended_params.motor.b),
             "motor_gear_ratio": float(env.extended_params.motor.gear_ratio),
             # Brake parameters
             "brake_tau": float(env.extended_params.brake.tau_br),
@@ -182,6 +183,15 @@ def run_closed_loop_evaluation(
         diffs = np.diff(actions)
         action_variances.append(float(np.var(diffs)) if len(diffs) else 0.0)
 
+        # Calculate maximum feasible speed from back-EMF constraint
+        # v_max = V_max * r_w / (K_e * gear_ratio)
+        # Apply configurable safety margin for conservative operation
+        v_max_theoretical = (env.extended_params.motor.V_max * env.extended_params.wheel.radius / 
+                            (env.extended_params.motor.K_e * env.extended_params.motor.gear_ratio))
+        # Get safety factor from config (default to 0.75 if not specified)
+        safety_factor = generator_config.get('speed_limit_safety_factor', 0.75)
+        v_max_feasible = safety_factor * v_max_theoretical
+
         episode_id = f"episode_{episode:03d}"
         per_episode_metrics.append(
             {
@@ -217,6 +227,8 @@ def run_closed_loop_evaluation(
                 "wheel_speed": wheel_speeds,
                 "V_cmd": V_cmds,
                 "V_max": V_maxes,
+                "v_max_feasible": float(v_max_feasible),  # Generation max speed (with safety factor)
+                "v_max_theoretical": float(v_max_theoretical),  # Theoretical max speed from back-EMF = V_max
                 "brake_torque": brake_torques,
                 "brake_torque_max": brake_torque_maxes,
                 "back_emf_voltage": motor_voltages,

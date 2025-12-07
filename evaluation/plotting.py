@@ -67,8 +67,37 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     fig, axes = plt.subplots(9, 1, figsize=(12, 27), sharex=True)
 
     # 1. Speed and ref speed
+    v_max_feasible = trace.get("v_max_feasible", None)  # Generation max speed (with safety factor)
+    v_max_theoretical = trace.get("v_max_theoretical", None)  # Theoretical max speed (back-EMF = V_max)
     axes[0].plot(time, speed, label="Speed")
     axes[0].plot(time, reference, label="Reference", linestyle="--")
+    if v_max_theoretical is not None:
+        axes[0].axhline(
+            y=v_max_theoretical,
+            color="#ff7f0e",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Theoretical max speed ({v_max_theoretical:.1f} m/s)",
+        )
+    if v_max_feasible is not None:
+        axes[0].axhline(
+            y=v_max_feasible,
+            color="#d62728",
+            linestyle=":",
+            linewidth=2,
+            label=f"Generation max speed ({v_max_feasible:.1f} m/s)",
+        )
+
+    # Set ylim based on speed and reference data only (not max feasible speed)
+    if len(speed) > 0 and len(reference) > 0:
+        y_min = min(np.min(speed), np.min(reference))
+        y_max = max(np.max(speed), np.max(reference))
+        y_range = y_max - y_min
+        y_margin = 0.05 * y_range if y_range > 0 else 0.1
+        axes[0].set_ylim(y_min - y_margin, y_max + y_margin)
+    else:
+        axes[0].set_ylim(0, 1.0)
+
     axes[0].set_ylabel("Speed (m/s)")
     axes[0].legend(loc="upper right")
     axes[0].grid(alpha=0.3)

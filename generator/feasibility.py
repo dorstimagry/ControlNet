@@ -6,19 +6,24 @@ import torch
 
 @dataclass
 class VehicleCapabilities:
-    """Vehicle parameters for feasibility checking."""
+    """Vehicle parameters for feasibility checking.
+    
+    Based on new_params_randomization.md specifications.
+    All tensors are shape [B] for batch dimension.
+    """
     m: torch.Tensor          # [B] mass (kg)
     r_w: torch.Tensor        # [B] wheel radius (m)
     gear_ratio: torch.Tensor # [B] gear ratio
     eta_gb: torch.Tensor     # [B] gearbox efficiency
     K_t: torch.Tensor        # [B] motor torque constant (Nm/A)
-    K_e: torch.Tensor        # [B] motor back-EMF constant (V/(rad/s))
+    K_e: torch.Tensor        # [B] motor back-EMF constant (V/(rad/s)) - SI: K_e = K_t
     R: torch.Tensor          # [B] motor resistance (ohm)
-    i_max: torch.Tensor      # [B] max current (A)
+    i_max: torch.Tensor      # [B] max current (A) - typically V_max/R
     V_max: torch.Tensor      # [B] max voltage (V)
-    T_brake_max: torch.Tensor # [B] max brake torque (Nm)
+    b: torch.Tensor          # [B] motor viscous damping (Nm·s/rad)
+    T_brake_max: torch.Tensor # [B] max brake torque at wheel (Nm)
     mu: torch.Tensor         # [B] tire friction coefficient
-    C_dA: torch.Tensor       # [B] drag coefficient * area (kg/m)
+    C_dA: torch.Tensor       # [B] drag coefficient * area (CdA in m²)
     C_r: torch.Tensor        # [B] rolling resistance coefficient
 
 
@@ -28,6 +33,25 @@ class FeasibilityParams:
     safety_margin: float = 0.88  # Safety margin for voltage/current (0.85-0.95)
     max_projection_iters: int = 5  # Maximum iterations for projection
     convergence_tol: float = 1e-3  # Convergence tolerance for projection
+
+
+def compute_max_feasible_speed(vehicle: VehicleCapabilities) -> torch.Tensor:
+    """Compute maximum feasible speed where back-EMF = V_max.
+    
+    When back_EMF >= V_max, the motor cannot produce any drive torque.
+    This gives a hard speed limit: v_max = V_max * r_w / (K_e * gear_ratio)
+    
+    Args:
+        vehicle: Vehicle parameters
+        
+    Returns:
+        Maximum feasible speeds [B] (m/s)
+    """
+    # back_EMF = K_e * gear_ratio * v / r_w
+    # Set back_EMF = V_max and solve for v:
+    # v_max = V_max * r_w / (K_e * gear_ratio)
+    v_max = (vehicle.V_max * vehicle.r_w) / (vehicle.K_e * vehicle.gear_ratio)
+    return v_max
 
 
 def compute_resistive_forces(
@@ -83,21 +107,40 @@ def compute_feasible_accelerations(
     T_wheel_max = (vehicle.i_max * vehicle.K_t * vehicle.eta_gb * vehicle.gear_ratio).unsqueeze(-1)
     a_drive_max_torque = (T_wheel_max / vehicle.r_w.unsqueeze(-1) - F_resist) / vehicle.m.unsqueeze(-1)
 
-    # Voltage/back-EMF constraint for drive (only when accelerating)
-    # alpha = R / (eta_gb * gear_ratio * K_t)
-    # beta = K_e * gear_ratio / r_w
-    # V_req = alpha * T_req + beta * v
-    # T_req = r_w * (m*a + F_resist)
-    # So: V_req = alpha * r_w * (m*a + F_resist) + beta * v
-    # a <= (V_max_eff - beta*v - alpha*r_w*F_resist) / (alpha * r_w * m)
-    alpha = vehicle.R / (vehicle.eta_gb * vehicle.gear_ratio * vehicle.K_t)
-    beta = vehicle.K_e * vehicle.gear_ratio / vehicle.r_w
-    V_max_eff = params.safety_margin * vehicle.V_max.unsqueeze(-1)
-
-    # Avoid division by near-zero alpha
-    alpha_safe = torch.clamp(alpha, min=1e-6).unsqueeze(-1)
-    a_drive_max_voltage = (V_max_eff - beta.unsqueeze(-1) * v - alpha.unsqueeze(-1) * F_resist) / (
-        alpha_safe * vehicle.m.unsqueeze(-1)
+    # Voltage/back-EMF constraint for drive (accounting for b - viscous damping)
+    # Motor model: tau_m = K_t * I - b * omega_m
+    # where I = (V_cmd - back_EMF) / R, back_EMF = K_e * omega_m
+    # omega_m = gear_ratio * v / r_w
+    # T_wheel = tau_m * gear_ratio * eta_gb
+    # F_drive = T_wheel / r_w
+    # a_max = (F_drive - F_resist) / m
+    
+    # Compute motor angular speed and back-EMF
+    omega_m = (vehicle.gear_ratio.unsqueeze(-1) * v) / vehicle.r_w.unsqueeze(-1)  # [B,H]
+    back_EMF = vehicle.K_e.unsqueeze(-1) * omega_m  # [B,H]
+    V_max_eff = params.safety_margin * vehicle.V_max.unsqueeze(-1)  # [B,1]
+    
+    # Current limited by voltage: I = (V_max - back_EMF) / R, clamped to >= 0 (no regen)
+    I_available = torch.clamp((V_max_eff - back_EMF) / vehicle.R.unsqueeze(-1), min=0.0)  # [B,H]
+    
+    # Motor torque: tau_m = K_t * I - b * omega_m
+    tau_m = (vehicle.K_t.unsqueeze(-1) * I_available - 
+             vehicle.b.unsqueeze(-1) * omega_m)  # [B,H]
+    
+    # Wheel torque and drive force
+    T_wheel = tau_m * vehicle.gear_ratio.unsqueeze(-1) * vehicle.eta_gb.unsqueeze(-1)  # [B,H]
+    F_drive = T_wheel / vehicle.r_w.unsqueeze(-1)  # [B,H]
+    
+    # Maximum acceleration from voltage constraint
+    a_drive_max_voltage = (F_drive - F_resist) / vehicle.m.unsqueeze(-1)  # [B,H]
+    
+    # Hard speed limit: when back_EMF >= V_max, motor cannot produce drive torque
+    # Set a_drive_max to 0 (or negative if resistive forces dominate)
+    back_EMF_limit = back_EMF >= V_max_eff
+    a_drive_max_voltage = torch.where(
+        back_EMF_limit,
+        torch.clamp(-F_resist / vehicle.m.unsqueeze(-1), max=0.0),  # Can only decelerate
+        a_drive_max_voltage
     )
 
     # Drive acceleration is limited by both torque and voltage
@@ -138,6 +181,12 @@ def project_window_to_feasible(
     # Initialize with raw window
     v_projected = raw_window.clone()
     v_current = raw_window[:, 0].clone()  # Current speed at start of window
+
+    # Apply hard speed limit from back-EMF constraint
+    v_max = compute_max_feasible_speed(vehicle)  # [B]
+    v_max_expanded = v_max.unsqueeze(-1)  # [B, 1] to broadcast with [B, H]
+    v_projected = torch.clamp(v_projected, min=torch.tensor(0.0, device=v_projected.device), max=v_max_expanded)  # Clamp to [0, v_max]
+    v_current = torch.clamp(v_current, min=torch.tensor(0.0, device=v_current.device), max=v_max)  # Clamp current speed too
 
     # Iterative projection
     for iter_idx in range(params.max_projection_iters):
@@ -192,17 +241,26 @@ def enforce_voltage_at_zero_accel(
     Returns:
         Corrected speed profile [B,H]
     """
-    # Compute required voltage at zero acceleration
+    # Compute required voltage at zero acceleration using corrected motor model
     F_resist = compute_resistive_forces(v_profile, grade_profile, vehicle)
 
-    # At zero accel: T_req = r_w * F_resist (to overcome resistance)
-    # V_req = alpha * T_req + beta * v
-    alpha = vehicle.R / (vehicle.eta_gb * vehicle.gear_ratio * vehicle.K_t)
-    beta = vehicle.K_e * vehicle.gear_ratio / vehicle.r_w
-
-    T_req_zero = vehicle.r_w.unsqueeze(-1) * F_resist
-    V_req_zero = (alpha.unsqueeze(-1) * T_req_zero +
-                  beta.unsqueeze(-1) * torch.abs(v_profile))  # Use abs for back-EMF
+    # Motor model: tau_m = K_t * I - b * omega_m
+    # where I = (V_cmd - back_EMF) / R, back_EMF = K_e * omega_m
+    # omega_m = gear_ratio * v / r_w
+    # At zero accel: T_wheel_req = r_w * F_resist (to overcome resistance)
+    # T_wheel = tau_m * gear_ratio * eta_gb
+    # So: tau_m_req = T_wheel_req / (gear_ratio * eta_gb) = r_w * F_resist / (gear_ratio * eta_gb)
+    
+    omega_m = (vehicle.gear_ratio.unsqueeze(-1) * v_profile) / vehicle.r_w.unsqueeze(-1)  # [B,H]
+    back_EMF = vehicle.K_e.unsqueeze(-1) * omega_m  # [B,H]
+    
+    T_wheel_req = vehicle.r_w.unsqueeze(-1) * F_resist  # [B,H]
+    tau_m_req = T_wheel_req / (vehicle.gear_ratio.unsqueeze(-1) * vehicle.eta_gb.unsqueeze(-1))  # [B,H]
+    
+    # Solve for required voltage: tau_m = K_t * (V_req - back_EMF) / R - b * omega_m
+    # Rearranging: V_req = (tau_m + b * omega_m) * R / K_t + back_EMF
+    V_req_zero = ((tau_m_req + vehicle.b.unsqueeze(-1) * omega_m) * vehicle.R.unsqueeze(-1) / 
+                  vehicle.K_t.unsqueeze(-1) + back_EMF)  # [B,H]
 
     V_max_eff = params.safety_margin * vehicle.V_max.unsqueeze(-1)
 
@@ -220,12 +278,16 @@ def enforce_voltage_at_zero_accel(
                     v_corrected[b, h] = reduce_speed_until_voltage_ok(
                         v_profile[b, h],
                         grade_profile[b, h],
-                        vehicle.m[b],
-                        vehicle.r_w[b],
-                        alpha[b],
-                        beta[b],
-                        F_resist[b, h],
-                        V_max_eff[b, 0],  # Broadcast to scalar
+                        vehicle.m[b].item(),
+                        vehicle.r_w[b].item(),
+                        vehicle.gear_ratio[b].item(),
+                        vehicle.eta_gb[b].item(),
+                        vehicle.K_t[b].item(),
+                        vehicle.K_e[b].item(),
+                        vehicle.R[b].item(),
+                        vehicle.b[b].item(),
+                        F_resist[b, h].item(),
+                        V_max_eff[b, 0].item(),  # Broadcast to scalar
                         v_min=0.0,
                         max_iters=20,
                         tol=1e-3
@@ -241,8 +303,12 @@ def reduce_speed_until_voltage_ok(
     grade: float,
     m: float,
     r_w: float,
-    alpha: float,
-    beta: float,
+    gear_ratio: float,
+    eta_gb: float,
+    K_t: float,
+    K_e: float,
+    R: float,
+    b: float,
     F_resist: float,
     V_max_eff: float,
     v_min: float = 0.0,
@@ -256,8 +322,12 @@ def reduce_speed_until_voltage_ok(
         grade: Road grade
         m: Vehicle mass
         r_w: Wheel radius
-        alpha: Motor constant
-        beta: Back-EMF constant
+        gear_ratio: Gear ratio
+        eta_gb: Gearbox efficiency
+        K_t: Motor torque constant
+        K_e: Motor back-EMF constant
+        R: Motor resistance
+        b: Motor viscous damping (Nm·s/rad)
         F_resist: Resistive force
         V_max_eff: Maximum effective voltage
         v_min: Minimum speed to consider
@@ -274,9 +344,17 @@ def reduce_speed_until_voltage_ok(
     for _ in range(max_iters):
         v_mid = 0.5 * (v_low + v_high)
 
-        # Compute required voltage at this speed
-        T_req_zero = r_w * F_resist
-        V_req = alpha * T_req_zero + beta * abs(v_mid)
+        # Compute required voltage at this speed using corrected motor model
+        omega_m = gear_ratio * v_mid / r_w
+        back_EMF = K_e * omega_m
+        
+        # At zero accel: T_wheel_req = r_w * F_resist
+        T_wheel_req = r_w * F_resist
+        tau_m_req = T_wheel_req / (gear_ratio * eta_gb)
+        
+        # Solve for required voltage: tau_m = K_t * (V_req - back_EMF) / R - b * omega_m
+        # Rearranging: V_req = (tau_m + b * omega_m) * R / K_t + back_EMF
+        V_req = (tau_m_req + b * omega_m) * R / K_t + back_EMF
 
         if V_req > V_max_eff:
             # Voltage too high, reduce speed
