@@ -59,6 +59,11 @@ class LongitudinalEnvConfig:
     negative_speed_weight: float = 1.0  # Penalty weight for negative vehicle speeds
     accel_filter_alpha: float = 0.1  # Exponential smoothing factor for acceleration (0 = no smoothing, 1 = instant)
     base_reward_clip: float = 10000.0
+    # Comfort penalty annealing configuration
+    comfort_anneal_enabled: bool = False  # Enable weight annealing for jerk/smooth_action penalties
+    comfort_anneal_start_mult: float = 0.0  # Starting multiplier (0 = no penalty at start)
+    comfort_anneal_end_mult: float = 1.0  # Ending multiplier (1 = full penalty at end)
+    comfort_anneal_steps: int = 500000  # Number of steps to anneal over
     # Deprecated parameters (kept for backward compatibility with config files)
     force_initial_speed_zero: bool = False  # Ignored - new generator handles feasibility
     post_feasibility_smoothing: bool = False  # Ignored - new generator handles feasibility
@@ -126,6 +131,7 @@ class LongitudinalEnv(gym.Env):
         self._accel_noise_std: float = 0.1
         self._ref_idx: int = 0
         self._step_count: int = 0
+        self._global_step_count: int = 0  # Global step counter for weight annealing (persists across episodes)
         self.speed: float = 0.0
         self.prev_speed: float = 0.0
         self._prev_prev_speed: float = 0.0  # Speed from 2 steps ago (for jerk estimation)
@@ -141,6 +147,36 @@ class LongitudinalEnv(gym.Env):
     def seed(self, seed: int | None = None) -> None:  # pragma: no cover
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+
+    def set_global_step(self, step: int) -> None:
+        """Set the global step count for weight annealing.
+        
+        Call this from the training loop to update the annealing progress.
+        
+        Args:
+            step: Current global training step count
+        """
+        self._global_step_count = step
+
+    def get_comfort_anneal_multiplier(self) -> float:
+        """Compute the current annealing multiplier for comfort penalties.
+        
+        Returns a value that linearly interpolates from start_mult to end_mult
+        over the configured annealing steps.
+        
+        Returns:
+            float: Current multiplier in [start_mult, end_mult]
+        """
+        if not self.config.comfort_anneal_enabled:
+            return 1.0  # No annealing, use full weights
+        
+        start = self.config.comfort_anneal_start_mult
+        end = self.config.comfort_anneal_end_mult
+        total_steps = max(self.config.comfort_anneal_steps, 1)
+        
+        # Linear interpolation, clamped to [start, end]
+        progress = min(self._global_step_count / total_steps, 1.0)
+        return start + progress * (end - start)
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         if seed is not None:
@@ -279,10 +315,11 @@ class LongitudinalEnv(gym.Env):
 
             reward += self.config.horizon_penalty_weight * horizon_penalty
 
-        # Other penalties
-        reward -= self.config.jerk_weight * abs(jerk)
+        # Other penalties (comfort penalties use annealing multiplier)
+        comfort_mult = self.get_comfort_anneal_multiplier()
+        reward -= comfort_mult * self.config.jerk_weight * abs(jerk)
         reward -= self.config.action_weight * (abs(action_value))
-        reward -= self.config.smooth_action_weight * abs(action_value - self._prev_action)
+        reward -= comfort_mult * self.config.smooth_action_weight * abs(action_value - self._prev_action)
         if self.config.use_extended_plant and plant_state is not None:
             reward -= self.config.brake_weight * abs(plant_state.brake_torque)
 

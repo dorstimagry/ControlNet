@@ -13,6 +13,13 @@ env:
   jerk_weight: 0.1          # Penalty weight for acceleration changes (smoothness)
   smooth_action_weight: 10.0 # Penalty weight for action changes (stability)
   track_weight: 1.0         # Weight for speed tracking error in reward
+  
+  # Comfort penalty annealing - gradually increase comfort penalties during training
+  # This allows the agent to first learn tracking, then refine for smoothness
+  comfort_anneal_enabled: true   # Enable/disable comfort penalty annealing
+  comfort_anneal_start_mult: 0.0  # Multiplier at training start (0 = no comfort penalty)
+  comfort_anneal_end_mult: 1.0    # Multiplier at end of annealing (1 = full comfort penalty)
+  comfort_anneal_steps: 500000    # Number of steps to anneal over (linear interpolation)
   voltage_weight: 0.0       # Penalty weight for motor voltage (set to 0 to disable)
 
   # Simulation parameters
