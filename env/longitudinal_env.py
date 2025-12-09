@@ -107,7 +107,9 @@ class LongitudinalEnv(gym.Env):
             low=np.array([self.config.action_low], dtype=np.float32),
             high=np.array([self.config.action_high], dtype=np.float32),
         )
-        obs_dim = 1 + self.preview_steps  # [speed] + [current_ref + future_refs]
+        # Observation: [speed, prev_speed, prev_prev_speed, prev_action] + [refs]
+        # This allows the agent to estimate acceleration, jerk, and action smoothness
+        obs_dim = 4 + self.preview_steps
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self.params: VehicleParams | None = None
@@ -126,6 +128,7 @@ class LongitudinalEnv(gym.Env):
         self._step_count: int = 0
         self.speed: float = 0.0
         self.prev_speed: float = 0.0
+        self._prev_prev_speed: float = 0.0  # Speed from 2 steps ago (for jerk estimation)
         self.position: float = 0.0
         self._prev_action: float = 0.0
         self._prev_accel: float = 0.0
@@ -168,6 +171,7 @@ class LongitudinalEnv(gym.Env):
         initial_speed = float(options.get("initial_speed", self.reference[0]))
         self.speed = max(0.0, initial_speed)
         self.prev_speed = self.speed  # Start with consistent prev_speed
+        self._prev_prev_speed = self.speed  # Initialize speed history to initial speed
         self.position = 0.0
         self._prev_action = 0.0
         self._prev_accel = 0.0  # Start with zero acceleration
@@ -287,6 +291,7 @@ class LongitudinalEnv(gym.Env):
             reward -= self.config.negative_speed_weight * abs(self.speed)
         reward = float(np.clip(reward, -self.config.base_reward_clip, self.config.base_reward_clip))
 
+        self._prev_prev_speed = self.prev_speed  # Shift speed history back
         self.prev_speed = self.speed
         self._prev_accel = self._filtered_accel  # Use filtered accel for jerk calculation consistency
         self._prev_action = action_value
@@ -375,8 +380,18 @@ class LongitudinalEnv(gym.Env):
         state = self._last_state
         speed_meas = (state.speed if state else self.speed) + self._rng.normal(0.0, self._speed_noise_std)
 
-        # Only include speed and reference speeds (current + future)
-        base = np.array([speed_meas], dtype=np.float32)
+        # Include speed history and previous action for derivative estimation
+        # Observation: [speed, prev_speed, prev_prev_speed, prev_action, refs...]
+        # This allows the agent to estimate:
+        #   - Acceleration: (speed - prev_speed) / dt
+        #   - Jerk: ((speed - prev_speed) - (prev_speed - prev_prev_speed)) / dt^2
+        #   - Action smoothness: action - prev_action
+        base = np.array([
+            speed_meas,             # Current speed
+            self.prev_speed,        # Previous speed (for acceleration)
+            self._prev_prev_speed,  # Speed from 2 steps ago (for jerk)
+            self._prev_action,      # Previous action (for action smoothness)
+        ], dtype=np.float32)
 
         preview = np.empty(self.preview_steps, dtype=np.float32)
         last_idx = len(self.reference) - 1

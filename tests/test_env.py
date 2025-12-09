@@ -79,7 +79,8 @@ def test_env_accepts_custom_reference_profile() -> None:
     obs, info = env.reset(options={"reference_profile": profile, "initial_speed": 0.0})
     assert env.reference.shape[0] == 50
     assert info["reference_speed"] == profile[0]
-    assert obs.shape == (1 + env.preview_steps,)
+    # Observation: [speed, prev_speed, prev_prev_speed, prev_action] + [refs]
+    assert obs.shape == (4 + env.preview_steps,)
 
 
 def test_profile_feasibility_integration() -> None:
