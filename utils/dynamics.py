@@ -192,6 +192,8 @@ class ExtendedPlantRandomization:
     min_accel_from_rest: float = 2.5  # m/s² - minimum required acceleration at standstill
     min_brake_decel: float = 4.0  # m/s² - minimum braking deceleration
     min_top_speed: float = 20.0  # m/s - minimum achievable top speed
+    skip_feasibility_checks: bool = False  # If True, skip feasibility checks (fitted params mode)
+    skip_sanity_checks: bool = False  # If True, skip sanity checks (viscous torque, stall current)
 
     @classmethod
     def from_config(cls, config: dict) -> 'ExtendedPlantRandomization':
@@ -226,6 +228,37 @@ class ExtendedPlantRandomization:
             min_accel_from_rest=vr_config.get('min_accel_from_rest', 2.5),
             min_brake_decel=vr_config.get('min_brake_decel', 4.0),
             min_top_speed=vr_config.get('min_top_speed', 20.0),
+            skip_feasibility_checks=vr_config.get('skip_feasibility_checks', False),
+            skip_sanity_checks=vr_config.get('skip_sanity_checks', False),
+        )
+
+    @classmethod
+    def from_fitted_params(
+        cls,
+        fitted_params_path: str,
+        spread_pct: float = 0.1,
+    ) -> 'ExtendedPlantRandomization':
+        """Create ExtendedPlantRandomization centered on fitted vehicle parameters.
+        
+        This factory method loads fitted parameters from a JSON file and creates
+        a randomization config with ranges centered around the fitted values.
+        
+        Args:
+            fitted_params_path: Path to fitted_params.json file
+            spread_pct: Spread percentage around fitted means (default: 0.1 = ±10%)
+            
+        Returns:
+            ExtendedPlantRandomization with ranges centered on fitted params
+        """
+        from pathlib import Path
+        from fitting.randomization_config import (
+            CenteredRandomizationConfig,
+            create_extended_randomization_from_fitted,
+        )
+        
+        return create_extended_randomization_from_fitted(
+            Path(fitted_params_path),
+            spread_pct=spread_pct,
         )
 
 
@@ -439,32 +472,36 @@ def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomiz
         )
         
         # Feasibility checks per new_params_randomization.md section 9
-        # Check 1: Minimum acceleration from rest
-        if caps['a_max_from_rest'] < rand.min_accel_from_rest:
-            continue
+        # Skip if explicitly disabled (fitted params mode)
+        if not rand.skip_feasibility_checks:
+            # Check 1: Minimum acceleration from rest
+            if caps['a_max_from_rest'] < rand.min_accel_from_rest:
+                continue
+            
+            # Check 2: Minimum top speed (no-load or steady-state)
+            if caps['v_no_load_max'] < rand.min_top_speed:
+                continue
+            if caps['v_ss_level'] < rand.min_top_speed * 0.8:  # Allow some margin
+                continue
+            
+            # Check 3: Minimum braking deceleration
+            if caps['a_brake_max'] < rand.min_brake_decel:
+                continue
         
-        # Check 2: Minimum top speed (no-load or steady-state)
-        if caps['v_no_load_max'] < rand.min_top_speed:
-            continue
-        if caps['v_ss_level'] < rand.min_top_speed * 0.8:  # Allow some margin
-            continue
-        
-        # Check 3: Minimum braking deceleration
-        if caps['a_brake_max'] < rand.min_brake_decel:
-            continue
-        
-        # Sanity check: viscous torque should be small compared to EM torque
-        omega_ref = 300.0  # rad/s reference
-        I_ref = min(V_max / R, 500.0)  # capped reference current
-        tau_visc = b * omega_ref
-        tau_em = K_t * I_ref
-        if tau_visc > 0.2 * tau_em:
-            continue  # Viscous damping too high
-        
-        # Sanity check: reasonable stall current (cap at 2000A for realism)
-        i_stall = V_max / R
-        if i_stall > 2000.0:
-            continue
+        # Sanity checks - skip if flag is set (fitted params mode)
+        if not rand.skip_sanity_checks:
+            # Sanity check: viscous torque should be small compared to EM torque
+            omega_ref = 300.0  # rad/s reference
+            I_ref = min(V_max / R, 500.0)  # capped reference current
+            tau_visc = b * omega_ref
+            tau_em = K_t * I_ref
+            if tau_visc > 0.2 * tau_em:
+                continue  # Viscous damping too high
+            
+            # Sanity check: reasonable stall current (cap at 2000A for realism)
+            i_stall = V_max / R
+            if i_stall > 2000.0:
+                continue
         
         # All checks passed - create parameter objects
         body = BodyParams(

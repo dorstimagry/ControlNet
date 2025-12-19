@@ -54,6 +54,10 @@ class ConfigBundle:
     training: TrainingParams
     output: OutputConfig
     reference_dataset: str | None = None
+    # Fitted vehicle randomization config
+    fitted_params_path: str | None = None
+    fitted_spread_pct: float = 0.1
+    generator_config: Dict[str, Any] | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +67,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--reference-dataset", type=str, default=None)
+    parser.add_argument("--fitted-params", type=str, default=None,
+                        help="Path to fitted_params.json for centered vehicle randomization")
+    parser.add_argument("--fitted-spread", type=float, default=0.1,
+                        help="Spread percentage around fitted params (default: 0.1 = ±10%%)")
     return parser.parse_args()
 
 
@@ -85,6 +93,18 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
     if overrides.num_train_timesteps is not None:
         training_cfg.num_train_timesteps = overrides.num_train_timesteps
     reference_dataset = overrides.reference_dataset or raw.get("reference_dataset")
+    
+    # Fitted vehicle randomization config
+    vr_config = raw.get("vehicle_randomization", {})
+    fitted_params_path = overrides.fitted_params or vr_config.get("fitted_params_path")
+    fitted_spread_pct = overrides.fitted_spread if overrides.fitted_params else vr_config.get("spread_pct", 0.1)
+    
+    # Build generator config from raw config
+    generator_config = {}
+    if "generator" in raw:
+        generator_config["generator"] = raw["generator"]
+    if "vehicle_randomization" in raw:
+        generator_config["vehicle_randomization"] = raw["vehicle_randomization"]
 
     return ConfigBundle(
         seed=seed,
@@ -92,6 +112,9 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
         training=training_cfg,
         output=output,
         reference_dataset=reference_dataset,
+        fitted_params_path=fitted_params_path,
+        fitted_spread_pct=fitted_spread_pct,
+        generator_config=generator_config,
     )
 
 
@@ -410,8 +433,41 @@ def train(config: ConfigBundle) -> None:
         },
     )
 
-    env = LongitudinalEnv(config.env, randomization=RandomizationConfig(), seed=config.seed)
-    eval_env = LongitudinalEnv(config.env, randomization=RandomizationConfig(), seed=config.seed + 1)
+    # Build generator config with vehicle randomization
+    generator_config = config.generator_config or {}
+    
+    # If fitted params specified, create centered randomization
+    if config.fitted_params_path:
+        from utils.dynamics import ExtendedPlantRandomization
+        accelerator.print(f"[setup] Using fitted params from {config.fitted_params_path}")
+        accelerator.print(f"[setup] Spread: ±{config.fitted_spread_pct*100:.0f}%")
+        
+        # Create centered randomization and get its config dict
+        centered_rand = ExtendedPlantRandomization.from_fitted_params(
+            config.fitted_params_path,
+            spread_pct=config.fitted_spread_pct,
+        )
+        # Update generator_config with fitted ranges
+        from fitting.randomization_config import CenteredRandomizationConfig
+        from fitting import FittedVehicleParams
+        fitted = FittedVehicleParams.load(Path(config.fitted_params_path))
+        centered_config = CenteredRandomizationConfig.from_fitted_params(
+            fitted, spread_pct=config.fitted_spread_pct
+        )
+        generator_config.update(centered_config.to_extended_randomization_dict())
+
+    env = LongitudinalEnv(
+        config.env,
+        randomization=RandomizationConfig(),
+        generator_config=generator_config,
+        seed=config.seed,
+    )
+    eval_env = LongitudinalEnv(
+        config.env,
+        randomization=RandomizationConfig(),
+        generator_config=generator_config,
+        seed=config.seed + 1,
+    )
     env.reset(seed=config.seed)
     eval_env.reset(seed=config.seed + 1)
 

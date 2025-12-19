@@ -37,6 +37,8 @@ def test_build_config_bundle_respects_overrides(tmp_path: Path) -> None:
         seed=99,
         output_dir=tmp_path / "out",
         reference_dataset="hf://dataset",
+        fitted_params=None,
+        fitted_spread=0.1,
     )
     bundle = build_config_bundle(raw, args)
 
