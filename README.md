@@ -20,13 +20,25 @@ DiffDynamics/
 │   ├── eval_offline.py            # Offline evaluation script
 │   ├── plotting.py                # Plotting utilities
 │   ├── policy_loader.py           # Policy loading utilities
+│   ├── pid_controller.py          # PID controller for closed-loop evaluation
+│   ├── cpp_onnx_policy.py         # Python wrapper for C++ ONNX inference
+│   ├── cpp_inference/              # C++ ONNX inference module (PyBind11)
+│   │   ├── onnx_policy.h/cpp      # C++ ONNX Runtime wrapper
+│   │   ├── pybind_module.cpp      # PyBind11 bindings
+│   │   └── CMakeLists.txt         # Build configuration
 │   └── results/                   # Evaluation outputs (ignored)
+├── fitting/                       # Vehicle parameter fitting
+│   ├── vehicle_fitter.py          # Parameter fitting from trip data
+│   ├── randomization_config.py    # Centered randomization around fitted params
+│   └── __init__.py
 ├── scripts/                       # Utility scripts
 │   ├── generate_synthetic_dataset.py    # Generate synthetic training data
 │   ├── analyze_dataset_coverage.py      # Dataset analysis tools
 │   ├── build_segment_metadata.py        # Metadata processing
 │   ├── fetch_trips.py                   # Data fetching utilities
 │   ├── parse_trips.py                   # Trip parsing tools
+│   ├── fit_vehicle_params.py            # Fit vehicle params from real data
+│   ├── export_onnx.py                   # Export trained policy to ONNX
 │   └── tune_objective_weights.py        # Hyperparameter tuning
 ├── src/                          # Additional source code
 │   └── data/                     # Data processing modules
@@ -35,15 +47,19 @@ DiffDynamics/
 │   ├── test_dynamics.py          # Dynamics model tests
 │   ├── test_evaluation.py        # Evaluation tests
 │   ├── test_training.py          # Training tests
-│   └── test_data.py              # Data processing tests
+│   ├── test_data.py              # Data processing tests
+│   ├── test_fitting.py           # Parameter fitting tests
+│   └── test_pid_controller.py    # PID controller tests
 ├── training/                     # Training code and configuration
 │   ├── train_sac.py              # Main training script
 │   ├── config.yaml               # Training configuration
 │   └── checkpoints/              # Model checkpoints (ignored)
 ├── utils/                        # Core utilities
-│   ├── dynamics.py               # Vehicle dynamics models
+│   ├── dynamics.py               # Vehicle dynamics models (ExtendedPlant)
 │   ├── data_utils.py             # Data processing utilities
 │   └── __init__.py
+├── examples/                     # Example code
+│   └── cpp_inference/            # C++ ONNX inference example
 ├── .gitignore                    # Git ignore rules
 ├── tuning_results.yaml           # Hyperparameter tuning results
 └── README.md                     # This file
@@ -51,26 +67,59 @@ DiffDynamics/
 
 ## 🚗 System Overview
 
-### Vehicle Model
-- **Pure DC Motor**: Direct wheel drive with gear reduction
-- **Mass Range**: 1500-6000 kg (light cars to heavy trucks)
-- **Motor Power**: 200-800V, 0.05-0.5Ω, 0.1-0.4 Nm/A constants
-- **Gear Ratio**: 4:1 to 20:1 reduction
-- **Rolling Resistance**: Speed-dependent (goes to zero at zero speed)
-- **Guaranteed Performance**: All vehicles can achieve 2.5-4.0 m/s² acceleration
+### Vehicle Model: ExtendedPlant
+
+The system uses a detailed **DC Motor + Nonlinear Brake** vehicle dynamics model with 18 fitted parameters:
+
+#### Core Vehicle Parameters
+- **mass**: Vehicle mass (kg)
+- **drag_area**: Drag coefficient × frontal area (m²)
+- **rolling_coeff**: Rolling resistance coefficient
+- **wheel_radius**: Wheel radius (m)
+- **wheel_inertia**: Wheel rotational inertia (kg·m²)
+
+#### Motor Parameters (DC Motor Model)
+- **motor_V_max**: Maximum motor voltage (V)
+- **motor_R**: Armature resistance (Ω)
+- **motor_L**: Armature inductance (H)
+- **motor_K**: Torque constant = back-EMF constant (Nm/A, V·s/rad)
+- **motor_b**: Viscous friction coefficient (Nm·s/rad)
+- **motor_J**: Rotor inertia (kg·m²)
+- **gear_ratio**: Gear reduction ratio
+- **eta_gb**: Gearbox efficiency
+
+#### Brake Parameters
+- **brake_T_max**: Maximum brake torque at wheel (Nm)
+- **brake_tau**: Brake time constant (s)
+- **brake_p**: Brake exponent (nonlinearity)
+- **brake_kappa**: Brake slip constant
+- **mu**: Tire-road friction coefficient
+
+The model includes:
+- **DC motor dynamics**: First-order electrical dynamics with back-EMF
+- **Nonlinear braking**: Slip-dependent brake torque with time constant
+- **Wheel dynamics**: Rotational inertia and tire forces
+- **Aerodynamic drag**: Speed-squared drag force
+- **Rolling resistance**: Speed-dependent rolling friction
+- **Road grade**: Gravitational force component
 
 ### Control Architecture
 - **Algorithm**: Soft Actor-Critic (SAC) with automatic entropy tuning
 - **Action Space**: [-1, 1] (throttle/brake command)
-- **Observation Space**: [speed] + 30 future reference speeds
+- **Observation Space**: 34 elements
+  - Current speed, previous speeds (2), previous action
+  - 30 future reference speeds (3-second preview at 10Hz)
 - **Horizon**: 3 seconds preview (30 timesteps at 10Hz)
 - **Reward**: Speed tracking + jerk penalty + action regularization + voltage constraints
 
 ### Key Features
 - **Domain Randomization**: Vehicle parameters randomized per episode
+- **Parameter Fitting**: Fit all 18 parameters from real-world trip data
+- **Centered Randomization**: Train on distributions centered around fitted parameters
+- **PID Controller**: Optional PID controller for closed-loop evaluation
+- **C++ ONNX Inference**: Deploy trained policies in C++ via ONNX Runtime
 - **Acceleration Filtering**: Smoothed acceleration for jerk computation
 - **Preview-Based Control**: Agent sees future reference trajectory
-- **Physical Constraints**: Realistic motor limits and vehicle dynamics
 
 ## 🛠️ Installation & Setup
 
@@ -80,8 +129,30 @@ DiffDynamics/
 python --version
 
 # Required packages
-pip install torch gymnasium numpy matplotlib scipy pyyaml
+pip install torch gymnasium numpy matplotlib scipy pyyaml tqdm
+
+# Optional: For ONNX export and C++ inference
+pip install onnx onnxruntime
 ```
+
+### C++ ONNX Inference Setup (Optional)
+
+To use C++ ONNX inference, you need to build the PyBind11 module:
+
+```bash
+cd evaluation/cpp_inference
+mkdir -p build && cd build
+cmake ..
+make
+```
+
+This creates `_cpp_onnx_policy.so` (or `.pyd` on Windows) that can be imported in Python.
+
+**Dependencies:**
+- CMake >= 3.12
+- C++17 compiler
+- ONNX Runtime (included in `onnxruntime-linux-x64-1.16.3/`)
+- PyBind11 (install via `pip install pybind11`)
 
 ### Environment Setup
 ```bash
@@ -91,6 +162,102 @@ cd DiffDynamics
 # Install in development mode
 pip install -e .
 ```
+
+## 🔧 Vehicle Parameter Fitting
+
+Fit all 18 vehicle parameters from real-world trip data to train RL models on distributions close to specific vehicles.
+
+### Basic Usage
+
+```bash
+# Fit parameters from trip data
+python scripts/fit_vehicle_params.py \
+    --data data/processed/NiroEV/NIROEV_HA_02/all_trips_data.pt \
+    --output fitted_params.json
+```
+
+### Advanced Options
+
+```bash
+# Custom optimization settings
+python scripts/fit_vehicle_params.py \
+    --data data/processed/NiroEV/NIROEV_HA_02/all_trips_data.pt \
+    --epochs 5 \
+    --batch-size 20 \
+    --max-iter 50 \
+    --val-fraction 0.2
+
+# Fix specific parameters (use same min/max bounds)
+python scripts/fit_vehicle_params.py \
+    --data data/processed/NiroEV/NIROEV_HA_02/all_trips_data.pt \
+    --mass-bounds 1885 1885  # Fix mass to 1885 kg
+
+# Data filtering options
+python scripts/fit_vehicle_params.py \
+    --data data/processed/NiroEV/NIROEV_HA_02/all_trips_data.pt \
+    --min-speed 0.5 \
+    --max-speed 30.0 \
+    --max-accel 5.0 \
+    --downsample 2  # Use every 2nd sample
+
+# Warmup: try random parameter sets before optimization
+python scripts/fit_vehicle_params.py \
+    --data data/processed/NiroEV/NIROEV_HA_02/all_trips_data.pt \
+    --warmup \
+    --warmup-samples 10
+```
+
+### Fitting Process
+
+1. **Data Loading**: Loads trip data from `.pt` files (speed, throttle, brake, time)
+2. **Segment Creation**: Splits trips into contiguous segments
+3. **Filtering**: Filters by speed, acceleration, segment length, zero-speed fraction
+4. **Downsampling**: Optional downsampling to reduce computation
+5. **Train/Validation Split**: Holds out validation set for early stopping
+6. **Warmup** (optional): Evaluates random parameter sets, picks best as initial guess
+7. **Optimization**: L-BFGS-B optimization minimizing velocity MSE over trajectories
+8. **Checkpointing**: Saves best parameters (by validation loss) to JSON
+
+### Output
+
+The fitting process generates:
+- `fitted_params.json`: Best-fit parameters (all 18 parameters)
+- Console output: Progress bars, RMSE metrics, validation plots
+- Checkpoint file: Saved when validation loss improves
+
+## 🎯 Training with Fitted Parameters
+
+Train RL models on parameter distributions centered around fitted values.
+
+### Using Fitted Parameters
+
+1. **Fit parameters** (see above)
+2. **Create training config** with fitted params:
+
+```yaml
+# training/config_niro_fitted_10pct.yaml
+vehicle_randomization:
+  fitted_params_path: "data/processed/NiroEV/NIROEV_HA_02/fitted_params.json"
+  spread_pct: 0.1  # ±10% spread around fitted mean
+```
+
+3. **Train with config**:
+
+```bash
+python training/train_sac.py \
+    --config training/config_niro_fitted_10pct.yaml \
+    --num-train-timesteps 1000000
+```
+
+### Centered Randomization
+
+The system creates parameter ranges centered on fitted values:
+- **Uniform parameters**: `[mean * (1 - spread), mean * (1 + spread)]`
+- **Log-uniform parameters**: Geometric mean = fitted value, log spread
+- **Positivity constraints**: Only enforces positivity (no hard bounds)
+- **Feasibility checks**: Skipped when using fitted parameters
+
+This enables training on distributions very close to the target vehicle while maintaining some diversity for robustness.
 
 ## 📊 Data Generation
 
@@ -156,6 +323,10 @@ python training/train_sac.py --num-train-timesteps 500000
 
 # Custom output directory
 python training/train_sac.py --output-dir training/custom_run
+
+# Use fitted parameters
+python training/train_sac.py \
+    --config training/config_niro_fitted_10pct.yaml
 ```
 
 ### Hyperparameter Tuning
@@ -170,10 +341,11 @@ Results are saved to `tuning_results.yaml`.
 ## 📈 Evaluation
 
 ### Closed-Loop Evaluation
+
 Evaluate trained policy on reference tracking:
 
 ```bash
-# Evaluate latest checkpoint
+# Basic evaluation
 python evaluation/eval_closed_loop.py \
     --checkpoint training/checkpoints/sac_step_1000000.pt \
     --episodes 10 \
@@ -183,8 +355,61 @@ python evaluation/eval_closed_loop.py \
 python evaluation/eval_closed_loop.py \
     --checkpoint training/checkpoints/sac_step_500000.pt \
     --episodes 20 \
-    --output evaluation/results/custom_eval.json
+    --output evaluation/results/custom_eval.json \
+    --config training/config.yaml
 ```
+
+### PID Controller Integration
+
+Add a PID controller to assist the RL policy:
+
+```bash
+# With PID controller (default: feeds only RL action back to network)
+python evaluation/eval_closed_loop.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --episodes 10 \
+    --pid-kp 0.1 \
+    --pid-ki 0.01 \
+    --pid-kd 0.05 \
+    --pid-integral-min -0.1 \
+    --pid-integral-max 0.1
+
+# Feed combined RL+PID action back to network
+python evaluation/eval_closed_loop.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --episodes 10 \
+    --pid-ki 0.01 \
+    --pid-feedback-combined
+```
+
+**PID Controller Behavior:**
+- **Default**: PID action is treated as "part of the plant" - network only sees its own action
+- **Combined mode**: Network sees the combined (RL + PID) action
+- **Output**: Final action = `clip(RL_action + PID_action, -1, 1)`
+- **Plots**: Show final action, RL contribution, and PID contribution separately
+
+### C++ ONNX Inference Comparison
+
+Compare Python PyTorch inference with C++ ONNX Runtime:
+
+```bash
+# Export model to ONNX first
+python scripts/export_onnx.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --output training/checkpoints/sac_step_1000000.onnx
+
+# Run evaluation with C++ comparison
+python evaluation/eval_closed_loop.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --onnx-model training/checkpoints/sac_step_1000000.onnx \
+    --use-cpp-inference \
+    --episodes 10
+```
+
+The evaluation reports:
+- Maximum difference between Python and C++ outputs
+- Mean difference
+- Number of mismatches (if any)
 
 ### Offline Evaluation
 Evaluate policy against recorded trajectories:
@@ -200,6 +425,7 @@ python evaluation/eval_offline.py \
 - **Acceleration Smoothness**: Variance in acceleration changes
 - **Control Effort**: Total throttle/brake activity
 - **Constraint Satisfaction**: Motor voltage limits, speed bounds
+- **C++ Comparison**: Max/mean differences between Python and C++ inference
 
 ## 🔧 Configuration Details
 
@@ -213,6 +439,8 @@ env:
   max_speed: 25.0                  # Maximum vehicle speed (m/s)
   max_position: 5000.0             # Maximum travel distance (m)
   preview_horizon_s: 3.0           # Reference preview horizon (s)
+  use_extended_plant: true         # Use ExtendedPlant model (18 params)
+  plant_substeps: 5                # Integration substeps per policy step
 ```
 
 #### Reward Weights
@@ -226,16 +454,17 @@ env:
   voltage_weight: 0.0              # Motor voltage constraint
 ```
 
-#### Advanced Settings
+#### Vehicle Randomization
 ```yaml
-env:
-  accel_filter_alpha: 0.2          # Acceleration filtering (0-1)
-  force_initial_speed_zero: false    # Force initial target speed to 0
-  post_feasibility_smoothing: false   # Apply additional smoothing after feasibility projection
-  post_feasibility_alpha: 0.8        # Smoothing factor for post-feasibility smoothing (0-1)
-  horizon_penalty_decay: 0.95      # Future penalty exponential decay
-  use_extended_plant: true         # Use DC motor dynamics
-  plant_substeps: 5                # Integration substeps
+vehicle_randomization:
+  # Option 1: Standard randomization (ranges)
+  mass_range: [1500.0, 6000.0]
+  motor_Vmax_range: [200.0, 800.0]
+  # ... (see ExtendedPlantRandomization for all parameters)
+
+  # Option 2: Fitted parameters mode (centered randomization)
+  fitted_params_path: "data/processed/NiroEV/NIROEV_HA_02/fitted_params.json"
+  spread_pct: 0.1  # ±10% spread around fitted mean
 ```
 
 ### Training Configuration
@@ -250,6 +479,35 @@ training:
   target_entropy_scale: 0.98       # Entropy temperature tuning
 ```
 
+## 🚀 Model Export to ONNX
+
+Export trained policies to ONNX format for deployment:
+
+```bash
+# Basic export
+python scripts/export_onnx.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --output policy.onnx
+
+# Custom opset version
+python scripts/export_onnx.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --output policy.onnx \
+    --opset 17
+
+# Skip validation
+python scripts/export_onnx.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --output policy.onnx \
+    --no-validate
+```
+
+**Output:**
+- `policy.onnx`: ONNX model file
+- `policy.json`: Metadata (obs_dim, action_dim, action_scale, etc.)
+
+The exported model uses deterministic policy (mean action, no stochastic sampling).
+
 ## 🧪 Testing
 
 ### Run All Tests
@@ -262,6 +520,8 @@ pytest tests/test_env.py          # Environment tests
 pytest tests/test_dynamics.py     # Dynamics model tests
 pytest tests/test_training.py     # Training pipeline tests
 pytest tests/test_evaluation.py   # Evaluation tests
+pytest tests/test_fitting.py      # Parameter fitting tests
+pytest tests/test_pid_controller.py  # PID controller tests
 ```
 
 ### Test Coverage
@@ -269,6 +529,8 @@ pytest tests/test_evaluation.py   # Evaluation tests
 - **Dynamics**: Vehicle models, parameter sampling, acceleration capabilities
 - **Training**: SAC implementation, replay buffer, policy updates
 - **Evaluation**: Metric calculation, plotting, policy loading
+- **Fitting**: Parameter optimization, trajectory simulation
+- **PID Controller**: Proportional, integral, derivative terms, windup prevention
 
 ## 📋 Dependencies
 
@@ -277,13 +539,16 @@ pytest tests/test_evaluation.py   # Evaluation tests
 - `gymnasium`: Reinforcement learning environment interface
 - `numpy`: Numerical computations
 - `matplotlib`: Plotting and visualization
-- `scipy`: Scientific computing (stats, signal processing)
+- `scipy`: Scientific computing (optimization, stats, signal processing)
 - `pyyaml`: Configuration file parsing
+- `tqdm`: Progress bars
 
 ### Optional Dependencies
 - `wandb`: Experiment tracking
 - `pytest`: Testing framework
-- `tqdm`: Progress bars
+- `onnx`: ONNX model format
+- `onnxruntime`: ONNX Runtime for inference
+- `pybind11`: C++ Python bindings (for C++ inference)
 - `accelerate`: Multi-GPU training
 
 ## 🎯 Usage Examples
@@ -304,21 +569,34 @@ python evaluation/eval_closed_loop.py \
     --episodes 5 --plot-dir evaluation/results/quick_eval
 ```
 
-### Production Training
+### Production Training with Fitted Parameters
 ```bash
-# Generate large dataset
-python scripts/generate_synthetic_dataset.py \
-    --output data/processed/synthetic/training_data.pt \
-    --num-segments 500 --segment-length 2048 --seed 42
+# 1. Fit parameters from real vehicle data
+python scripts/fit_vehicle_params.py \
+    --data data/processed/NiroEV/NIROEV_HA_02/all_trips_data.pt \
+    --epochs 5 --batch-size 20
 
-# Train with optimized settings
-# (edit training/config.yaml for production settings)
-python training/train_sac.py --num-train-timesteps 2000000
+# 2. Create config with fitted parameters
+# (Edit training/config_niro_fitted_10pct.yaml)
 
-# Comprehensive evaluation
+# 3. Train with fitted parameters (10% spread)
+python training/train_sac.py \
+    --config training/config_niro_fitted_10pct.yaml \
+    --num-train-timesteps 2000000
+
+# 4. Export to ONNX
+python scripts/export_onnx.py \
+    --checkpoint training/checkpoints/sac_step_2000000.pt \
+    --output training/checkpoints/sac_step_2000000.onnx
+
+# 5. Comprehensive evaluation with PID
 python evaluation/eval_closed_loop.py \
     --checkpoint training/checkpoints/sac_step_2000000.pt \
-    --episodes 50 --plot-dir evaluation/results/production_eval
+    --onnx-model training/checkpoints/sac_step_2000000.onnx \
+    --use-cpp-inference \
+    --episodes 50 \
+    --pid-ki 0.01 \
+    --plot-dir evaluation/results/production_eval
 ```
 
 ## 🔬 Research Features
@@ -331,11 +609,30 @@ The agent receives 30 timesteps (3 seconds) of future reference speeds, enabling
 
 ### Domain Randomization
 Vehicle parameters randomized per episode:
-- **Mass**: 1500-6000 kg
-- **Motor voltage**: 200-800V
-- **Resistance**: 0.05-0.5Ω
-- **Gear ratio**: 4:1 to 20:1
-- **Friction**: Variable road conditions
+- **Standard mode**: Full parameter ranges (mass: 1500-6000 kg, motor: 200-800V, etc.)
+- **Fitted mode**: Centered around fitted values with configurable spread (e.g., ±10%)
+- **18 parameters**: All ExtendedPlant parameters can be randomized
+
+### Parameter Fitting
+- **Trajectory-based optimization**: Minimizes velocity MSE over full simulated trips
+- **L-BFGS-B optimization**: Efficient gradient-based optimization
+- **Validation-based early stopping**: Prevents overfitting
+- **Warmup step**: Random parameter search for better initialization
+- **Data filtering**: Speed, acceleration, segment length, zero-speed fraction
+
+### PID Controller
+- **Configurable gains**: kp, ki, kd (default: all 0.0)
+- **Integral saturation**: Prevents windup with configurable limits
+- **Two feedback modes**:
+  - **RL-only** (default): Network sees only its own action (PID as "plant")
+  - **Combined**: Network sees RL + PID action
+- **Visualization**: Separate plots for RL and PID contributions
+
+### C++ ONNX Deployment
+- **ONNX export**: Convert PyTorch models to ONNX format
+- **C++ inference**: PyBind11 module for ONNX Runtime inference
+- **Verification**: Compare Python and C++ outputs during evaluation
+- **Production-ready**: Deterministic policy export for deployment
 
 ### Acceleration Filtering
 - **Exponential smoothing** prevents noisy jerk calculations
@@ -384,21 +681,37 @@ This project is released under the MIT License. See `LICENSE` file for details.
 - Check reward weights in `config.yaml`
 - Verify dataset quality and diversity
 - Ensure sufficient exploration (warmup_steps)
+- Try different learning rates or batch sizes
+
+**Parameter fitting fails:**
+- Check data quality (speed, throttle, brake signals)
+- Adjust filtering parameters (min_speed, max_speed, max_accel)
+- Try warmup step for better initialization
+- Increase batch size or reduce max_iter if optimization is unstable
 
 **Evaluation shows poor performance:**
 - Verify checkpoint path is correct
 - Check if model was fully trained
 - Compare evaluation vs training environments
+- Ensure config file matches training config
+
+**C++ inference doesn't work:**
+- Verify ONNX model was exported correctly
+- Check that C++ module is built (`_cpp_onnx_policy.so` exists)
+- Ensure ONNX Runtime is available in `onnxruntime-linux-x64-1.16.3/`
+- Check CMake and compiler versions
 
 **Memory issues:**
 - Reduce `replay_size` in training config
 - Use smaller `batch_size`
+- Reduce `batch_size` in parameter fitting
 - Consider gradient accumulation
 
 **Slow training:**
 - Enable GPU acceleration if available
 - Reduce model size or batch size
 - Use mixed precision training
+- Reduce `plant_substeps` (may affect accuracy)
 
 ### Support
 For issues and questions:
