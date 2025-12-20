@@ -11,7 +11,7 @@ env:
   horizon_penalty_weight: 0.0  # Weight for future horizon tracking penalties
   horizon_penalty_decay: 0.99  # Exponential decay factor for future penalties (0.9-1.0)
   jerk_weight: 0.1          # Penalty weight for acceleration changes (smoothness)
-  smooth_action_weight: 10.0 # Penalty weight for action changes (stability)
+  smooth_action_weight: 15.0 # Penalty weight for action changes (stability)
   track_weight: 1.0         # Weight for speed tracking error in reward
   
   # Comfort penalty annealing - gradually increase comfort penalties during training
@@ -19,7 +19,7 @@ env:
   comfort_anneal_enabled: true   # Enable/disable comfort penalty annealing
   comfort_anneal_start_mult: 0.0  # Multiplier at training start (0 = no comfort penalty)
   comfort_anneal_end_mult: 1.0    # Multiplier at end of annealing (1 = full comfort penalty)
-  comfort_anneal_steps: 500000    # Number of steps to anneal over (linear interpolation)
+  comfort_anneal_steps: 10000000    # Number of steps to anneal over (linear interpolation)
   voltage_weight: 0.0       # Penalty weight for motor voltage (set to 0 to disable)
 
   # Simulation parameters
@@ -37,7 +37,7 @@ reference_dataset: null         # Path to reference dataset (null = use generato
 seed: 42                        # Random seed for reproducibility
 training:
   # SAC algorithm hyperparameters
-  gamma: 0.99                # Discount factor for future rewards (0.9-0.99)
+  gamma: 0.95                # Discount factor for future rewards (0.9-0.99)
   learning_rate: 0.0003      # Learning rate for policy/critic updates
   tau: 0.01                  # Soft update coefficient for target networks (0.001-0.01)
   target_entropy_scale: 0.98 # Target entropy scaling for automatic temperature tuning

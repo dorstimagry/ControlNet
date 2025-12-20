@@ -45,10 +45,19 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     brake_torque_max = float(trace.get("brake_torque_max", [10000.0])[0])  # Get max brake torque for this vehicle
     V_max = float(trace.get("V_max", [800.0])[0])  # Get max motor voltage for this vehicle
 
-    # Convert to percentages (V_cmd is 0-V_max, brake torque uses actual vehicle max)
-    throttle_pct = (V_cmd / V_max) * 100.0  # Convert to percentage using actual vehicle V_max
-    brake_pct = (brake_torque / brake_torque_max) * 100.0  # Convert to percentage using actual vehicle max
-    action = _to_numpy(trace["action"])
+    # Get action arrays (final, RL, PID)
+    action = _to_numpy(trace["action"])  # Final combined action
+    rl_action = _to_numpy(trace.get("rl_action", action))  # RL action (fallback to final if not present)
+    pid_action = _to_numpy(trace.get("pid_action", np.zeros_like(action)))  # PID action (default to zero if not present)
+    
+    # Convert actions to throttle/brake percentages
+    # Throttle: max(0, action) * 100, Brake: max(0, -action) * 100
+    throttle_pct_final = np.maximum(0, action) * 100.0
+    brake_pct_final = np.maximum(0, -action) * 100.0
+    throttle_pct_rl = np.maximum(0, rl_action) * 100.0
+    brake_pct_rl = np.maximum(0, -rl_action) * 100.0
+    throttle_pct_pid = np.maximum(0, pid_action) * 100.0
+    brake_pct_pid = np.maximum(0, -pid_action) * 100.0
     policy_mean = _to_numpy(trace["policy_pre_tanh_mean"])
     policy_log_std = _to_numpy(trace["policy_log_std"])
     # Force data
@@ -118,7 +127,9 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     axes[2].set_title("Vehicle Jerk")
 
     # 4. Throttle %
-    axes[3].plot(time, throttle_pct, label="Throttle %", color="#1b9e77")
+    axes[3].plot(time, throttle_pct_final, label="Final throttle", color="#1b9e77", linewidth=2)
+    axes[3].plot(time, throttle_pct_rl, label="RL throttle", color="#7570b3", linestyle="--", linewidth=1.5)
+    axes[3].plot(time, throttle_pct_pid, label="PID throttle", color="#e7298a", linestyle="--", linewidth=1.5)
     axes[3].set_ylabel("Throttle %")
     axes[3].set_ylim(0, 100)
     axes[3].legend(loc="upper right")
@@ -126,7 +137,9 @@ def plot_sequence_diagnostics(trace: Mapping[str, object], output_path: Path) ->
     axes[3].set_title("Motor Throttle Command")
 
     # 5. Brake %
-    axes[4].plot(time, brake_pct, label="Brake %", color="#d95f02")
+    axes[4].plot(time, brake_pct_final, label="Final brake", color="#d95f02", linewidth=2)
+    axes[4].plot(time, brake_pct_rl, label="RL brake", color="#7570b3", linestyle="--", linewidth=1.5)
+    axes[4].plot(time, brake_pct_pid, label="PID brake", color="#e7298a", linestyle="--", linewidth=1.5)
     axes[4].set_ylabel("Brake %")
     axes[4].set_ylim(0, 100)
     axes[4].legend(loc="upper right")

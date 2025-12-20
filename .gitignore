@@ -68,6 +68,9 @@ Thumbs.db
 
 # Project-specific ignores
 
+# External dependencies
+onnxruntime-linux-x64-1.16.3/
+
 # Training checkpoints (large files)
 training/checkpoints/
 *.pt
