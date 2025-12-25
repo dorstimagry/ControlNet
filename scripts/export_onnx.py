@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--opset",
         type=int,
-        default=17,
+        default=13,
         help="ONNX opset version",
     )
     parser.add_argument(
@@ -103,7 +103,7 @@ def parse_args() -> argparse.Namespace:
 def export_to_onnx(
     checkpoint_path: Path,
     output_path: Path,
-    opset_version: int = 17,
+    opset_version: int = 13,
     validate: bool = True,
 ) -> dict:
     """Export a trained policy checkpoint to ONNX format.

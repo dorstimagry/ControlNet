@@ -58,6 +58,7 @@ class ConfigBundle:
     fitted_params_path: str | None = None
     fitted_spread_pct: float = 0.1
     generator_config: Dict[str, Any] | None = None
+    resume_from_checkpoint: Path | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +72,12 @@ def parse_args() -> argparse.Namespace:
                         help="Path to fitted_params.json for centered vehicle randomization")
     parser.add_argument("--fitted-spread", type=float, default=0.1,
                         help="Spread percentage around fitted params (default: 0.1 = ±10%%)")
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Path to checkpoint file to resume training from",
+    )
     return parser.parse_args()
 
 
@@ -106,6 +113,8 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
     if "vehicle_randomization" in raw:
         generator_config["vehicle_randomization"] = raw["vehicle_randomization"]
 
+    resume_from_checkpoint = overrides.resume_from if hasattr(overrides, 'resume_from') else None
+    
     return ConfigBundle(
         seed=seed,
         env=env_cfg,
@@ -115,6 +124,7 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
         fitted_params_path=fitted_params_path,
         fitted_spread_pct=fitted_spread_pct,
         generator_config=generator_config,
+        resume_from_checkpoint=resume_from_checkpoint,
     )
 
 
@@ -473,12 +483,43 @@ def train(config: ConfigBundle) -> None:
 
     trainer = SACTrainer(env, eval_env, config, accelerator)
 
+    # Load checkpoint if specified
+    start_step = 0
+    if config.resume_from_checkpoint and config.resume_from_checkpoint.exists():
+        accelerator.print(f"[resume] Loading checkpoint from {config.resume_from_checkpoint}")
+        checkpoint = torch.load(config.resume_from_checkpoint, map_location="cpu", weights_only=False)
+        start_step = checkpoint.get("step", 0)
+        
+        # Load network weights (unwrap from accelerator if needed)
+        unwrapped_policy = accelerator.unwrap_model(trainer.policy)
+        unwrapped_q1 = accelerator.unwrap_model(trainer.q1)
+        unwrapped_q2 = accelerator.unwrap_model(trainer.q2)
+        
+        unwrapped_policy.load_state_dict(checkpoint["policy"])
+        unwrapped_q1.load_state_dict(checkpoint["q1"])
+        unwrapped_q2.load_state_dict(checkpoint["q2"])
+        trainer.target_q1.load_state_dict(checkpoint["target_q1"])
+        trainer.target_q2.load_state_dict(checkpoint["target_q2"])
+        
+        # Load optimizer states
+        trainer.policy_optimizer.load_state_dict(checkpoint["policy_optimizer"])
+        trainer.q_optimizer.load_state_dict(checkpoint["q_optimizer"])
+        trainer.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
+        
+        # Load log_alpha
+        trainer.log_alpha.data = checkpoint["log_alpha"].to(trainer.device)
+        
+        # Update trainer's global step
+        trainer._global_step = start_step
+        
+        accelerator.print(f"[resume] Resuming from step {start_step}")
+
     obs, _ = env.reset(seed=config.seed)
     last_log = time.time()
 
     accelerator.print(f"[setup] num_train_timesteps={config.training.num_train_timesteps}")
     progress = tqdm(
-        range(1, config.training.num_train_timesteps + 1),
+        range(start_step + 1, config.training.num_train_timesteps + 1),
         disable=not accelerator.is_main_process,
         desc="Training",
     )

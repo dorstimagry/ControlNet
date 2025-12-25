@@ -57,6 +57,8 @@ class LongitudinalEnvConfig:
     brake_weight: float = 1e-3
     smooth_action_weight: float = 0.05
     negative_speed_weight: float = 1.0  # Penalty weight for negative vehicle speeds
+    zero_speed_error_weight: float = 0.25  # Penalty weight for speed error when target speed is 0
+    zero_speed_throttle_weight: float = 0.25  # Penalty weight for throttle usage when target speed is 0
     accel_filter_alpha: float = 0.1  # Exponential smoothing factor for acceleration (0 = no smoothing, 1 = instant)
     base_reward_clip: float = 10000.0
     # Comfort penalty annealing configuration
@@ -326,6 +328,17 @@ class LongitudinalEnv(gym.Env):
         # Negative speed penalty
         if self.speed < 0.0:
             reward -= self.config.negative_speed_weight * abs(self.speed)
+        
+        # Zero-speed penalties: when target speed is 0
+        current_ref = float(self.reference[self._ref_idx])
+        if abs(current_ref) < 1e-6:  # Target speed is 0 (with epsilon for floating point)
+            # Penalty for speed error when target is 0 (only if vehicle is moving)
+            if self.speed > 0.0:
+                reward -= self.config.zero_speed_error_weight * abs(self.speed)
+            # Penalty for throttle usage when target is 0 (constant penalty for any positive action)
+            if action_value > 0.0:
+                reward -= self.config.zero_speed_throttle_weight
+        
         reward = float(np.clip(reward, -self.config.base_reward_clip, self.config.base_reward_clip))
 
         self._prev_prev_speed = self.prev_speed  # Shift speed history back

@@ -233,6 +233,10 @@ class FitterConfig:
     use_warmup: bool = False  # enable warmup to find better initial guess
     warmup_samples: int = 10  # number of random parameter sets to try
     warmup_seed: int = 42  # random seed for warmup sampling
+    
+    # === BARRIER FUNCTIONS ===
+    use_barrier: bool = False  # enable interior-point barrier method to avoid active constraints
+    barrier_mu: float = 0.01  # barrier parameter μ (smaller = stronger barrier, keeps params away from boundaries)
 
 
 @dataclass
@@ -284,6 +288,45 @@ class VehicleParamFitter:
         self.config = config or FitterConfig()
         self._segments: List[TripSegment] = []
         self._current_loss: float = 0.0
+        self._bounds: Optional[List[Tuple[float, float]]] = None  # Store bounds for barrier computation
+    
+    def _barrier_penalty(self, params: np.ndarray, bounds: List[Tuple[float, float]]) -> float:
+        """Compute logarithmic barrier penalty to keep parameters away from boundaries.
+        
+        Barrier function: -μ * Σ (log(x_i - l_i) + log(u_i - x_i))
+        
+        Args:
+            params: Parameter vector
+            bounds: List of (min, max) tuples for each parameter
+            
+        Returns:
+            Barrier penalty value (positive, added to loss)
+        """
+        if not self.config.use_barrier:
+            return 0.0
+        
+        mu = self.config.barrier_mu
+        eps = 1e-10  # Small epsilon to prevent log(0) and handle numerical issues
+        
+        penalty_sum = 0.0
+        for i, (x, (l, u)) in enumerate(zip(params, bounds)):
+            # Skip barrier for fixed parameters (min == max)
+            if l == u:
+                continue
+            
+            # Ensure we're within bounds (with small margin for numerical stability)
+            if x <= l + eps or x >= u - eps:
+                # Return large penalty if too close to boundary
+                return 1e10
+            
+            # Compute barrier terms: log(x - l) + log(u - x)
+            # Both terms are negative (since x is between l and u)
+            # We negate the sum and multiply by mu to get positive penalty
+            penalty_sum += np.log(x - l) + np.log(u - x)
+        
+        # Return -mu * sum (negative because we want to add this to loss)
+        # Since penalty_sum is negative, -mu * penalty_sum is positive
+        return -mu * penalty_sum
     
     def load_trip_data(self, data_path: Path) -> Dict[str, Dict[str, np.ndarray]]:
         """Load trip data from .pt file.
@@ -604,7 +647,7 @@ class VehicleParamFitter:
             segments: List of trip segments to simulate
             
         Returns:
-            Mean squared velocity error
+            Mean squared velocity error (with barrier penalty if enabled)
         """
         total_se = 0.0
         total_samples = 0
@@ -616,6 +659,12 @@ class VehicleParamFitter:
             total_samples += segment.length
         
         mse = total_se / total_samples if total_samples > 0 else 0.0
+        
+        # Add barrier penalty if enabled
+        if self.config.use_barrier and self._bounds is not None:
+            barrier_penalty = self._barrier_penalty(params, self._bounds)
+            mse += barrier_penalty
+        
         self._current_loss = mse
         return mse
     
@@ -833,14 +882,16 @@ class VehicleParamFitter:
         data_path: Path,
         verbose: bool = True,
         log_path: Optional[Path] = None,
+        progress_callback: Optional[Callable[[np.ndarray, float], None]] = None,
     ) -> FittedVehicleParams:
         """Fit vehicle parameters by minimizing trajectory velocity error.
-        
+
         Args:
             data_path: Path to trip data (.pt file)
             verbose: Print progress
             log_path: Path to save best-so-far parameters (updated on each improvement)
-            
+            progress_callback: Optional callback called with (best_params, best_loss) when new best is found
+
         Returns:
             Fitted vehicle parameters
         """
@@ -956,6 +1007,9 @@ class VehicleParamFitter:
             cfg.wheel_inertia_bounds,
         ]
         
+        # Store bounds for barrier function computation
+        self._bounds = bounds
+        
         # Warmup: find better initial guess by random sampling
         if cfg.use_warmup:
             warmup_params, warmup_loss = self._run_warmup(
@@ -1035,6 +1089,10 @@ class VehicleParamFitter:
                         # Plot validation trips comparison
                         val_plot_path = data_path.parent / f"validation_trips_epoch{epoch}_batch{b}.png"
                         self._plot_validation_trips(best_params, val_segments, val_plot_path, max_trips=5)
+
+                    # Call progress callback if provided
+                    if progress_callback is not None:
+                        progress_callback(best_params, best_val_loss)
                 
                 # Warm start next batch
                 x0 = result.x

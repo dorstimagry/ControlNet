@@ -386,36 +386,36 @@ def run_closed_loop_evaluation(
             }
         )
         trace_data = {
-            "sequence_id": episode_id,
-            "vehicle_params": vehicle_params,
-            "time": time_axis,
-            "speed": speeds,
-            "reference": references,
-            "acceleration": accelerations,
-            "action": actions,
+                "sequence_id": episode_id,
+                "vehicle_params": vehicle_params,
+                "time": time_axis,
+                "speed": speeds,
+                "reference": references,
+                "acceleration": accelerations,
+                "action": actions,
             "rl_action": rl_actions,
             "pid_action": pid_actions,
-            "policy_pre_tanh_mean": policy_means,
-            "policy_log_std": policy_log_stds,
-            "policy_plan": policy_plans,
-            "jerk": jerks,
-            "wheel_speed": wheel_speeds,
-            "V_cmd": V_cmds,
-            "V_max": V_maxes,
-            "v_max_feasible": float(v_max_feasible),  # Generation max speed (with safety factor)
-            "v_max_theoretical": float(v_max_theoretical),  # Theoretical max speed from back-EMF = V_max
-            "brake_torque": brake_torques,
-            "brake_torque_max": brake_torque_maxes,
-            "back_emf_voltage": motor_voltages,
-            "motor_current": motor_currents,
-            "slip_ratio": slip_ratios,
-            "drive_torque": drive_torques,
-            "tire_force": tire_forces,
-            "drag_force": drag_forces,
-            "rolling_force": rolling_forces,
-            "grade_force": grade_forces,
-            "net_force": net_forces,
-        }
+                "policy_pre_tanh_mean": policy_means,
+                "policy_log_std": policy_log_stds,
+                "policy_plan": policy_plans,
+                "jerk": jerks,
+                "wheel_speed": wheel_speeds,
+                "V_cmd": V_cmds,
+                "V_max": V_maxes,
+                "v_max_feasible": float(v_max_feasible),  # Generation max speed (with safety factor)
+                "v_max_theoretical": float(v_max_theoretical),  # Theoretical max speed from back-EMF = V_max
+                "brake_torque": brake_torques,
+                "brake_torque_max": brake_torque_maxes,
+                "back_emf_voltage": motor_voltages,
+                "motor_current": motor_currents,
+                "slip_ratio": slip_ratios,
+                "drive_torque": drive_torques,
+                "tire_force": tire_forces,
+                "drag_force": drag_forces,
+                "rolling_force": rolling_forces,
+                "grade_force": grade_forces,
+                "net_force": net_forces,
+            }
         
         # Add C++ inference data if available
         if cpp_policy is not None:

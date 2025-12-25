@@ -80,6 +80,9 @@ evaluation/results/
 evaluation/results/plots/
 evaluation/results/*.json
 
+# Fitting results
+fitting/results/
+
 # Documentation files (implementation guides)
 docs/
 

@@ -8,6 +8,8 @@ env:
   action_weight: 0.5       # Penalty weight for action magnitude (reduces aggressive control)
   brake_weight: 0.0001         # Penalty weight for brake usage (set to 0 to disable)
   negative_speed_weight: 10.0   # Penalty weight for negative vehicle speeds (prevents reverse)
+  zero_speed_error_weight: 0.25    # Penalty for speed error when target speed is 0
+  zero_speed_throttle_weight: 0.25 # Penalty for throttle usage when target speed is 0
   horizon_penalty_weight: 0.0  # Weight for future horizon tracking penalties
   horizon_penalty_decay: 0.99  # Exponential decay factor for future penalties (0.9-1.0)
   jerk_weight: 0.1          # Penalty weight for acceleration changes (smoothness)
