@@ -22,6 +22,13 @@ import numpy as np
 from scipy.optimize import minimize
 
 try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
+
+try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
@@ -213,18 +220,18 @@ class FitterConfig:
     min_speed: float = 0.0  # m/s - minimum speed to include
     max_speed: float = 20.0  # m/s - maximum speed to include (filter unrealistic values)
     max_accel: float = 3.0  # m/s² - filter extreme accelerations
-    min_segment_length: int = 150  # minimum timesteps per segment
-    max_segment_length: int = 150  # maximum timesteps per segment (memory)
+    min_segment_length: int = 50  # minimum timesteps per segment
+    max_segment_length: int = 100  # maximum timesteps per segment (memory)
     downsampling_factor: int = 1  # downsample data by taking every Nth sample (1 = no downsampling)
     max_zero_speed_fraction: float = 0.05  # maximum fraction of segments with zero/near-zero speed (0.05 = 5%)
     zero_speed_eps: float = 0.1  # epsilon for zero speed threshold (m/s) - segments with mean speed < eps are considered zero-speed
     
     # === OPTIMIZATION SETTINGS ===
-    max_iter: int = 200  # iterations per optimization call
-    tolerance: float = 1e-9
+    max_iter: int = 50  # iterations per optimization call (reduced for faster convergence)
+    tolerance: float = 1e-6  # relaxed tolerance for faster convergence
     
     # === TRAJECTORY BATCHING ===
-    segments_per_batch: int = 10  # number of trip segments per batch (smaller = faster)
+    segments_per_batch: int = 16  # number of trip segments per batch (smaller = faster)
     num_epochs: int = 1  # number of passes over all segments
     shuffle_segments: bool = True
     validation_fraction: float = 0.1  # fraction of segments for validation
@@ -237,6 +244,38 @@ class FitterConfig:
     # === BARRIER FUNCTIONS ===
     use_barrier: bool = False  # enable interior-point barrier method to avoid active constraints
     barrier_mu: float = 0.01  # barrier parameter μ (smaller = stronger barrier, keeps params away from boundaries)
+    
+    # === GPU ACCELERATION ===
+    use_gpu: bool = True  # use GPU for parallel simulation and loss computation (if available)
+    
+    # === MOTOR MODEL TYPE ===
+    motor_model_type: str = "dc"  # "dc" or "polynomial"
+    fit_dc_from_map: bool = False  # if True, fit DC motor params to match polynomial map after optimization
+    
+    # === POLYNOMIAL MOTOR MAP COEFFICIENTS (order 3 with cross-terms) ===
+    # τ_m = c_00 + c_10*V + c_01*ω + c_20*V² + c_11*V*ω + c_02*ω² + c_30*V³ + c_21*V²*ω + c_12*V*ω² + c_03*ω³
+    # where V = V_cmd/V_max (normalized 0-1), ω = omega_m (rad/s)
+    poly_c_00_init: float = 0.0  # constant term
+    poly_c_10_init: float = 200.0  # V term
+    poly_c_01_init: float = -0.1  # ω term
+    poly_c_20_init: float = 0.0  # V² term
+    poly_c_11_init: float = -0.5  # V*ω term
+    poly_c_02_init: float = 0.0  # ω² term
+    poly_c_30_init: float = 0.0  # V³ term
+    poly_c_21_init: float = 0.0  # V²*ω term
+    poly_c_12_init: float = 0.0  # V*ω² term
+    poly_c_03_init: float = 0.0  # ω³ term
+    
+    poly_c_00_bounds: Tuple[float, float] = (-50.0, 50.0)
+    poly_c_10_bounds: Tuple[float, float] = (0.0, 1000.0)  # V term should be positive
+    poly_c_01_bounds: Tuple[float, float] = (-10.0, 0.0)  # ω term typically negative (back-EMF)
+    poly_c_20_bounds: Tuple[float, float] = (-100.0, 100.0)
+    poly_c_11_bounds: Tuple[float, float] = (-5.0, 0.0)  # V*ω typically negative
+    poly_c_02_bounds: Tuple[float, float] = (-0.01, 0.01)
+    poly_c_30_bounds: Tuple[float, float] = (-200.0, 200.0)
+    poly_c_21_bounds: Tuple[float, float] = (-10.0, 10.0)
+    poly_c_12_bounds: Tuple[float, float] = (-0.1, 0.1)
+    poly_c_03_bounds: Tuple[float, float] = (-0.001, 0.001)
 
 
 @dataclass
@@ -276,19 +315,46 @@ class VehicleParamFitter:
     This forces parameters to be physically consistent over time.
     """
     
-    PARAM_NAMES = [
-        "mass", "drag_area", "rolling_coeff",
-        "motor_V_max", "motor_R", "motor_L", "motor_K", "motor_b", "motor_J",
-        "gear_ratio", "eta_gb",
-        "brake_T_max", "brake_tau", "brake_p", "brake_kappa", "mu",
-        "wheel_radius", "wheel_inertia",
-    ]
+    @property
+    def PARAM_NAMES(self) -> List[str]:
+        """Get parameter names based on motor model type."""
+        if self.config.motor_model_type == "polynomial":
+            return [
+                "mass", "drag_area", "rolling_coeff",
+                "motor_V_max",
+                "poly_c_00", "poly_c_10", "poly_c_01", "poly_c_20", "poly_c_11", "poly_c_02",
+                "poly_c_30", "poly_c_21", "poly_c_12", "poly_c_03",
+                "gear_ratio", "eta_gb",
+                "brake_T_max", "brake_tau", "brake_p", "brake_kappa", "mu",
+                "wheel_radius", "wheel_inertia",
+            ]
+        else:  # DC model
+            return [
+                "mass", "drag_area", "rolling_coeff",
+                "motor_V_max", "motor_R", "motor_L", "motor_K", "motor_b", "motor_J",
+                "gear_ratio", "eta_gb",
+                "brake_T_max", "brake_tau", "brake_p", "brake_kappa", "mu",
+                "wheel_radius", "wheel_inertia",
+            ]
     
     def __init__(self, config: Optional[FitterConfig] = None):
         self.config = config or FitterConfig()
         self._segments: List[TripSegment] = []
         self._current_loss: float = 0.0
         self._bounds: Optional[List[Tuple[float, float]]] = None  # Store bounds for barrier computation
+        
+        # GPU setup
+        self._device = None
+        if self.config.use_gpu:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self._device = torch.device("cuda")
+                    LOGGER.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+                else:
+                    LOGGER.warning("GPU requested but not available, falling back to CPU")
+            except ImportError:
+                LOGGER.warning("PyTorch not available, falling back to CPU")
     
     def _barrier_penalty(self, params: np.ndarray, bounds: List[Tuple[float, float]]) -> float:
         """Compute logarithmic barrier penalty to keep parameters away from boundaries.
@@ -542,6 +608,168 @@ class VehicleParamFitter:
         )
         return filtered
     
+    def _compute_polynomial_motor_torque(
+        self,
+        V_norm: float,
+        omega_m: float,
+        coeffs: np.ndarray,
+    ) -> float:
+        """Compute motor torque from polynomial map.
+        
+        Polynomial: τ_m = c_00 + c_10*V + c_01*ω + c_20*V² + c_11*V*ω + c_02*ω² 
+                   + c_30*V³ + c_21*V²*ω + c_12*V*ω² + c_03*ω³
+        
+        Args:
+            V_norm: Normalized voltage (V_cmd / V_max), range [0, 1]
+            omega_m: Motor angular speed (rad/s)
+            coeffs: Array of 10 coefficients [c_00, c_10, c_01, c_20, c_11, c_02, c_30, c_21, c_12, c_03]
+            
+        Returns:
+            Motor torque (Nm), clamped to non-negative
+        """
+        # Check for invalid coefficients (fast check)
+        if np.any(np.isnan(coeffs)) or np.any(np.isinf(coeffs)):
+            return 0.0
+        
+        c_00, c_10, c_01, c_20, c_11, c_02, c_30, c_21, c_12, c_03 = coeffs
+        
+        # Clamp inputs to reasonable ranges to prevent overflow
+        V = np.clip(V_norm, 0.0, 1.0)
+        # Clamp omega_m to prevent overflow in high-order terms
+        # Typical motor speeds: 0-1000 rad/s, clamp to 2000 rad/s for safety
+        w = np.clip(omega_m, -2000.0, 2000.0)
+        
+        # Compute polynomial terms efficiently
+        # Constant
+        tau = c_00
+        
+        # Linear terms
+        tau += c_10 * V
+        tau += c_01 * w
+        
+        # Quadratic terms
+        V2 = V * V
+        w2 = w * w
+        tau += c_20 * V2
+        tau += c_11 * V * w
+        tau += c_02 * w2
+        
+        # Cubic terms
+        tau += c_30 * V2 * V
+        tau += c_21 * V2 * w
+        tau += c_12 * V * w2
+        tau += c_03 * w2 * w
+        
+        # Check for invalid result
+        if np.isnan(tau) or np.isinf(tau):
+            return 0.0
+        
+        # Clamp to non-negative (no regeneration)
+        return max(tau, 0.0)
+    
+    def _fit_dc_from_polynomial_map(
+        self,
+        poly_params: np.ndarray,
+        verbose: bool = True,
+    ) -> Dict[str, float]:
+        """Fit DC motor parameters to match polynomial motor map.
+        
+        Samples polynomial map over V and ω ranges and fits DC model:
+        τ_dc = K * (V - K*ω)/R - b*ω
+        
+        Args:
+            poly_params: Parameter array from polynomial model fitting
+            verbose: Print progress
+            
+        Returns:
+            Dictionary with fitted DC parameters: R, K, b
+        """
+        # Extract polynomial parameters
+        V_max = poly_params[3]
+        poly_coeffs = poly_params[4:14]  # 10 coefficients
+        
+        # Sample polynomial map
+        V_samples = np.linspace(0.1, 1.0, 20)  # Normalized voltage
+        omega_max = 1000.0  # rad/s - reasonable max motor speed
+        omega_samples = np.linspace(0.0, omega_max, 30)
+        
+        V_grid, omega_grid = np.meshgrid(V_samples, omega_samples)
+        V_flat = V_grid.flatten()
+        omega_flat = omega_grid.flatten()
+        
+        # Compute polynomial torques
+        tau_poly = np.array([
+            self._compute_polynomial_motor_torque(V_n, w, poly_coeffs)
+            for V_n, w in zip(V_flat, omega_flat)
+        ])
+        
+        # Filter out zero torques (not useful for fitting)
+        valid = tau_poly > 1e-3
+        V_valid = V_flat[valid]
+        omega_valid = omega_flat[valid]
+        tau_valid = tau_poly[valid]
+        
+        if len(tau_valid) < 10:
+            LOGGER.warning("Not enough valid samples for DC fitting")
+            return {"R": 0.2, "K": 0.2, "b": 1e-3}
+        
+        # Convert normalized V to actual voltage
+        V_actual = V_valid * V_max
+        
+        # Fit DC model: τ = K * (V - K*ω)/R - b*ω
+        # Rearranging: τ = (K*V)/R - (K²*ω)/R - b*ω
+        # Let a = K/R, b_eff = (K²/R + b)
+        # τ = a*V - b_eff*ω
+        
+        # Linear regression: τ = a*V - b_eff*ω
+        A = np.column_stack([V_actual, -omega_valid])
+        coeffs, residuals, rank, s = np.linalg.lstsq(A, tau_valid, rcond=None)
+        
+        a = coeffs[0]  # K/R
+        b_eff = coeffs[1]  # K²/R + b
+        
+        # Solve for R, K, b
+        # We need additional constraint. Use typical K value to estimate
+        # Or use least squares with constraint
+        
+        # Simple approach: assume K is in reasonable range, solve for R and b
+        # Try multiple K values and pick best fit
+        K_candidates = np.linspace(0.05, 0.5, 20)
+        best_error = float('inf')
+        best_R, best_K, best_b = 0.2, 0.2, 1e-3
+        
+        for K in K_candidates:
+            R = K / a if a > 0 else 0.2
+            if R < 0.01 or R > 1.0:
+                continue
+            
+            b = b_eff - (K * K / R)
+            if b < 0 or b > 0.1:
+                continue
+            
+            # Evaluate fit
+            tau_dc = K * (V_actual - K * omega_valid) / R - b * omega_valid
+            tau_dc = np.maximum(tau_dc, 0.0)  # Clamp to non-negative
+            
+            error = np.mean((tau_dc - tau_valid) ** 2)
+            if error < best_error:
+                best_error = error
+                best_R, best_K, best_b = R, K, b
+        
+        if verbose:
+            print(f"\nFitted DC parameters from polynomial map:")
+            print(f"  R: {best_R:.4f} Ω")
+            print(f"  K: {best_K:.4f} Nm/A")
+            print(f"  b: {best_b:.6f} Nm·s/rad")
+            print(f"  Fit RMSE: {np.sqrt(best_error):.4f} Nm")
+        
+        return {
+            "R": float(best_R),
+            "K": float(best_K),
+            "b": float(best_b),
+            "fit_rmse": float(np.sqrt(best_error)),
+        }
+    
     def _compute_acceleration(
         self,
         params: np.ndarray,
@@ -552,31 +780,63 @@ class VehicleParamFitter:
     ) -> float:
         """Compute acceleration for a single timestep.
         
-        Uses DC motor model with quasi-steady-state assumption.
-        All 18 parameters are extracted even if some have minimal effect.
+        Supports both DC motor model and polynomial motor map.
         """
-        (mass, drag_area, rolling_coeff,
-         V_max, R, L, K, b, J,
-         gear_ratio, eta,
-         brake_T_max, brake_tau, brake_p, brake_kappa, mu,
-         r_w, wheel_inertia) = params
-        
-        # Motor speed from wheel speed
-        omega_m = gear_ratio * speed / r_w
-        
-        # Commanded voltage
-        V_cmd = (max(throttle, 0.0) / 100.0) * V_max
-        
-        # Motor current (quasi-steady, no regen)
-        back_emf = K * omega_m
-        motor_current = max((V_cmd - back_emf) / R, 0.0)
-        
-        # Motor torque with viscous friction loss
-        motor_torque = K * motor_current - b * omega_m
-        motor_torque = max(motor_torque, 0.0)
-        
-        # Wheel torque through gearbox
-        wheel_torque = eta * gear_ratio * motor_torque
+        if self.config.motor_model_type == "polynomial":
+            # Polynomial model: 23 parameters
+            (mass, drag_area, rolling_coeff,
+             V_max,
+             poly_c_00, poly_c_10, poly_c_01, poly_c_20, poly_c_11, poly_c_02,
+             poly_c_30, poly_c_21, poly_c_12, poly_c_03,
+             gear_ratio, eta,
+             brake_T_max, brake_tau, brake_p, brake_kappa, mu,
+             r_w, wheel_inertia) = params
+            
+            # Motor speed from wheel speed
+            omega_m = gear_ratio * speed / r_w
+            
+            # Commanded voltage and normalized voltage
+            V_cmd = (max(throttle, 0.0) / 100.0) * V_max
+            V_norm = V_cmd / V_max if V_max > 0 else 0.0
+            
+            # Polynomial coefficients
+            poly_coeffs = np.array([
+                poly_c_00, poly_c_10, poly_c_01, poly_c_20, poly_c_11, poly_c_02,
+                poly_c_30, poly_c_21, poly_c_12, poly_c_03
+            ])
+            
+            # Compute motor torque from polynomial map
+            motor_torque = self._compute_polynomial_motor_torque(V_norm, omega_m, poly_coeffs)
+            
+            # Wheel torque through gearbox
+            wheel_torque = eta * gear_ratio * motor_torque
+            
+            # For polynomial model, use default motor inertia (not fitted)
+            J = 1e-3  # Default motor rotor inertia (kg·m²)
+        else:
+            # DC motor model: 18 parameters
+            (mass, drag_area, rolling_coeff,
+             V_max, R, L, K, b, J,
+             gear_ratio, eta,
+             brake_T_max, brake_tau, brake_p, brake_kappa, mu,
+             r_w, wheel_inertia) = params
+            
+            # Motor speed from wheel speed
+            omega_m = gear_ratio * speed / r_w
+            
+            # Commanded voltage
+            V_cmd = (max(throttle, 0.0) / 100.0) * V_max
+            
+            # Motor current (quasi-steady, no regen)
+            back_emf = K * omega_m
+            motor_current = max((V_cmd - back_emf) / R, 0.0)
+            
+            # Motor torque with viscous friction loss
+            motor_torque = K * motor_current - b * omega_m
+            motor_torque = max(motor_torque, 0.0)
+            
+            # Wheel torque through gearbox
+            wheel_torque = eta * gear_ratio * motor_torque
         
         # Drive force
         F_drive = wheel_torque / r_w
@@ -635,6 +895,231 @@ class VehicleParamFitter:
         
         return v_sim
     
+    def _compute_acceleration_torch(
+        self,
+        params: torch.Tensor,
+        speed: torch.Tensor,
+        throttle: torch.Tensor,
+        brake: torch.Tensor,
+        grade: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute acceleration vectorized on GPU using PyTorch.
+        
+        Args:
+            params: Parameter tensor [batch_size, n_params] or [n_params]
+            speed: Speed tensor [batch_size] or scalar
+            throttle: Throttle tensor [batch_size] or scalar
+            brake: Brake tensor [batch_size] or scalar
+            grade: Grade tensor [batch_size] or scalar
+            
+        Returns:
+            Acceleration tensor [batch_size] or scalar
+        """
+        if self.config.motor_model_type == "polynomial":
+            # Polynomial model: 23 parameters
+            mass = params[..., 0]
+            drag_area = params[..., 1]
+            rolling_coeff = params[..., 2]
+            V_max = params[..., 3]
+            poly_coeffs = params[..., 4:14]  # 10 coefficients
+            gear_ratio = params[..., 14]
+            eta = params[..., 15]
+            brake_T_max = params[..., 16]
+            brake_tau = params[..., 17]
+            brake_p = params[..., 18]
+            brake_kappa = params[..., 19]
+            mu = params[..., 20]
+            r_w = params[..., 21]
+            wheel_inertia = params[..., 22]
+            
+            # Motor speed from wheel speed
+            omega_m = gear_ratio * speed / r_w
+            
+            # Commanded voltage and normalized voltage
+            V_cmd = (torch.clamp(throttle, min=0.0) / 100.0) * V_max
+            V_norm = V_cmd / torch.clamp(V_max, min=1e-6)
+            
+            # Compute polynomial motor torque
+            V = torch.clamp(V_norm, 0.0, 1.0)
+            w = torch.clamp(omega_m, -2000.0, 2000.0)
+            
+            # Polynomial: τ = c_00 + c_10*V + c_01*ω + c_20*V² + c_11*V*ω + c_02*ω² 
+            #            + c_30*V³ + c_21*V²*ω + c_12*V*ω² + c_03*ω³
+            c_00, c_10, c_01, c_20, c_11, c_02, c_30, c_21, c_12, c_03 = torch.unbind(poly_coeffs, dim=-1)
+            
+            tau = c_00
+            tau = tau + c_10 * V
+            tau = tau + c_01 * w
+            tau = tau + c_20 * V * V
+            tau = tau + c_11 * V * w
+            tau = tau + c_02 * w * w
+            tau = tau + c_30 * V * V * V
+            tau = tau + c_21 * V * V * w
+            tau = tau + c_12 * V * w * w
+            tau = tau + c_03 * w * w * w
+            
+            motor_torque = torch.clamp(tau, min=0.0)
+            
+            # Wheel torque through gearbox
+            wheel_torque = eta * gear_ratio * motor_torque
+            
+            # Default motor inertia for polynomial model
+            J = torch.full_like(mass, 1e-3)
+        else:
+            # DC motor model: 18 parameters
+            mass = params[..., 0]
+            drag_area = params[..., 1]
+            rolling_coeff = params[..., 2]
+            V_max = params[..., 3]
+            R = params[..., 4]
+            L = params[..., 5]
+            K = params[..., 6]
+            b = params[..., 7]
+            J = params[..., 8]
+            gear_ratio = params[..., 9]
+            eta = params[..., 10]
+            brake_T_max = params[..., 11]
+            brake_tau = params[..., 12]
+            brake_p = params[..., 13]
+            brake_kappa = params[..., 14]
+            mu = params[..., 15]
+            r_w = params[..., 16]
+            wheel_inertia = params[..., 17]
+            
+            # Motor speed from wheel speed
+            omega_m = gear_ratio * speed / r_w
+            
+            # Commanded voltage
+            V_cmd = (torch.clamp(throttle, min=0.0) / 100.0) * V_max
+            
+            # Motor current (quasi-steady, no regen)
+            back_emf = K * omega_m
+            motor_current = torch.clamp((V_cmd - back_emf) / R, min=0.0)
+            
+            # Motor torque with viscous friction loss
+            motor_torque = K * motor_current - b * omega_m
+            motor_torque = torch.clamp(motor_torque, min=0.0)
+            
+            # Wheel torque through gearbox
+            wheel_torque = eta * gear_ratio * motor_torque
+        
+        # Drive force
+        F_drive = wheel_torque / r_w
+        
+        # Brake force with nonlinear characteristic
+        brake_cmd = torch.clamp(brake, min=0.0) / 100.0
+        F_brake = brake_T_max * (brake_cmd ** brake_p) / r_w
+        
+        # Aerodynamic drag
+        F_drag = 0.5 * AIR_DENSITY * drag_area * speed * torch.abs(speed)
+        
+        # Rolling resistance
+        cos_grade = torch.cos(grade)
+        F_roll = rolling_coeff * mass * GRAVITY * cos_grade
+        
+        # Grade resistance
+        sin_grade = torch.sin(grade)
+        F_grade = mass * GRAVITY * sin_grade
+        
+        # Net force and acceleration
+        effective_mass = mass + (4 * wheel_inertia + J * gear_ratio**2) / (r_w**2)
+        F_net = F_drive - F_brake - F_drag - F_roll - F_grade
+        a = F_net / effective_mass
+        
+        return a
+    
+    def _simulate_segments_batch_torch(
+        self,
+        params: torch.Tensor,
+        segments: List[TripSegment],
+    ) -> torch.Tensor:
+        """Simulate multiple segments in parallel on GPU.
+        
+        Args:
+            params: Parameter tensor [n_params]
+            segments: List of trip segments
+            
+        Returns:
+            Simulated velocities tensor [n_segments, max_length]
+            Valid mask tensor [n_segments, max_length] (1 where valid, 0 where padded)
+        """
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch not available")
+        
+        n_segments = len(segments)
+        max_length = max(s.length for s in segments)
+        
+        # Prepare input tensors
+        speeds_list = []
+        throttles_list = []
+        brakes_list = []
+        grades_list = []
+        dts_list = []
+        initial_speeds_list = []
+        valid_mask_list = []
+        
+        for seg in segments:
+            length = seg.length
+            speeds_list.append(torch.tensor(seg.speed, device=self._device, dtype=torch.float32))
+            throttles_list.append(torch.tensor(seg.throttle, device=self._device, dtype=torch.float32))
+            brakes_list.append(torch.tensor(seg.brake, device=self._device, dtype=torch.float32))
+            grades_list.append(torch.tensor(seg.grade, device=self._device, dtype=torch.float32))
+            dts_list.append(seg.dt)
+            initial_speeds_list.append(seg.initial_speed)
+            
+            # Create valid mask
+            mask = torch.zeros(max_length, device=self._device, dtype=torch.float32)
+            mask[:length] = 1.0
+            valid_mask_list.append(mask)
+        
+        # Pad and stack
+        speeds_gt = torch.stack([
+            torch.nn.functional.pad(s, (0, max_length - s.shape[0]), value=0.0)
+            for s in speeds_list
+        ])
+        throttles = torch.stack([
+            torch.nn.functional.pad(t, (0, max_length - t.shape[0]), value=0.0)
+            for t in throttles_list
+        ])
+        brakes = torch.stack([
+            torch.nn.functional.pad(b, (0, max_length - b.shape[0]), value=0.0)
+            for b in brakes_list
+        ])
+        grades = torch.stack([
+            torch.nn.functional.pad(g, (0, max_length - g.shape[0]), value=0.0)
+            for g in grades_list
+        ])
+        valid_mask = torch.stack(valid_mask_list)
+        
+        # Expand params to batch dimension
+        params_expanded = params.unsqueeze(0).expand(n_segments, -1)
+        
+        # Initialize velocity tensor
+        v_sim = torch.zeros(n_segments, max_length, device=self._device, dtype=torch.float32)
+        v_sim[:, 0] = torch.tensor(initial_speeds_list, device=self._device, dtype=torch.float32)
+        
+        # Forward simulation for all segments in parallel
+        for t in range(max_length - 1):
+            # Get current speeds
+            v_curr = v_sim[:, t]
+            
+            # Compute accelerations for all segments at once
+            a = self._compute_acceleration_torch(
+                params_expanded,
+                v_curr,
+                throttles[:, t],
+                brakes[:, t],
+                grades[:, t],
+            )
+            
+            # Euler integration with speed clamp
+            dt_tensor = torch.tensor([segments[i].dt if t < segments[i].length - 1 else 0.0 
+                                     for i in range(n_segments)], 
+                                    device=self._device, dtype=torch.float32)
+            v_sim[:, t + 1] = torch.clamp(v_curr + a * dt_tensor, min=0.0)
+        
+        return v_sim, valid_mask
+    
     def _trajectory_loss(
         self,
         params: np.ndarray,
@@ -649,16 +1134,44 @@ class VehicleParamFitter:
         Returns:
             Mean squared velocity error (with barrier penalty if enabled)
         """
-        total_se = 0.0
-        total_samples = 0
-        
-        for segment in segments:
-            v_sim = self._simulate_segment(params, segment)
-            se = np.sum((v_sim - segment.speed) ** 2)
-            total_se += se
-            total_samples += segment.length
-        
-        mse = total_se / total_samples if total_samples > 0 else 0.0
+        # Use GPU if available
+        if self._device is not None and len(segments) > 0 and TORCH_AVAILABLE:
+            
+            # Convert params to GPU tensor
+            params_torch = torch.tensor(params, device=self._device, dtype=torch.float32)
+            
+            # Simulate all segments in parallel on GPU
+            v_sim_batch, valid_mask = self._simulate_segments_batch_torch(params_torch, segments)
+            
+            # Compute squared errors for all segments
+            speeds_gt_list = []
+            for seg in segments:
+                speed_padded = torch.zeros(v_sim_batch.shape[1], device=self._device, dtype=torch.float32)
+                speed_padded[:seg.length] = torch.tensor(seg.speed, device=self._device, dtype=torch.float32)
+                speeds_gt_list.append(speed_padded)
+            speeds_gt = torch.stack(speeds_gt_list)
+            
+            # Compute squared errors (only where valid)
+            errors = (v_sim_batch - speeds_gt) ** 2
+            errors = errors * valid_mask  # Mask out padding
+            
+            # Sum over all segments and timesteps
+            total_se = torch.sum(errors).item()
+            total_samples = torch.sum(valid_mask).item()
+            
+            mse = total_se / total_samples if total_samples > 0 else 0.0
+        else:
+            # CPU fallback
+            total_se = 0.0
+            total_samples = 0
+            
+            for segment in segments:
+                v_sim = self._simulate_segment(params, segment)
+                se = np.sum((v_sim - segment.speed) ** 2)
+                total_se += se
+                total_samples += segment.length
+            
+            mse = total_se / total_samples if total_samples > 0 else 0.0
         
         # Add barrier penalty if enabled
         if self.config.use_barrier and self._bounds is not None:
@@ -676,21 +1189,20 @@ class VehicleParamFitter:
     ) -> Tuple[float, np.ndarray]:
         """Compute loss and numerical gradient.
         
-        Uses central finite differences for gradient approximation.
+        Uses forward finite differences for faster computation (2x faster than central).
         """
         loss = self._trajectory_loss(params, segments)
         
         grad = np.zeros_like(params)
+        # Use forward differences instead of central (2x faster, slightly less accurate)
+        # This reduces from 2*N+1 to N+1 function evaluations
         for i in range(len(params)):
             params_plus = params.copy()
-            params_minus = params.copy()
             params_plus[i] += eps
-            params_minus[i] -= eps
             
             loss_plus = self._trajectory_loss(params_plus, segments)
-            loss_minus = self._trajectory_loss(params_minus, segments)
             
-            grad[i] = (loss_plus - loss_minus) / (2 * eps)
+            grad[i] = (loss_plus - loss) / eps
         
         return loss, grad
     
@@ -801,6 +1313,12 @@ class VehicleParamFitter:
             LOGGER.warning("matplotlib not available, skipping histogram plot")
             return
         
+        # Use non-GUI backend when called from background thread
+        import matplotlib
+        current_backend = matplotlib.get_backend()
+        if current_backend.lower() in ['tkagg', 'qt5agg', 'qt4agg', 'gtk3agg', 'gtk4agg']:
+            matplotlib.use('Agg')
+        
         train_speeds = np.concatenate([s.speed for s in train_segments])
         val_speeds = np.concatenate([s.speed for s in val_segments])
         
@@ -833,6 +1351,14 @@ class VehicleParamFitter:
             plt.show()
         
         plt.close(fig)
+        
+        # Restore original backend if changed
+        if current_backend.lower() in ['tkagg', 'qt5agg', 'qt4agg', 'gtk3agg', 'gtk4agg']:
+            matplotlib.use(current_backend)
+        
+        # Restore original backend if changed
+        if current_backend.lower() in ['tkagg', 'qt5agg', 'qt4agg', 'gtk3agg', 'gtk4agg']:
+            matplotlib.use(current_backend)
     
     def _plot_validation_trips(
         self,
@@ -845,6 +1371,12 @@ class VehicleParamFitter:
         if not MATPLOTLIB_AVAILABLE:
             LOGGER.warning("matplotlib not available, skipping validation plot")
             return
+        
+        # Use non-GUI backend when called from background thread
+        import matplotlib
+        current_backend = matplotlib.get_backend()
+        if current_backend.lower() in ['tkagg', 'qt5agg', 'qt4agg', 'gtk3agg', 'gtk4agg']:
+            matplotlib.use('Agg')
         
         n_trips = min(max_trips, len(val_segments))
         selected_segments = val_segments[:n_trips]
@@ -876,6 +1408,10 @@ class VehicleParamFitter:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         LOGGER.info(f"Saved validation trip comparison to {save_path}")
         plt.close(fig)
+        
+        # Restore original backend if changed
+        if current_backend.lower() in ['tkagg', 'qt5agg', 'qt4agg', 'gtk3agg', 'gtk4agg']:
+            matplotlib.use(current_backend)
     
     def fit(
         self,
@@ -963,49 +1499,103 @@ class VehicleParamFitter:
             hist_path = data_path.parent / "speed_histograms.png"
             self._plot_speed_histograms(train_segments, val_segments, save_path=hist_path)
         
-        # Initial parameters (all 18)
-        x0 = np.array([
-            cfg.mass_init,
-            cfg.drag_area_init,
-            cfg.rolling_coeff_init,
-            cfg.motor_V_max_init,
-            cfg.motor_R_init,
-            cfg.motor_L_init,
-            cfg.motor_K_init,
-            cfg.motor_b_init,
-            cfg.motor_J_init,
-            cfg.gear_ratio_init,
-            cfg.eta_gb_init,
-            cfg.brake_T_max_init,
-            cfg.brake_tau_init,
-            cfg.brake_p_init,
-            cfg.brake_kappa_init,
-            cfg.mu_init,
-            cfg.wheel_radius_init,
-            cfg.wheel_inertia_init,
-        ])
-        
-        # Bounds (all 18)
-        bounds = [
-            cfg.mass_bounds,
-            cfg.drag_area_bounds,
-            cfg.rolling_coeff_bounds,
-            cfg.motor_V_max_bounds,
-            cfg.motor_R_bounds,
-            cfg.motor_L_bounds,
-            cfg.motor_K_bounds,
-            cfg.motor_b_bounds,
-            cfg.motor_J_bounds,
-            cfg.gear_ratio_bounds,
-            cfg.eta_gb_bounds,
-            cfg.brake_T_max_bounds,
-            cfg.brake_tau_bounds,
-            cfg.brake_p_bounds,
-            cfg.brake_kappa_bounds,
-            cfg.mu_bounds,
-            cfg.wheel_radius_bounds,
-            cfg.wheel_inertia_bounds,
-        ]
+        # Initial parameters and bounds (variable count based on motor model)
+        if cfg.motor_model_type == "polynomial":
+            # Polynomial model: 23 parameters
+            x0 = np.array([
+                cfg.mass_init,
+                cfg.drag_area_init,
+                cfg.rolling_coeff_init,
+                cfg.motor_V_max_init,
+                cfg.poly_c_00_init,
+                cfg.poly_c_10_init,
+                cfg.poly_c_01_init,
+                cfg.poly_c_20_init,
+                cfg.poly_c_11_init,
+                cfg.poly_c_02_init,
+                cfg.poly_c_30_init,
+                cfg.poly_c_21_init,
+                cfg.poly_c_12_init,
+                cfg.poly_c_03_init,
+                cfg.gear_ratio_init,
+                cfg.eta_gb_init,
+                cfg.brake_T_max_init,
+                cfg.brake_tau_init,
+                cfg.brake_p_init,
+                cfg.brake_kappa_init,
+                cfg.mu_init,
+                cfg.wheel_radius_init,
+                cfg.wheel_inertia_init,
+            ])
+            
+            bounds = [
+                cfg.mass_bounds,
+                cfg.drag_area_bounds,
+                cfg.rolling_coeff_bounds,
+                cfg.motor_V_max_bounds,
+                cfg.poly_c_00_bounds,
+                cfg.poly_c_10_bounds,
+                cfg.poly_c_01_bounds,
+                cfg.poly_c_20_bounds,
+                cfg.poly_c_11_bounds,
+                cfg.poly_c_02_bounds,
+                cfg.poly_c_30_bounds,
+                cfg.poly_c_21_bounds,
+                cfg.poly_c_12_bounds,
+                cfg.poly_c_03_bounds,
+                cfg.gear_ratio_bounds,
+                cfg.eta_gb_bounds,
+                cfg.brake_T_max_bounds,
+                cfg.brake_tau_bounds,
+                cfg.brake_p_bounds,
+                cfg.brake_kappa_bounds,
+                cfg.mu_bounds,
+                cfg.wheel_radius_bounds,
+                cfg.wheel_inertia_bounds,
+            ]
+        else:
+            # DC motor model: 18 parameters
+            x0 = np.array([
+                cfg.mass_init,
+                cfg.drag_area_init,
+                cfg.rolling_coeff_init,
+                cfg.motor_V_max_init,
+                cfg.motor_R_init,
+                cfg.motor_L_init,
+                cfg.motor_K_init,
+                cfg.motor_b_init,
+                cfg.motor_J_init,
+                cfg.gear_ratio_init,
+                cfg.eta_gb_init,
+                cfg.brake_T_max_init,
+                cfg.brake_tau_init,
+                cfg.brake_p_init,
+                cfg.brake_kappa_init,
+                cfg.mu_init,
+                cfg.wheel_radius_init,
+                cfg.wheel_inertia_init,
+            ])
+            
+            bounds = [
+                cfg.mass_bounds,
+                cfg.drag_area_bounds,
+                cfg.rolling_coeff_bounds,
+                cfg.motor_V_max_bounds,
+                cfg.motor_R_bounds,
+                cfg.motor_L_bounds,
+                cfg.motor_K_bounds,
+                cfg.motor_b_bounds,
+                cfg.motor_J_bounds,
+                cfg.gear_ratio_bounds,
+                cfg.eta_gb_bounds,
+                cfg.brake_T_max_bounds,
+                cfg.brake_tau_bounds,
+                cfg.brake_p_bounds,
+                cfg.brake_kappa_bounds,
+                cfg.mu_bounds,
+                cfg.wheel_radius_bounds,
+                cfg.wheel_inertia_bounds,
+            ]
         
         # Store bounds for barrier function computation
         self._bounds = bounds
@@ -1063,6 +1653,7 @@ class VehicleParamFitter:
                 batch_segments = [train_segments[i] for i in batch_indices]
                 
                 # Optimize on this batch
+                # Using forward differences (2x faster than central) via explicit gradient
                 result = minimize(
                     self._trajectory_loss_with_numerical_gradient,
                     x0,
@@ -1086,9 +1677,13 @@ class VehicleParamFitter:
                     self._save_checkpoint(log_path, best_params, best_val_loss, epoch, b)
                     if verbose:
                         print(f"\n  New best: val_RMSE={np.sqrt(best_val_loss):.4f} m/s (saved)")
-                        # Plot validation trips comparison
-                        val_plot_path = data_path.parent / f"validation_trips_epoch{epoch}_batch{b}.png"
-                        self._plot_validation_trips(best_params, val_segments, val_plot_path, max_trips=5)
+                        # Plot validation trips comparison only occasionally to avoid slowdown
+                        # Plot every 10 improvements or at end of epoch
+                        improvement_count = getattr(self, '_improvement_count', 0) + 1
+                        self._improvement_count = improvement_count
+                        if improvement_count % 10 == 0 or b == num_batches - 1:
+                            val_plot_path = data_path.parent / f"validation_trips_epoch{epoch}_batch{b}.png"
+                            self._plot_validation_trips(best_params, val_segments, val_plot_path, max_trips=5)
 
                     # Call progress callback if provided
                     if progress_callback is not None:
@@ -1147,30 +1742,60 @@ class VehicleParamFitter:
         
         total_samples = train_samples + val_samples
         
-        # Create result (all 18 params from optimization)
-        fitted = FittedVehicleParams(
-            mass=best_params[0],
-            drag_area=best_params[1],
-            rolling_coeff=best_params[2],
-            motor_V_max=best_params[3],
-            motor_R=best_params[4],
-            motor_L=best_params[5],
-            motor_K=best_params[6],
-            motor_b=best_params[7],
-            motor_J=best_params[8],
-            gear_ratio=best_params[9],
-            eta_gb=best_params[10],
-            brake_T_max=best_params[11],
-            brake_tau=best_params[12],
-            brake_p=best_params[13],
-            brake_kappa=best_params[14],
-            mu=best_params[15],
-            wheel_radius=best_params[16],
-            wheel_inertia=best_params[17],
-            fit_loss=val_loss,
-            num_samples=total_samples,
-            r_squared=r_squared,
-        )
+        # Create result based on motor model type
+        if cfg.motor_model_type == "polynomial":
+            # For polynomial model, create a dictionary with all parameters
+            param_dict = {name: float(val) for name, val in zip(self.PARAM_NAMES, best_params)}
+            param_dict.update({
+                "motor_model_type": "polynomial",
+                "fit_loss": val_loss,
+                "num_samples": total_samples,
+                "r_squared": r_squared,
+            })
+            
+            # If requested, fit DC motor parameters from polynomial map
+            if cfg.fit_dc_from_map:
+                dc_params = self._fit_dc_from_polynomial_map(best_params, verbose=verbose)
+                param_dict["fitted_dc_params"] = dc_params
+            
+            # Create a simple result object (we'll save as dict)
+            class PolynomialFittedParams:
+                def __init__(self, data):
+                    self.__dict__.update(data)
+                def to_dict(self):
+                    return self.__dict__.copy()
+                def save(self, path):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(path, "w") as f:
+                        json.dump(self.to_dict(), f, indent=2)
+                    LOGGER.info(f"Saved fitted params to {path}")
+            
+            fitted = PolynomialFittedParams(param_dict)
+        else:
+            # DC motor model: use existing FittedVehicleParams
+            fitted = FittedVehicleParams(
+                mass=best_params[0],
+                drag_area=best_params[1],
+                rolling_coeff=best_params[2],
+                motor_V_max=best_params[3],
+                motor_R=best_params[4],
+                motor_L=best_params[5],
+                motor_K=best_params[6],
+                motor_b=best_params[7],
+                motor_J=best_params[8],
+                gear_ratio=best_params[9],
+                eta_gb=best_params[10],
+                brake_T_max=best_params[11],
+                brake_tau=best_params[12],
+                brake_p=best_params[13],
+                brake_kappa=best_params[14],
+                mu=best_params[15],
+                wheel_radius=best_params[16],
+                wheel_inertia=best_params[17],
+                fit_loss=val_loss,
+                num_samples=total_samples,
+                r_squared=r_squared,
+            )
         
         return fitted
     

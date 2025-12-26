@@ -23,10 +23,23 @@ matplotlib.use("TkAgg")
 
 LOGGER = logging.getLogger(__name__)
 
-# Parameter groups for organization
-PARAM_GROUPS = {
+# Parameter groups for DC motor model
+PARAM_GROUPS_DC = {
     "Body": ["mass", "drag_area", "rolling_coeff"],
     "Motor": ["motor_V_max", "motor_R", "motor_L", "motor_K", "motor_b", "motor_J"],
+    "Drivetrain": ["gear_ratio", "eta_gb"],
+    "Brake": ["brake_T_max", "brake_tau", "brake_p", "brake_kappa", "mu"],
+    "Wheel": ["wheel_radius", "wheel_inertia"],
+}
+
+# Parameter groups for polynomial motor model
+PARAM_GROUPS_POLY = {
+    "Body": ["mass", "drag_area", "rolling_coeff"],
+    "Motor": ["motor_V_max"],
+    "Polynomial Coefficients": [
+        "poly_c_00", "poly_c_10", "poly_c_01", "poly_c_20", "poly_c_11", "poly_c_02",
+        "poly_c_30", "poly_c_21", "poly_c_12", "poly_c_03"
+    ],
     "Drivetrain": ["gear_ratio", "eta_gb"],
     "Brake": ["brake_T_max", "brake_tau", "brake_p", "brake_kappa", "mu"],
     "Wheel": ["wheel_radius", "wheel_inertia"],
@@ -43,6 +56,16 @@ PARAM_DISPLAY = {
     "motor_K": ("Motor K", "Nm/A"),
     "motor_b": ("Motor b", "Nm·s/rad"),
     "motor_J": ("Motor J", "kg·m²"),
+    "poly_c_00": ("c₀₀ (constant)", ""),
+    "poly_c_10": ("c₁₀ (V)", ""),
+    "poly_c_01": ("c₀₁ (ω)", ""),
+    "poly_c_20": ("c₂₀ (V²)", ""),
+    "poly_c_11": ("c₁₁ (V·ω)", ""),
+    "poly_c_02": ("c₀₂ (ω²)", ""),
+    "poly_c_30": ("c₃₀ (V³)", ""),
+    "poly_c_21": ("c₂₁ (V²·ω)", ""),
+    "poly_c_12": ("c₁₂ (V·ω²)", ""),
+    "poly_c_03": ("c₀₃ (ω³)", ""),
     "gear_ratio": ("Gear Ratio", ""),
     "eta_gb": ("Gearbox Efficiency", ""),
     "brake_T_max": ("Brake T_max", "Nm"),
@@ -73,6 +96,7 @@ class FittingGUI:
         # Fitting state
         self.fitting_thread: Optional[threading.Thread] = None
         self.is_fitting = False
+        self.current_fitter: Optional[VehicleParamFitter] = None  # Store fitter for param names
 
         # Update throttling
         self.last_update_time = 0.0
@@ -142,6 +166,30 @@ class FittingGUI:
             foreground="gray",
         ).grid(row=3, column=2, sticky=tk.W, padx=5)
 
+        # Motor model type selector
+        ttk.Label(top_left, text="Motor Model:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        self.motor_model_var = tk.StringVar(value="dc")
+        motor_model_frame = ttk.Frame(top_left)
+        motor_model_frame.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=5, padx=5)
+        ttk.Radiobutton(
+            motor_model_frame, text="DC Motor", variable=self.motor_model_var, value="dc",
+            command=self._on_motor_model_changed
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(
+            motor_model_frame, text="Polynomial Map", variable=self.motor_model_var, value="polynomial",
+            command=self._on_motor_model_changed
+        ).pack(side=tk.LEFT, padx=5)
+        
+        # Fit DC from map option (only shown for polynomial model)
+        self.fit_dc_from_map_var = tk.BooleanVar(value=False)
+        self.fit_dc_check = ttk.Checkbutton(
+            top_left,
+            text="Fit DC parameters from map after optimization",
+            variable=self.fit_dc_from_map_var,
+        )
+        self.fit_dc_check.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=5, padx=5)
+        self.fit_dc_check.grid_remove()  # Hidden by default
+
         top_left.columnconfigure(1, weight=1)
 
         # Left panel: Parameters (scrollable)
@@ -164,72 +212,13 @@ class FittingGUI:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Store parameter entry widgets
+        # Store parameter entry widgets and scrollable frame reference
         self.param_entries: Dict[str, Dict[str, tk.StringVar]] = {}
+        self.scrollable_frame = scrollable_frame
+        self.param_canvas = canvas
 
-        # Create parameter input fields
-        row = 0
-        for group_name, param_names in PARAM_GROUPS.items():
-            # Group header
-            ttk.Label(
-                scrollable_frame, text=group_name, font=("TkDefaultFont", 10, "bold")
-            ).grid(row=row, column=0, columnspan=4, sticky=tk.W, pady=(10, 5))
-            row += 1
-
-            # Column headers
-            ttk.Label(scrollable_frame, text="Parameter").grid(
-                row=row, column=0, sticky=tk.W, padx=5
-            )
-            ttk.Label(scrollable_frame, text="Initial").grid(
-                row=row, column=1, sticky=tk.W, padx=5
-            )
-            ttk.Label(scrollable_frame, text="Min").grid(
-                row=row, column=2, sticky=tk.W, padx=5
-            )
-            ttk.Label(scrollable_frame, text="Max").grid(
-                row=row, column=3, sticky=tk.W, padx=5
-            )
-            row += 1
-
-            # Parameter rows
-            for param_name in param_names:
-                display_name, unit = PARAM_DISPLAY[param_name]
-                label_text = f"{display_name}"
-                if unit:
-                    label_text += f" ({unit})"
-
-                ttk.Label(scrollable_frame, text=label_text).grid(
-                    row=row, column=0, sticky=tk.W, padx=5, pady=2
-                )
-
-                # Get default values
-                init_val = getattr(self.default_config, f"{param_name}_init")
-                bounds = getattr(self.default_config, f"{param_name}_bounds")
-                min_val, max_val = bounds
-
-                # Entry variables
-                init_var = tk.StringVar(value=str(init_val))
-                min_var = tk.StringVar(value=str(min_val))
-                max_var = tk.StringVar(value=str(max_val))
-
-                # Entry widgets
-                ttk.Entry(scrollable_frame, textvariable=init_var, width=12).grid(
-                    row=row, column=1, padx=5, pady=2
-                )
-                ttk.Entry(scrollable_frame, textvariable=min_var, width=12).grid(
-                    row=row, column=2, padx=5, pady=2
-                )
-                ttk.Entry(scrollable_frame, textvariable=max_var, width=12).grid(
-                    row=row, column=3, padx=5, pady=2
-                )
-
-                self.param_entries[param_name] = {
-                    "init": init_var,
-                    "min": min_var,
-                    "max": max_var,
-                }
-
-                row += 1
+        # Create parameter input fields (will be updated when motor model changes)
+        self._create_parameter_fields()
 
         # Left panel: Buttons
         button_frame = ttk.Frame(left_frame)
@@ -280,6 +269,103 @@ class FittingGUI:
         self.canvas_plot = FigureCanvasTkAgg(self.fig, plot_frame)
         self.canvas_plot.draw()
         self.canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    
+    def _on_motor_model_changed(self):
+        """Called when motor model type changes - update parameter fields."""
+        # Clear existing parameter fields
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        self.param_entries.clear()
+        
+        # Recreate parameter fields for new model
+        self._create_parameter_fields()
+        
+        # Show/hide fit DC checkbox
+        if self.motor_model_var.get() == "polynomial":
+            self.fit_dc_check.grid()
+        else:
+            self.fit_dc_check.grid_remove()
+    
+    def _create_parameter_fields(self):
+        """Create parameter input fields based on current motor model type."""
+        # Get appropriate parameter groups
+        if self.motor_model_var.get() == "polynomial":
+            param_groups = PARAM_GROUPS_POLY
+        else:
+            param_groups = PARAM_GROUPS_DC
+        
+        row = 0
+        for group_name, param_names in param_groups.items():
+            # Group header
+            ttk.Label(
+                self.scrollable_frame, text=group_name, font=("TkDefaultFont", 10, "bold")
+            ).grid(row=row, column=0, columnspan=4, sticky=tk.W, pady=(10, 5))
+            row += 1
+
+            # Column headers (only show once)
+            if row == 1:
+                ttk.Label(self.scrollable_frame, text="Parameter").grid(
+                    row=row, column=0, sticky=tk.W, padx=5
+                )
+                ttk.Label(self.scrollable_frame, text="Initial").grid(
+                    row=row, column=1, sticky=tk.W, padx=5
+                )
+                ttk.Label(self.scrollable_frame, text="Min").grid(
+                    row=row, column=2, sticky=tk.W, padx=5
+                )
+                ttk.Label(self.scrollable_frame, text="Max").grid(
+                    row=row, column=3, sticky=tk.W, padx=5
+                )
+                row += 1
+
+            # Parameter rows
+            for param_name in param_names:
+                display_name, unit = PARAM_DISPLAY.get(param_name, (param_name, ""))
+                label_text = f"{display_name}"
+                if unit:
+                    label_text += f" ({unit})"
+
+                ttk.Label(self.scrollable_frame, text=label_text).grid(
+                    row=row, column=0, sticky=tk.W, padx=5, pady=2
+                )
+
+                # Get default values
+                try:
+                    init_val = getattr(self.default_config, f"{param_name}_init")
+                    bounds = getattr(self.default_config, f"{param_name}_bounds")
+                    min_val, max_val = bounds
+                except AttributeError:
+                    # Use defaults if not found
+                    init_val = 0.0
+                    min_val, max_val = -100.0, 100.0
+
+                # Entry variables
+                init_var = tk.StringVar(value=str(init_val))
+                min_var = tk.StringVar(value=str(min_val))
+                max_var = tk.StringVar(value=str(max_val))
+
+                # Entry widgets
+                ttk.Entry(self.scrollable_frame, textvariable=init_var, width=12).grid(
+                    row=row, column=1, padx=5, pady=2
+                )
+                ttk.Entry(self.scrollable_frame, textvariable=min_var, width=12).grid(
+                    row=row, column=2, padx=5, pady=2
+                )
+                ttk.Entry(self.scrollable_frame, textvariable=max_var, width=12).grid(
+                    row=row, column=3, padx=5, pady=2
+                )
+
+                self.param_entries[param_name] = {
+                    "init": init_var,
+                    "min": min_var,
+                    "max": max_var,
+                }
+
+                row += 1
+        
+        # Update canvas scroll region
+        self.scrollable_frame.update_idletasks()
+        self.param_canvas.configure(scrollregion=self.param_canvas.bbox("all"))
 
     def _populate_datasets(self):
         """Scan data/processed for .pt files and populate dropdown."""
@@ -345,7 +431,8 @@ class FittingGUI:
             return
 
         # Convert to parameter array for simulation
-        param_array = self._params_dict_to_array(params_dict, use_init=True)
+        motor_model_type = self.motor_model_var.get()
+        param_array = self._params_dict_to_array(params_dict, use_init=True, motor_model_type=motor_model_type)
 
         # Clear existing lines to force recreation
         self.throttle_lines.clear()
@@ -360,7 +447,10 @@ class FittingGUI:
         self, params: np.ndarray, dt: float = 0.1, duration: float = 40.0
     ) -> Dict[float, Tuple[np.ndarray, np.ndarray]]:
         """Simulate throttle response from 0 m/s."""
-        fitter = VehicleParamFitter()
+        # Create fitter with current motor model type
+        motor_model_type = self.motor_model_var.get()
+        config = FitterConfig(motor_model_type=motor_model_type)
+        fitter = VehicleParamFitter(config)
         results = {}
 
         throttle_values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -391,7 +481,10 @@ class FittingGUI:
         initial_speed: float = 20.0,
     ) -> Dict[float, Tuple[np.ndarray, np.ndarray]]:
         """Simulate brake response from initial speed."""
-        fitter = VehicleParamFitter()
+        # Create fitter with current motor model type
+        motor_model_type = self.motor_model_var.get()
+        config = FitterConfig(motor_model_type=motor_model_type)
+        fitter = VehicleParamFitter(config)
         results = {}
 
         brake_values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -416,20 +509,24 @@ class FittingGUI:
         return results
 
     def _params_dict_to_array(
-        self, params_dict: Dict[str, Dict[str, float]], use_init: bool = True
+        self, params_dict: Dict[str, Dict[str, float]], use_init: bool = True, motor_model_type: str = "dc"
     ) -> np.ndarray:
         """Convert parameter dictionary to array in correct order."""
-        param_names = VehicleParamFitter.PARAM_NAMES
+        # Create temporary config to get param names
+        temp_config = FitterConfig(motor_model_type=motor_model_type)
+        temp_fitter = VehicleParamFitter(temp_config)
+        param_names = temp_fitter.PARAM_NAMES
         param_array = np.zeros(len(param_names))
 
         for i, param_name in enumerate(param_names):
-            if use_init:
-                param_array[i] = params_dict[param_name]["init"]
-            else:
-                # Use midpoint of bounds
-                min_val = params_dict[param_name]["min"]
-                max_val = params_dict[param_name]["max"]
-                param_array[i] = (min_val + max_val) / 2.0
+            if param_name in params_dict:
+                if use_init:
+                    param_array[i] = params_dict[param_name]["init"]
+                else:
+                    # Use midpoint of bounds
+                    min_val = params_dict[param_name]["min"]
+                    max_val = params_dict[param_name]["max"]
+                    param_array[i] = (min_val + max_val) / 2.0
 
         return param_array
 
@@ -482,6 +579,10 @@ class FittingGUI:
         except ValueError as e:
             raise ValueError(f"Invalid barrier μ value: {e}")
 
+        # Add motor model settings
+        config_kwargs["motor_model_type"] = self.motor_model_var.get()
+        config_kwargs["fit_dc_from_map"] = self.fit_dc_from_map_var.get()
+
         return FitterConfig(**config_kwargs)
 
     def _start_fitting(self):
@@ -530,6 +631,7 @@ class FittingGUI:
 
             # Create fitter and run
             fitter = VehicleParamFitter(config)
+            self.current_fitter = fitter  # Store for param names access
             output_params_path = output_dir / "fitted_params.json"
 
             self.root.after(0, lambda: self.progress_var.set("Fitting parameters..."))
@@ -540,23 +642,44 @@ class FittingGUI:
                 log_path=output_dir / "fitting_checkpoint.json",
                 progress_callback=self._progress_callback
             )
+            
+            self.current_fitter = None  # Clear after fitting
 
             # Save results
             fitted.save(output_params_path)
 
             # Save simulation preview plots
-            param_array = np.array([
-                fitted.mass, fitted.drag_area, fitted.rolling_coeff,
-                fitted.motor_V_max, fitted.motor_R, fitted.motor_L,
-                fitted.motor_K, fitted.motor_b, fitted.motor_J,
-                fitted.gear_ratio, fitted.eta_gb,
-                fitted.brake_T_max, fitted.brake_tau, fitted.brake_p,
-                fitted.brake_kappa, fitted.mu,
-                fitted.wheel_radius, fitted.wheel_inertia,
-            ])
+            # Extract parameters based on model type
+            if config.motor_model_type == "polynomial":
+                # Polynomial model - extract from dict
+                param_dict = fitted.to_dict()
+                motor_model_type = param_dict.get("motor_model_type", "polynomial")
+                temp_config = FitterConfig(motor_model_type=motor_model_type)
+                temp_fitter = VehicleParamFitter(temp_config)
+                param_names = temp_fitter.PARAM_NAMES
+                param_array = np.array([param_dict.get(name, 0.0) for name in param_names])
+            else:
+                # DC model - use FittedVehicleParams structure
+                param_array = np.array([
+                    fitted.mass, fitted.drag_area, fitted.rolling_coeff,
+                    fitted.motor_V_max, fitted.motor_R, fitted.motor_L,
+                    fitted.motor_K, fitted.motor_b, fitted.motor_J,
+                    fitted.gear_ratio, fitted.eta_gb,
+                    fitted.brake_T_max, fitted.brake_tau, fitted.brake_p,
+                    fitted.brake_kappa, fitted.mu,
+                    fitted.wheel_radius, fitted.wheel_inertia,
+                ])
 
+            # Use the model type from config (what was actually fitted)
+            # Temporarily set motor model type for simulations
+            original_model_type = self.motor_model_var.get()
+            self.motor_model_var.set(config.motor_model_type)
+            
             throttle_data = self._simulate_throttle_response(param_array)
             brake_data = self._simulate_brake_response(param_array)
+            
+            # Restore original model type
+            self.motor_model_var.set(original_model_type)
 
             # Create and save preview plots
             preview_fig = Figure(figsize=(10, 8), dpi=100)
@@ -632,10 +755,13 @@ class FittingGUI:
         loss = self.pending_loss
 
         # Update parameter display with current best
-        for i, param_name in enumerate(VehicleParamFitter.PARAM_NAMES):
-            if param_name in self.param_entries:
-                # Update the initial value field to show current best
-                self.param_entries[param_name]["init"].set(f"{params[i]:.6f}")
+        # Get param names from current fitter if available
+        if self.current_fitter is not None:
+            param_names = self.current_fitter.PARAM_NAMES
+            for i, param_name in enumerate(param_names):
+                if param_name in self.param_entries:
+                    # Update the initial value field to show current best
+                    self.param_entries[param_name]["init"].set(f"{params[i]:.6f}")
 
         # Update progress text
         rmse = np.sqrt(loss)
