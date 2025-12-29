@@ -73,6 +73,8 @@ onnxruntime-linux-x64-1.16.3/
 
 # Training checkpoints (large files)
 training/checkpoints/
+training/checkpoints_sac_pretrained/
+training/sysid_pretrained/
 *.pt
 
 # Evaluation results and plots

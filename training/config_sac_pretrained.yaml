@@ -1,0 +1,185 @@
+# Configuration for SAC training with pretrained SysID encoder
+# 
+# This config loads a pretrained SysID encoder and freezes it during SAC training.
+# The encoder provides vehicle-specific dynamics features to the policy/critic.
+#
+# Usage:
+#   1. First pretrain SysID:
+#      python scripts/pretrain_sysid.py --config training/config_sysid.yaml --num-steps 50000
+#   2. Then train SAC with this config:
+#      python training/train_sac.py --config training/config_sac_pretrained.yaml
+
+env:
+  # Action space bounds (dimensionless, -1 to 1)
+  action_high: 1.0          # Maximum action value (full throttle/brake)
+  action_low: -1.0          # Minimum action value (full brake)
+
+  # Reward function weights (dimensionless, affect reward scaling)
+  accel_filter_alpha: 0.2   # Exponential smoothing factor for acceleration (0=no smoothing, 1=instant)
+  action_weight: 0.5       # Penalty weight for action magnitude (reduces aggressive control)
+  brake_weight: 0.0001         # Penalty weight for brake usage (set to 0 to disable)
+  negative_speed_weight: 10.0   # Penalty weight for negative vehicle speeds (prevents reverse)
+  zero_speed_error_weight: 0.25    # Penalty for speed error when target speed is 0
+  zero_speed_throttle_weight: 0.5 # Penalty for throttle usage when target speed is 0
+  horizon_penalty_weight: 0.0  # Weight for future horizon tracking penalties
+  horizon_penalty_decay: 0.99  # Exponential decay factor for future penalties (0.9-1.0)
+  jerk_weight: 0.1          # Penalty weight for acceleration changes (smoothness)
+  smooth_action_weight: 20.0 # Penalty weight for action changes (stability)
+  track_weight: 1.0         # Weight for speed tracking error in reward
+  
+  # Comfort penalty annealing - gradually increase comfort penalties during training
+  # This allows the agent to first learn tracking, then refine for smoothness
+  comfort_anneal_enabled: true   # Enable/disable comfort penalty annealing
+  comfort_anneal_start_mult: 0.0  # Multiplier at training start (0 = no comfort penalty)
+  comfort_anneal_end_mult: 1.0    # Multiplier at end of annealing (1 = full comfort penalty)
+  comfort_anneal_steps: 10000000    # Number of steps to anneal over (linear interpolation)
+  voltage_weight: 0.0       # Penalty weight for motor voltage (set to 0 to disable)
+
+  # Simulation parameters
+  dt: 0.1                   # Policy step time (seconds) - controls control frequency
+  max_episode_steps: 2048   # Maximum steps per episode (affects episode length)
+  max_position: 5000.0      # Maximum position before episode termination (meters)
+  max_speed: 25.0           # Maximum allowed speed (m/s) - affects reward clipping
+  plant_substeps: 5         # Physics simulation substeps per policy step (stability)
+  preview_horizon_s: 3.0    # How far ahead the agent can see reference speeds (seconds)
+  use_extended_plant: true  # Use detailed vehicle dynamics model (true) or simple (false)
+output:
+  dir: training/checkpoints_sac_pretrained     # Directory to save model checkpoints
+  save_latest: true             # Whether to save the latest checkpoint during training
+reference_dataset: null         # Path to reference dataset (null = use generator)
+seed: 42                        # Random seed for reproducibility
+training:
+  # SAC algorithm hyperparameters
+  gamma: 0.95                # Discount factor for future rewards (0.9-0.99)
+  learning_rate: 0.0003      # Learning rate for policy/critic updates
+  tau: 0.01                  # Soft update coefficient for target networks (0.001-0.01)
+  target_entropy_scale: 0.98 # Target entropy scaling for automatic temperature tuning
+
+  # Training schedule
+  num_train_timesteps: 1000000  # Total training steps (environment interactions)
+  warmup_steps: 10000         # Steps before training starts (random exploration)
+  batch_size: 256             # Minibatch size for training updates
+  replay_size: 1000000        # Maximum replay buffer size (steps)
+
+  # Logging and checkpointing
+  log_interval: 1000          # Steps between logging training metrics
+  checkpoint_interval: 10000  # Steps between saving model checkpoints
+  max_grad_norm: 5.0          # Maximum gradient norm for clipping (stability)
+
+  # Evaluation during training
+  eval_interval: 5000         # Steps between evaluation runs during training
+  eval_episodes: 5            # Number of episodes per evaluation run
+
+  # Action planning (for MPC-style policies, if used)
+  action_horizon_steps: 10    # Planning horizon for action sequences (steps)
+
+# ========================================================================
+# SysID Configuration: Load pretrained encoder, freeze during SAC training
+# ========================================================================
+sysid:
+  enabled: true
+  
+  # IMPORTANT: Path to pretrained SysID checkpoint
+  pretrained_path: "training/sysid_pretrained/sysid_best.pt"
+  
+  # IMPORTANT: Freeze encoder during SAC training (recommended)
+  # Set to false to fine-tune encoder alongside SAC
+  freeze_encoder: true
+  
+  # Architecture (must match pretrained model)
+  dz: 12
+  gru_hidden: 64
+  predictor_hidden: 128
+  predictor_layers: 2
+  
+  # Training windows (must match pretrained model)
+  burn_in: 20
+  horizon: 40
+  
+  # Loss weights (only used if freeze_encoder: false)
+  lambda_slow: 0.005
+  lambda_z: 0.0005
+  
+  # Optimization (only used if freeze_encoder: false)
+  learning_rate: 0.001
+  update_every: 1
+  updates_per_step: 1
+  pretrain_steps: 0
+  
+  # Normalization
+  norm_clip: 10.0
+  norm_eps: 1.0e-6
+
+generator:
+  # Low-Pass Filter (LPF) parameters for smoothing target speed profiles
+  freq_cutoff: 0.8         # LPF cutoff frequency (Hz) - higher = more responsive but less smooth
+  zeta: 3.0                # Damping ratio - higher = more stable but slower response
+  dt: 0.02                 # LPF internal timestep (seconds) - affects smoothness resolution
+  jerk_max: 4.0            # Maximum allowed jerk (m/s³) - limits acceleration changes
+
+  # Event-driven target generation parameters
+  p_change: 0.03           # Probability of changing target speed per step (0-1)
+  p_zero_stop: 0.08        # Probability of sampling full stops vs. speed targets (0-1)
+  v_min: 0.0               # Minimum speed for random targets (m/s)
+  v_max_sample: 25.0       # Maximum speed for random targets (m/s)
+  t_min: 2.0               # Minimum time to reach new target (seconds)
+  t_max: 12.0              # Maximum time to reach new target (seconds)
+  stop_hold_min: 1.0       # Minimum dwell time for full stops (seconds)
+  stop_hold_max: 5.0       # Maximum dwell time for full stops (seconds)
+
+  # Stochastic acceleration/jerk sampling parameters
+  p_change_acc: 0.01       # Probability of changing acceleration scale per step (0-1)
+  p_change_jerk: 0.01      # Probability of changing jerk scale per step (0-1)
+
+  # Road grade generation parameters (Ornstein-Uhlenbeck process)
+  ds: 1.0                  # Spatial grid step size (meters) - resolution of grade map
+  l_corr: 300.0             # Spatial correlation length (meters) - road segment smoothness
+  sigma_g_stat: 0.02      # Grade standard deviation (radians) - ~0.29° typical variation
+  g_min: -0.08             # Minimum grade angle (radians) - ~ -4.6° max downhill
+  g_max: 0.08              # Maximum grade angle (radians) - ~ +4.6° max uphill
+
+  # Speed limit safety factor
+  speed_limit_safety_factor: 0.8  # Multiplier for max feasible speed (0.75 = 25% reduction from theoretical max)
+
+vehicle_randomization:
+  # Fitted vehicle mode (optional): use fitted params as center of randomization
+  # mode: "fitted"                        # "default" for standard ranges, "fitted" for centered
+  # fitted_params_path: null              # Path to fitted_params.json (e.g., "data/processed/NiroEV/NIROEV_HA_02/fitted_params.json")
+  # spread_pct: 0.1                       # Spread around fitted mean (0.1 = ±10%)
+  
+  # Basic vehicle parameters (per new_params_randomization.md)
+  mass_range: [1500.0, 6000.0]          # kg - vehicle mass range
+  rolling_coeff_range: [0.007, 0.015]   # C_rr - rolling resistance coefficient
+  drag_area_range: [0.2, 0.8]           # CdA (m²) - drag coefficient * frontal area
+  actuator_tau_range: [0.05, 0.30]      # seconds - actuator time constant
+  grade_range_deg: [-5.7, 5.7]          # degrees - ±10% road grade range
+
+  # Motor electrical parameters (use log-uniform in code for R, L, K, b, J)
+  motor_Vmax_range: [200.0, 800.0]      # V - motor max voltage
+  motor_R_range: [0.02, 0.6]            # Ω - armature resistance
+  motor_L_range: [0.0001, 0.01]         # H - armature inductance
+  motor_K_range: [0.05, 0.4]            # Nm/A (K_t = K_e in SI)
+  motor_b_range: [0.000001, 0.005]      # Nm·s/rad - viscous damping
+  motor_J_range: [0.0001, 0.01]         # kg·m² - rotor inertia
+
+  # Gearbox
+  gear_ratio_range: [4.0, 20.0]         # gear reduction ratio
+  eta_gb_range: [0.85, 0.98]            # gearbox efficiency
+
+  # Brake parameters (per new_params_randomization.md)
+  brake_tau_range: [0.04, 0.12]        # seconds - brake time constant
+  brake_Tmax_range: [5000.0, 60000.0]  # Nm - max brake torque at wheel
+  brake_p_range: [1.0, 1.8]            # brake pressure exponent
+  brake_kappa_range: [0.02, 0.25]      # brake slip smoothing constant
+
+  # Wheel parameters
+  wheel_radius_range: [0.26, 0.38]     # m - wheel radius (typical passenger vehicles)
+  wheel_inertia_range: [0.5, 5.0]      # kg·m² - wheel + rotating assembly inertia
+
+  # Friction
+  mu_range: [0.7, 1.0]                 # tire-road friction coefficient
+  
+  # Feasibility thresholds (for rejection sampling)
+  min_accel_from_rest: 2.5             # m/s² - minimum acceleration at standstill
+  min_brake_decel: 4.0                 # m/s² - minimum braking deceleration
+  min_top_speed: 20.0                  # m/s - minimum achievable top speed

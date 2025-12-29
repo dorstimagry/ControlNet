@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -90,6 +91,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to ONNX model file (required if --use-cpp-inference is set).",
     )
+    parser.add_argument(
+        "--force-export-onnx",
+        action="store_true",
+        help="Force re-export ONNX model from checkpoint before evaluation to ensure weight matching.",
+    )
     return parser.parse_args()
 
 
@@ -108,9 +114,47 @@ def run_closed_loop_evaluation(
     pid_feedback_rl_only: bool = True,
     use_cpp_inference: bool = False,
     onnx_model_path: Optional[Path] = None,
+    force_export_onnx: bool = False,
 ) -> dict[str, float]:
     device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy, env_cfg, _ = load_policy_from_checkpoint(checkpoint, device=device)
+    
+    # Check if SysID is enabled
+    checkpoint_data = torch.load(checkpoint, map_location=device, weights_only=False)
+    meta = checkpoint_data.get("meta", {})
+    sysid_enabled = meta.get("sysid_enabled", False)
+    
+    # Initialize SysID components if enabled
+    encoder = None
+    encoder_norm = None
+    feature_builder = None
+    encoder_hidden = None
+    prev_speed = 0.0
+    prev_action = 0.0
+    
+    if sysid_enabled:
+        from src.sysid import ContextEncoder, RunningNorm
+        from src.sysid.encoder import FeatureBuilder
+        from src.sysid.integration import compute_z_online
+        
+        config = checkpoint_data.get("config", {})
+        sysid_config = config.get("sysid", {})
+        z_dim = int(sysid_config.get("dz", 12))
+        gru_hidden = int(sysid_config.get("gru_hidden", 64))
+        
+        encoder = ContextEncoder(input_dim=4, hidden_dim=gru_hidden, z_dim=z_dim)
+        encoder_norm = RunningNorm(dim=4, eps=1e-6, clip=10.0)
+        
+        encoder.load_state_dict(checkpoint_data["encoder"])
+        encoder_norm.load_state_dict(checkpoint_data["encoder_norm"])
+        encoder.eval()
+        encoder_norm.eval()
+        encoder.to(device)
+        encoder_norm.to(device)
+        
+        feature_builder = FeatureBuilder(dt=env_cfg.dt)
+        
+        print(f"[SysID] Enabled: z_dim={z_dim}, gru_hidden={gru_hidden}")
 
     # Override environment config if specified
     raw_config = {}
@@ -152,12 +196,55 @@ def run_closed_loop_evaluation(
             )
         if onnx_model_path is None:
             raise ValueError("--onnx-model is required when --use-cpp-inference is set")
+        
+        # Force re-export ONNX model if requested to ensure weight matching
+        if force_export_onnx:
+            print(f"[Export] Re-exporting ONNX model from checkpoint to ensure weight matching...")
+            import subprocess
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,  # Use the same Python interpreter
+                        "scripts/export_onnx.py",
+                        "--checkpoint", str(checkpoint),
+                        "--output", str(onnx_model_path),
+                        "--no-validate",  # Skip validation for speed
+                    ],
+                    cwd=Path(__file__).parent.parent,  # Run from project root
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if result.returncode == 0:
+                    print(f"[Export] Successfully re-exported ONNX model to: {onnx_model_path}")
+                    if result.stdout:
+                        print("[Export] Output:")
+                        for line in result.stdout.strip().split('\n')[:10]:  # Show first 10 lines
+                            print(f"  {line}")
+                else:
+                    print(f"[Export] Warning: Export failed with return code {result.returncode}")
+                    print(f"[Export] Error: {result.stderr}")
+                    print(f"[Export] Continuing with existing ONNX model")
+            except subprocess.TimeoutExpired:
+                print(f"[Export] Warning: Export timed out after 60 seconds")
+                print(f"[Export] Continuing with existing ONNX model")
+            except Exception as e:
+                print(f"[Export] Warning: Failed to re-export ONNX model: {e}")
+                print(f"[Export] Continuing with existing ONNX model")
+        
         if not onnx_model_path.exists():
             raise FileNotFoundError(f"ONNX model not found: {onnx_model_path}")
         try:
             cpp_policy = CppOnnxPolicy(onnx_model_path)
             print(f"[C++ Inference] Loaded ONNX model: {onnx_model_path}")
             print(f"[C++ Inference] obs_dim: {cpp_policy.obs_dim}, action_dim: {cpp_policy.action_dim}")
+            if sysid_enabled:
+                if cpp_policy.is_sysid_model:
+                    print(f"[C++ Inference] SysID model detected: hidden_dim={cpp_policy.hidden_dim}")
+                else:
+                    print(f"[Warning] C++ module doesn't support SysID. Rebuild C++ module for SysID support.")
+                    print(f"[Warning] C++ inference will be disabled for SysID models.")
+                    cpp_policy = None  # Disable C++ inference if SysID not supported
         except Exception as e:
             print(f"[Warning] Failed to load C++ ONNX inference: {e}")
             print("[Warning] Continuing with Python inference only")
@@ -175,6 +262,19 @@ def run_closed_loop_evaluation(
 
     for episode in tqdm(range(episodes), desc="Evaluating episodes"):
         obs, _ = env.reset()
+        
+        # Reset SysID encoder state for new episode
+        if sysid_enabled:
+            # Separate hidden states for Python and C++ inference
+            py_encoder_hidden = encoder.reset(batch_size=1, device=device).squeeze(0)
+            cpp_encoder_hidden = encoder.reset(batch_size=1, device=device).squeeze(0)
+            feature_builder.reset()
+            # Action history for SysID: track 3 previous actions to match FeatureBuilder bug
+            # Due to FeatureBuilder's implementation, features at step t use action from step t-2
+            prev_speed = 0.0  # v_{t-1}, matches FeatureBuilder.v_prev initial value
+            prev_action = 0.0  # u_{t-1}, most recent action
+            prev_prev_action = 0.0  # u_{t-2}, used in features (due to FeatureBuilder bug)
+            prev_prev_prev_action = 0.0  # u_{t-3}, used for du computation
 
         # Capture vehicle parameters for this episode
         vehicle_params = {
@@ -255,17 +355,49 @@ def run_closed_loop_evaluation(
             current_speed = float(obs[0])
             reference_speed = float(obs[4])  # First reference speed (current)
             
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            # Compute z_t if SysID enabled (for Python inference)
+            if sysid_enabled:
+                py_encoder_hidden, z_t = compute_z_online(
+                    encoder=encoder,
+                    feature_builder=feature_builder,
+                    encoder_norm=encoder_norm,
+                    h_prev=py_encoder_hidden,
+                    v_t=current_speed,
+                    u_t=prev_action,
+                    device=device
+                )
+                z_t_np = z_t.cpu().numpy()
+                # Augment observation with z_t
+                obs_aug = np.concatenate([obs, z_t_np])
+            else:
+                obs_aug = obs
+            
+            obs_tensor = torch.as_tensor(obs_aug, dtype=torch.float32, device=device).unsqueeze(0)
             plan, stats = select_action(policy, obs_tensor, deterministic=True)
             rl_action = float(plan[0])
             
-            # Run C++ inference if enabled
+            # Run C++ inference if enabled (with independent state management)
             cpp_action = None
             action_diff = 0.0
             if cpp_policy is not None:
                 try:
-                    obs_array = np.array(obs, dtype=np.float32)
-                    cpp_plan = cpp_policy.infer(obs_array)
+                    if sysid_enabled and hasattr(cpp_policy, 'is_sysid_model') and cpp_policy.is_sysid_model:
+                        # For SysID, C++ needs all inputs
+                        # Due to FeatureBuilder bug, features use action from t-2, not t-1
+                        # So we pass prev_prev_action (u_{t-2}) where FeatureBuilder would use self.u_prev
+                        cpp_plan, cpp_hidden_new = cpp_policy.infer_sysid(
+                            base_obs=obs,
+                            speed=current_speed,  # v_t
+                            prev_action=prev_prev_action,  # u_{t-2} - matches FeatureBuilder's self.u_prev
+                            prev_speed=prev_speed,  # v_{t-1}
+                            prev_prev_action=prev_prev_prev_action,  # u_{t-3} - matches FeatureBuilder's self.u_prev_prev
+                            hidden_state=cpp_encoder_hidden.cpu().numpy()
+                        )
+                        # Update C++ encoder hidden state
+                        cpp_encoder_hidden = torch.from_numpy(cpp_hidden_new).to(device)
+                    else:
+                        obs_array = np.array(obs_aug, dtype=np.float32)
+                        cpp_plan = cpp_policy.infer(obs_array)
                     cpp_action = float(cpp_plan[0])
                     action_diff = abs(rl_action - cpp_action)
                     cpp_actions.append(cpp_action)
@@ -289,6 +421,14 @@ def run_closed_loop_evaluation(
             
             # Step environment with final action (for plant simulation)
             obs, reward, terminated, truncated, info = env.step(final_action)
+            
+            # Update SysID history for next step
+            if sysid_enabled:
+                # Update action history: shift all back by one
+                prev_prev_prev_action = prev_prev_action  # t-3 <- t-2
+                prev_prev_action = prev_action  # t-2 <- t-1
+                prev_action = rl_action  # t-1 <- t (current)
+                prev_speed = current_speed
             
             # Optionally override prev_action to feed only RL action back to network
             # This models PID as "part of the plant" - network only sees its own action
@@ -482,6 +622,7 @@ def main() -> None:
         pid_feedback_rl_only=pid_feedback_rl_only,
         use_cpp_inference=args.use_cpp_inference,
         onnx_model_path=args.onnx_model,
+        force_export_onnx=args.force_export_onnx,
     )
     print(json.dumps(summary, indent=2))
 

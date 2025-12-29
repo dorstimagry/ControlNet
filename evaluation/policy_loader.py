@@ -16,14 +16,24 @@ def load_policy_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device | None = None,
 ) -> Tuple[GaussianPolicy, LongitudinalEnvConfig, int]:
-    """Load a trained GaussianPolicy and corresponding env config."""
+    """Load a trained GaussianPolicy and corresponding env config.
+    
+    Note: The obs_dim in the checkpoint is the augmented observation dimension
+    (base_obs_dim + z_dim if SysID is enabled). The policy is always trained
+    with this augmented dimension.
+    """
 
     device = device or torch.device("cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config_block = checkpoint["config"]["env"]
     env_cfg = LongitudinalEnvConfig(**config_block)
     meta = checkpoint.get("meta", {})
-    obs_dim = int(meta.get("obs_dim", 4))
+    
+    # Infer obs_dim from policy weights (this is the augmented dimension if SysID is enabled)
+    # The first layer weight shape is (hidden_dim, obs_dim)
+    policy_state = checkpoint["policy"]
+    obs_dim = int(policy_state["net.0.weight"].shape[1])  # Get from actual checkpoint weights
+    
     env_action_dim = int(meta.get("env_action_dim", 1))
     policy_action_dim = int(meta.get("policy_action_dim", env_action_dim))
     horizon = max(1, policy_action_dim // max(1, env_action_dim))
@@ -32,7 +42,7 @@ def load_policy_from_checkpoint(
     action_high = np.tile(np.array([env_cfg.action_high], dtype=np.float32), horizon)
 
     policy = GaussianPolicy(
-        obs_dim=obs_dim,
+        obs_dim=obs_dim,  # Use augmented obs_dim (policy expects this)
         action_dim=policy_action_dim,
         action_low=action_low,
         action_high=action_high,

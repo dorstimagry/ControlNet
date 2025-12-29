@@ -31,6 +31,21 @@ PYBIND11_MODULE(_onnx_inference, m) {
              "Get observation dimension")
         .def("get_action_dim",
              &SACPolicyInference::getActionDim,
-             "Get action dimension");
+             "Get action dimension")
+        .def("infer_sysid",
+             &SACPolicyInference::inferSysID,
+             "Run inference with SysID model (multiple inputs/outputs)",
+             py::arg("base_obs"),
+             py::arg("speed"),
+             py::arg("prev_action"),
+             py::arg("prev_speed"),
+             py::arg("prev_prev_action"),
+             py::arg("hidden_state"))
+        .def("is_sysid_model",
+             &SACPolicyInference::isSysIDModel,
+             "Check if this is a SysID model")
+        .def("get_hidden_dim",
+             &SACPolicyInference::getHiddenDim,
+             "Get hidden state dimension (for SysID models)");
 }
 

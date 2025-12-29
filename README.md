@@ -39,10 +39,25 @@ DiffDynamics/
 │   ├── parse_trips.py                   # Trip parsing tools
 │   ├── fit_vehicle_params.py            # Fit vehicle params from real data
 │   ├── export_onnx.py                   # Export trained policy to ONNX
+│   ├── eval_sysid.py                    # Evaluate SysID quality (NEW!)
 │   └── tune_objective_weights.py        # Hyperparameter tuning
 ├── src/                          # Additional source code
+│   ├── sysid/                     # Vehicle dynamics encoding (NEW!)
+│   │   ├── encoder.py             # GRU context encoder
+│   │   ├── predictor.py           # Dynamics predictor MLP
+│   │   ├── normalization.py       # Running normalization
+│   │   ├── sysid_trainer.py       # Multi-step rollout training
+│   │   ├── dataset.py             # Sequence sampling utilities
+│   │   ├── integration.py         # SAC integration helpers
+│   │   └── __init__.py
 │   └── data/                     # Data processing modules
 ├── tests/                        # Unit tests
+│   ├── sysid/                     # SysID tests (NEW!)
+│   │   ├── test_encoder.py        # Encoder tests
+│   │   ├── test_predictor.py      # Predictor tests
+│   │   ├── test_normalization.py  # Normalization tests
+│   │   ├── test_dataset.py        # Sequence sampling tests
+│   │   └── test_actor_critic_conditioning.py  # z conditioning tests
 │   ├── test_env.py               # Environment tests
 │   ├── test_dynamics.py          # Dynamics model tests
 │   ├── test_evaluation.py        # Evaluation tests
@@ -51,8 +66,9 @@ DiffDynamics/
 │   ├── test_fitting.py           # Parameter fitting tests
 │   └── test_pid_controller.py    # PID controller tests
 ├── training/                     # Training code and configuration
-│   ├── train_sac.py              # Main training script
+│   ├── train_sac.py              # Main training script (updated for SysID)
 │   ├── config.yaml               # Training configuration
+│   ├── config_sysid.yaml         # SysID-enabled configuration (NEW!)
 │   └── checkpoints/              # Model checkpoints (ignored)
 ├── utils/                        # Core utilities
 │   ├── dynamics.py               # Vehicle dynamics models (ExtendedPlant)
@@ -66,6 +82,43 @@ DiffDynamics/
 ```
 
 ## 🚗 System Overview
+
+### 🔬 Vehicle-Conditioned SAC with Online Dynamics Encoding (NEW!)
+
+The system now supports **vehicle-conditioned SAC** with online system identification (SysID). This enables the agent to:
+- **Adapt to different vehicle dynamics** in real-time
+- **Generalize better** to unseen vehicles
+- **Learn interpretable vehicle-specific latents** z_t
+
+#### Architecture
+
+```
+Environment → Encoder (GRU) → z_t → Actor/Critic → Action
+     ↓                          ↓
+Speed/Action History    SysID Predictor (Multi-step Rollout)
+```
+
+**Key Components:**
+1. **Context Encoder**: GRU that processes speed and action history to produce dynamics latent z_t
+2. **Dynamics Predictor**: MLP that predicts speed changes from (v, u, z)
+3. **Multi-step Rollout Training**: Self-supervised objective trains encoder to capture vehicle-specific dynamics
+4. **SAC Conditioning**: Actor and critic receive augmented observations [obs, z_t]
+
+**How it Works:**
+1. During environment interaction, the encoder maintains a hidden state h_t
+2. At each step, features o_t = [v_t, u_{t-1}, dv_t, du_{t-1}] are normalized and fed to the GRU
+3. The GRU outputs z_t, a low-dimensional latent capturing vehicle dynamics
+4. z_t is concatenated with the observation and fed to SAC actor/critic
+5. The encoder is trained with a separate multi-step rollout loss:
+   - **Burn-in**: Compute z_t from recent history
+   - **Rollout**: Predict speeds H steps into the future using true actions
+   - **Loss**: MSE between predicted and actual speeds + regularization
+
+**Benefits:**
+- **Better generalization** to vehicles with different mass, drag, motor characteristics
+- **Faster adaptation** during evaluation (burn-in period)
+- **Interpretable**: z captures vehicle-specific properties
+- **Stop-gradient**: Encoder trained only by SysID loss (stable training)
 
 ### Vehicle Model: ExtendedPlant
 
@@ -289,7 +342,108 @@ python scripts/analyze_dataset_coverage.py
 
 ## 🎯 Training
 
-### Basic Training
+### Two-Stage Training (Recommended): Pretrain SysID → Train SAC
+
+For better results, pretrain the SysID encoder before training SAC:
+
+#### Stage 1: Pretrain SysID
+
+```bash
+# Pretrain SysID encoder with on-the-fly episode generation (50k steps, ~15-20 min on GPU)
+python scripts/pretrain_sysid.py \
+    --config training/config_sysid.yaml \
+    --num-steps 50000 \
+    --min-buffer-size 5000 \
+    --output-dir training/sysid_pretrained
+```
+
+This phase:
+- Generates episodes on-the-fly during training (no long upfront collection)
+- Continuously samples new vehicles from the randomization distribution
+- Trains encoder/predictor on multi-step rollout prediction
+- Saves best checkpoint to `training/sysid_pretrained/sysid_best.pt`
+
+**Key arguments:**
+- `--min-buffer-size`: Initial buffer size before training starts (default: 10k, use 5k for quick start)
+- `--num-steps`: Number of training steps (not environment steps)
+- Data collection happens continuously during training
+
+#### Stage 2: Train SAC with Pretrained SysID
+
+```bash
+# Create config with pretrained SysID
+# (Set pretrained_path and freeze_encoder in your config)
+
+python training/train_sac.py \
+    --config training/config_sac_pretrained.yaml \
+    --num-train-timesteps 1000000
+```
+
+**Config for pretrained SysID:**
+```yaml
+sysid:
+  enabled: true
+  pretrained_path: "training/sysid_pretrained/sysid_best.pt"
+  freeze_encoder: true    # Freeze (recommended) or false to fine-tune
+  # ... rest of sysid config ...
+```
+
+**Benefits of Two-Stage Training:**
+- ✅ Better SysID representation (no RL interference)
+- ✅ Faster SAC convergence (starts with good features)
+- ✅ Modular development (debug SysID separately)
+- ✅ Transfer learning (reuse encoder across tasks)
+
+See `docs/two_stage_training.md` for complete guide.
+
+### Training with Vehicle-Conditioned SAC (Joint Training)
+
+Train SAC with online dynamics encoding for better generalization:
+
+```bash
+# Train with SysID enabled
+python training/train_sac.py --config training/config_sysid.yaml
+
+# Or enable SysID in your config file:
+# sysid:
+#   enabled: true
+#   dz: 12                    # Latent dimension
+#   burn_in: 20              # Burn-in steps
+#   horizon: 40              # Rollout horizon
+```
+
+**Configuration Options** (`config_sysid.yaml`):
+
+```yaml
+sysid:
+  enabled: true               # Enable vehicle-conditioned SAC
+  dz: 12                      # Dynamics latent dimension
+  gru_hidden: 64              # GRU hidden size
+  predictor_hidden: 128       # Predictor MLP hidden size
+  burn_in: 20                 # Burn-in window (steps)
+  horizon: 40                 # Rollout horizon (steps)
+  lambda_slow: 0.005          # Slow latent regularization
+  lambda_z: 0.0005            # L2 latent regularization
+  learning_rate: 0.001        # SysID optimizer learning rate
+  update_every: 1             # Update frequency
+  updates_per_step: 1         # Updates per trigger
+```
+
+**Training Process:**
+1. Environment step → Compute z_t from encoder
+2. Augment observation with z_t
+3. Sample action from policy([obs, z_t])
+4. Store transition with z_t, z_{t+1}, speed
+5. Update SAC (detached z)
+6. Update SysID (multi-step rollout loss)
+
+**Monitoring:**
+- `sysid/pred_loss`: Multi-step prediction loss
+- `sysid/slow_loss`: Hidden state smoothness
+- `sysid/z_norm`: Latent magnitude
+- `train/policy_loss`, `train/q_loss`: Standard SAC losses
+
+### Basic Training (without SysID)
 Train SAC agent with default configuration:
 
 ```bash
@@ -339,6 +493,29 @@ python scripts/tune_objective_weights.py
 Results are saved to `tuning_results.yaml`.
 
 ## 📈 Evaluation
+
+### SysID Quality Evaluation
+
+Evaluate the quality of vehicle dynamics encoding:
+
+```bash
+# Evaluate SysID prediction accuracy
+python scripts/eval_sysid.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --num-episodes 20 \
+    --horizons 10 20 40 \
+    --output evaluation/results/sysid_metrics.json
+```
+
+**Metrics:**
+- `sysid_eval/rmse_h{H}`: RMSE for H-step rollout prediction
+- `sysid_eval/rmse_h{H}_z0`: RMSE with z=0 (ablation)
+- `sysid_eval/improvement_h{H}`: Improvement percentage vs z=0
+
+**Interpretation:**
+- Lower RMSE → Better dynamics prediction
+- Higher improvement → z is capturing useful vehicle-specific information
+- Stable across horizons → Good long-term modeling
 
 ### Closed-Loop Evaluation
 
@@ -553,6 +730,55 @@ pytest tests/test_pid_controller.py  # PID controller tests
 
 ## 🎯 Usage Examples
 
+### Quick Start with SysID
+
+```bash
+# 1. Train SAC with vehicle-conditioned dynamics encoding
+python training/train_sac.py \
+    --config training/config_sysid.yaml \
+    --num-train-timesteps 1000000
+
+# 2. Evaluate SysID prediction quality
+python scripts/eval_sysid.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --num-episodes 20 \
+    --horizons 10 20 40 \
+    --output evaluation/results/sysid_metrics.json
+
+# 3. Evaluate control performance (closed-loop)
+python evaluation/eval_closed_loop.py \
+    --checkpoint training/checkpoints/sac_step_1000000.pt \
+    --episodes 50 \
+    --plot-dir evaluation/results/plots/sysid_eval
+```
+
+### Baseline Comparison
+
+```bash
+# Train baseline SAC (no SysID)
+python training/train_sac.py \
+    --config training/config.yaml \
+    --num-train-timesteps 1000000 \
+    --output-dir training/checkpoints_baseline
+
+# Train SAC + SysID
+python training/train_sac.py \
+    --config training/config_sysid.yaml \
+    --num-train-timesteps 1000000 \
+    --output-dir training/checkpoints_sysid
+
+# Compare on held-out vehicles
+python evaluation/eval_closed_loop.py \
+    --checkpoint training/checkpoints_baseline/sac_step_1000000.pt \
+    --episodes 50 \
+    --output evaluation/results/baseline.json
+
+python evaluation/eval_closed_loop.py \
+    --checkpoint training/checkpoints_sysid/sac_step_1000000.pt \
+    --episodes 50 \
+    --output evaluation/results/sysid.json
+```
+
 ### Quick Start
 ```bash
 # 1. Generate small dataset
@@ -600,6 +826,32 @@ python evaluation/eval_closed_loop.py \
 ```
 
 ## 🔬 Research Features
+
+### Vehicle-Conditioned SAC (SysID)
+
+**Multi-Step Rollout Training:**
+- Encoder learns from **self-supervised prediction** objective
+- Predicts speeds H steps into future using true actions
+- Forces z to capture long-term dynamics (not just single-step noise)
+
+**Stop-Gradient Design:**
+- z is **detached** when used by SAC (no gradient flow from RL to encoder)
+- Encoder trained **only** by SysID loss
+- Prevents representation collapse and training instability
+- Allows independent tuning of RL and SysID objectives
+
+**Ablation Studies:**
+1. **Baseline SAC** (z_dim=0): Standard SAC without dynamics encoding
+2. **SAC + z** (default): Full vehicle-conditioned SAC
+3. **z=0 at test time**: Evaluate with zero latent (measures z importance)
+4. **Different horizons**: H ∈ {10, 20, 40, 60} (longer = more long-term)
+5. **Different burn-in**: B ∈ {10, 20, 30} (longer = more history)
+
+**Recommended Experiments:**
+- Train baseline SAC and SAC+z on same vehicle distribution
+- Evaluate both on **held-out vehicles** (different seed)
+- Compare tracking error, jerk, action smoothness
+- Measure adaptation speed (performance vs burn-in length)
 
 ### Preview-Based Control
 The agent receives 30 timesteps (3 seconds) of future reference speeds, enabling:

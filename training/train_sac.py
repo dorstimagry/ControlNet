@@ -42,6 +42,28 @@ class TrainingParams:
 
 
 @dataclass(slots=True)
+class SysIDParams:
+    """SysID configuration for vehicle-conditioned SAC."""
+    enabled: bool = False
+    pretrained_path: str | None = None  # Path to pretrained SysID checkpoint
+    freeze_encoder: bool = False  # Freeze encoder during SAC training
+    dz: int = 12
+    gru_hidden: int = 64
+    predictor_hidden: int = 128
+    predictor_layers: int = 2
+    burn_in: int = 20
+    horizon: int = 40
+    lambda_slow: float = 5e-3
+    lambda_z: float = 5e-4
+    learning_rate: float = 1e-3
+    update_every: int = 1
+    updates_per_step: int = 1
+    pretrain_steps: int = 0  # Deprecated: use pretrain_sysid.py instead
+    norm_clip: float = 10.0
+    norm_eps: float = 1e-6
+
+
+@dataclass(slots=True)
 class OutputConfig:
     dir: Path = Path("training/checkpoints")
     save_latest: bool = True
@@ -53,6 +75,7 @@ class ConfigBundle:
     env: LongitudinalEnvConfig
     training: TrainingParams
     output: OutputConfig
+    sysid: SysIDParams
     reference_dataset: str | None = None
     # Fitted vehicle randomization config
     fitted_params_path: str | None = None
@@ -93,6 +116,7 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
     seed = overrides.seed if overrides.seed is not None else raw.get("seed", 0)
     env_cfg = LongitudinalEnvConfig(**raw.get("env", {}))
     training_cfg = TrainingParams(**raw.get("training", {}))
+    sysid_cfg = SysIDParams(**raw.get("sysid", {}))
     output_block = raw.get("output", {})
     output_dir = overrides.output_dir if overrides.output_dir else Path(output_block.get("dir", "training/checkpoints"))
     output = OutputConfig(dir=Path(output_dir), save_latest=output_block.get("save_latest", True))
@@ -119,6 +143,7 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
         seed=seed,
         env=env_cfg,
         training=training_cfg,
+        sysid=sysid_cfg,
         output=output,
         reference_dataset=reference_dataset,
         fitted_params_path=fitted_params_path,
@@ -129,37 +154,197 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
 
 
 class ReplayBuffer:
-    """Simple numpy-backed replay buffer."""
+    """Unified replay buffer for SAC and SysID training.
+    
+    Stores both single-step transitions (for SAC) and sequence data (for SysID).
+    Supports:
+        - Single-step sampling with z_t and z_{t+1} for SAC
+        - Sequence sampling with burn-in and rollout windows for SysID
+    """
 
-    def __init__(self, obs_dim: int, action_dim: int, capacity: int):
+    def __init__(self, obs_dim: int, action_dim: int, capacity: int, z_dim: int = 0):
+        """Initialize replay buffer.
+        
+        Args:
+            obs_dim: Observation dimension (without z)
+            action_dim: Action dimension
+            capacity: Buffer capacity
+            z_dim: Dynamics latent dimension (0 = disabled, for backward compatibility)
+        """
         self.capacity = capacity
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.z_dim = z_dim
+        
+        # SAC buffers
         self.obs_buf = np.zeros((capacity, obs_dim), dtype=np.float32)
         self.next_obs_buf = np.zeros((capacity, obs_dim), dtype=np.float32)
         self.action_buf = np.zeros((capacity, action_dim), dtype=np.float32)
         self.reward_buf = np.zeros((capacity, 1), dtype=np.float32)
         self.done_buf = np.zeros((capacity, 1), dtype=np.float32)
+        
+        # SysID buffers (only allocated if z_dim > 0)
+        if z_dim > 0:
+            self.speed_buf = np.zeros((capacity,), dtype=np.float32)
+            self.z_buf = np.zeros((capacity, z_dim), dtype=np.float32)
+            self.z_next_buf = np.zeros((capacity, z_dim), dtype=np.float32)
+            self.episode_id_buf = np.zeros((capacity,), dtype=np.int32)
+            self.step_in_episode_buf = np.zeros((capacity,), dtype=np.int32)
+        else:
+            self.speed_buf = None
+            self.z_buf = None
+            self.z_next_buf = None
+            self.episode_id_buf = None
+            self.step_in_episode_buf = None
+        
         self.ptr = 0
         self.size = 0
+        self._current_episode_id = 0
+        self._current_episode_step = 0
 
-    def add(self, obs: np.ndarray, action: np.ndarray, reward: float, next_obs: np.ndarray, done: bool) -> None:
+    def add(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_obs: np.ndarray,
+        done: bool,
+        speed: float | None = None,
+        z: np.ndarray | None = None,
+        z_next: np.ndarray | None = None,
+        episode_id: int | None = None,
+        step_in_episode: int | None = None
+    ) -> None:
+        """Add transition to buffer.
+        
+        Args:
+            obs: Observation (without z)
+            action: Action
+            reward: Reward
+            next_obs: Next observation (without z)
+            done: Done flag
+            speed: Raw speed v_t (for SysID, optional)
+            z: Dynamics latent z_t (for SAC, optional)
+            z_next: Dynamics latent z_{t+1} (for SAC, optional)
+            episode_id: Episode ID (for SysID sequence sampling, optional)
+            step_in_episode: Step index in episode (for SysID, optional)
+        """
         self.obs_buf[self.ptr] = obs
         self.action_buf[self.ptr] = action
         self.reward_buf[self.ptr] = reward
         self.next_obs_buf[self.ptr] = next_obs
         self.done_buf[self.ptr] = float(done)
+        
+        # Store SysID data if available
+        if self.z_dim > 0:
+            if speed is not None:
+                self.speed_buf[self.ptr] = speed
+            if z is not None:
+                self.z_buf[self.ptr] = z
+            if z_next is not None:
+                self.z_next_buf[self.ptr] = z_next
+            if episode_id is not None:
+                self.episode_id_buf[self.ptr] = episode_id
+            if step_in_episode is not None:
+                self.step_in_episode_buf[self.ptr] = step_in_episode
+        
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, ...]:
+        """Sample single-step transitions for SAC training.
+        
+        Returns:
+            If z_dim == 0: (obs, action, reward, next_obs, done)
+            If z_dim > 0: (obs_aug, action, reward, next_obs_aug, done)
+                where obs_aug = [obs, z] and next_obs_aug = [next_obs, z_next]
+        """
         idxs = np.random.randint(0, self.size, size=batch_size)
-        batch = (
-            torch.as_tensor(self.obs_buf[idxs], device=device),
-            torch.as_tensor(self.action_buf[idxs], device=device),
-            torch.as_tensor(self.reward_buf[idxs], device=device),
-            torch.as_tensor(self.next_obs_buf[idxs], device=device),
-            torch.as_tensor(self.done_buf[idxs], device=device),
-        )
+        
+        if self.z_dim == 0:
+            # Backward compatibility: no z augmentation
+            batch = (
+                torch.as_tensor(self.obs_buf[idxs], device=device),
+                torch.as_tensor(self.action_buf[idxs], device=device),
+                torch.as_tensor(self.reward_buf[idxs], device=device),
+                torch.as_tensor(self.next_obs_buf[idxs], device=device),
+                torch.as_tensor(self.done_buf[idxs], device=device),
+            )
+        else:
+            # Augment observations with z
+            obs = self.obs_buf[idxs]
+            next_obs = self.next_obs_buf[idxs]
+            z = self.z_buf[idxs]
+            z_next = self.z_next_buf[idxs]
+            
+            obs_aug = np.concatenate([obs, z], axis=1)
+            next_obs_aug = np.concatenate([next_obs, z_next], axis=1)
+            
+            batch = (
+                torch.as_tensor(obs_aug, device=device),
+                torch.as_tensor(self.action_buf[idxs], device=device),
+                torch.as_tensor(self.reward_buf[idxs], device=device),
+                torch.as_tensor(next_obs_aug, device=device),
+                torch.as_tensor(self.done_buf[idxs], device=device),
+            )
+        
         return batch
+    
+    def sample_sequences(
+        self,
+        batch_size: int,
+        burn_in: int,
+        horizon: int,
+        rng: np.random.Generator | None = None
+    ):
+        """Sample sequences for SysID training.
+        
+        Args:
+            batch_size: Number of sequences to sample
+            burn_in: Number of burn-in steps
+            horizon: Number of rollout steps
+            rng: Random number generator
+        
+        Returns:
+            SequenceBatch or None if not enough valid sequences
+        """
+        if self.z_dim == 0:
+            raise ValueError("Cannot sample sequences: SysID is disabled (z_dim=0)")
+        
+        from src.sysid.dataset import sample_sequences
+        
+        return sample_sequences(
+            speed_buf=self.speed_buf,
+            action_buf=self.action_buf,
+            episode_id_buf=self.episode_id_buf,
+            step_in_episode_buf=self.step_in_episode_buf,
+            buffer_size=self.size,
+            batch_size=batch_size,
+            burn_in=burn_in,
+            horizon=horizon,
+            rng=rng
+        )
+    
+    def start_new_episode(self) -> None:
+        """Start a new episode (increments episode ID, resets step counter)."""
+        if self.z_dim > 0:
+            self._current_episode_id += 1
+            self._current_episode_step = 0
+    
+    def get_current_episode_info(self) -> Tuple[int, int]:
+        """Get current episode ID and step index.
+        
+        Returns:
+            Tuple of (episode_id, step_in_episode)
+        """
+        if self.z_dim == 0:
+            return 0, 0
+        return self._current_episode_id, self._current_episode_step
+    
+    def increment_episode_step(self) -> None:
+        """Increment step counter in current episode."""
+        if self.z_dim > 0:
+            self._current_episode_step += 1
 
 
 def mlp(input_dim: int, output_dim: int, hidden_dim: int = 256, depth: int = 2) -> nn.Sequential:
@@ -174,7 +359,12 @@ def mlp(input_dim: int, output_dim: int, hidden_dim: int = 256, depth: int = 2) 
 
 
 class GaussianPolicy(nn.Module):
-    """Gaussian policy with Tanh squashing and action-range scaling."""
+    """Gaussian policy with Tanh squashing and action-range scaling.
+    
+    Supports optional vehicle dynamics latent z:
+        - If z_dim > 0: expects obs of shape (batch, obs_dim + z_dim)
+        - If z_dim == 0: backward compatible with obs of shape (batch, obs_dim)
+    """
 
     def __init__(
         self,
@@ -183,10 +373,26 @@ class GaussianPolicy(nn.Module):
         action_low: np.ndarray,
         action_high: np.ndarray,
         hidden_dim: int = 256,
+        z_dim: int = 0,
     ):
+        """Initialize policy.
+        
+        Args:
+            obs_dim: Base observation dimension (without z)
+            action_dim: Action dimension
+            action_low: Action lower bounds
+            action_high: Action upper bounds
+            hidden_dim: Hidden layer dimension
+            z_dim: Dynamics latent dimension (0 = disabled, backward compatible)
+        """
         super().__init__()
+        self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.net = mlp(obs_dim, hidden_dim, hidden_dim=hidden_dim, depth=2)
+        self.z_dim = z_dim
+        
+        # Network input is obs_dim + z_dim
+        input_dim = obs_dim + z_dim
+        self.net = mlp(input_dim, hidden_dim, hidden_dim=hidden_dim, depth=2)
         self.mu_head = nn.Linear(hidden_dim, action_dim)
         self.log_std_head = nn.Linear(hidden_dim, action_dim)
         action_low = np.asarray(action_low, dtype=np.float32)
@@ -218,9 +424,30 @@ class GaussianPolicy(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256):
+    """Q-network for SAC critic.
+    
+    Supports optional vehicle dynamics latent z:
+        - If z_dim > 0: expects obs of shape (batch, obs_dim + z_dim)
+        - If z_dim == 0: backward compatible with obs of shape (batch, obs_dim)
+    """
+    
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256, z_dim: int = 0):
+        """Initialize Q-network.
+        
+        Args:
+            obs_dim: Base observation dimension (without z)
+            action_dim: Action dimension
+            hidden_dim: Hidden layer dimension
+            z_dim: Dynamics latent dimension (0 = disabled, backward compatible)
+        """
         super().__init__()
-        self.net = mlp(obs_dim + action_dim, 1, hidden_dim=hidden_dim, depth=2)
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.z_dim = z_dim
+        
+        # Network input is obs_dim + z_dim + action_dim
+        input_dim = obs_dim + z_dim + action_dim
+        self.net = mlp(input_dim, 1, hidden_dim=hidden_dim, depth=2)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         x = torch.cat([obs, action], dim=-1)
@@ -251,12 +478,119 @@ class SACTrainer:
         action_low = np.tile(self.env_action_low, self.action_horizon)
         action_high = np.tile(self.env_action_high, self.action_horizon)
 
-        self.replay_buffer = ReplayBuffer(obs_dim, self.policy_action_dim, cfg.training.replay_size)
-        self.policy = GaussianPolicy(obs_dim, self.policy_action_dim, action_low, action_high)
-        self.q1 = QNetwork(obs_dim, self.policy_action_dim)
-        self.q2 = QNetwork(obs_dim, self.policy_action_dim)
-        self.target_q1 = QNetwork(obs_dim, self.policy_action_dim)
-        self.target_q2 = QNetwork(obs_dim, self.policy_action_dim)
+        # SysID setup
+        self.sysid_enabled = cfg.sysid.enabled
+        z_dim = cfg.sysid.dz if self.sysid_enabled else 0
+        
+        # Initialize SysID components if enabled
+        if self.sysid_enabled:
+            from src.sysid import (
+                ContextEncoder,
+                DynamicsPredictor,
+                FeatureBuilder,
+                RunningNorm,
+                SysIDTrainer as SysIDTrainerClass,
+            )
+            
+            # Create encoder and predictor
+            self.encoder = ContextEncoder(
+                input_dim=4,
+                hidden_dim=cfg.sysid.gru_hidden,
+                z_dim=cfg.sysid.dz
+            ).to(self.device)
+            
+            self.predictor = DynamicsPredictor(
+                z_dim=cfg.sysid.dz,
+                hidden_dim=cfg.sysid.predictor_hidden,
+                num_layers=cfg.sysid.predictor_layers
+            ).to(self.device)
+            
+            # Create normalizers
+            self.encoder_norm = RunningNorm(
+                dim=4,
+                eps=cfg.sysid.norm_eps,
+                clip=cfg.sysid.norm_clip
+            ).to(self.device)
+            
+            self.predictor_v_norm = RunningNorm(
+                dim=1,
+                eps=cfg.sysid.norm_eps,
+                clip=cfg.sysid.norm_clip
+            ).to(self.device)
+            
+            self.predictor_u_norm = RunningNorm(
+                dim=1,
+                eps=cfg.sysid.norm_eps,
+                clip=cfg.sysid.norm_clip
+            ).to(self.device)
+            
+            # Load pretrained SysID if provided
+            if cfg.sysid.pretrained_path:
+                pretrained_path = Path(cfg.sysid.pretrained_path)
+                if pretrained_path.exists():
+                    accelerator.print(f"[sysid] Loading pretrained SysID from {pretrained_path}")
+                    checkpoint = torch.load(pretrained_path, map_location=self.device, weights_only=False)
+                    
+                    self.encoder.load_state_dict(checkpoint["encoder"])
+                    self.predictor.load_state_dict(checkpoint["predictor"])
+                    self.encoder_norm.load_state_dict(checkpoint["encoder_norm"])
+                    self.predictor_v_norm.load_state_dict(checkpoint["predictor_v_norm"])
+                    self.predictor_u_norm.load_state_dict(checkpoint["predictor_u_norm"])
+                    
+                    accelerator.print(f"[sysid] Loaded pretrained SysID (step {checkpoint.get('step', 'unknown')})")
+                    
+                    # Optionally freeze encoder
+                    if cfg.sysid.freeze_encoder:
+                        for param in self.encoder.parameters():
+                            param.requires_grad = False
+                        for param in self.predictor.parameters():
+                            param.requires_grad = False
+                        accelerator.print("[sysid] Froze encoder and predictor parameters")
+                else:
+                    accelerator.print(f"[sysid] Warning: Pretrained path {pretrained_path} not found, training from scratch")
+            
+            # Create SysID trainer (even if frozen, for potential fine-tuning)
+            self.sysid_trainer = SysIDTrainerClass(
+                encoder=self.encoder,
+                predictor=self.predictor,
+                encoder_norm=self.encoder_norm,
+                predictor_v_norm=self.predictor_v_norm,
+                predictor_u_norm=self.predictor_u_norm,
+                learning_rate=cfg.sysid.learning_rate,
+                lambda_slow=cfg.sysid.lambda_slow,
+                lambda_z=cfg.sysid.lambda_z,
+                dt=cfg.env.dt,
+                device=self.device
+            )
+            
+            # Feature builder for online inference
+            self.feature_builder = FeatureBuilder(dt=cfg.env.dt)
+            
+            # Encoder hidden state (single env, so shape is (hidden_dim,))
+            self.encoder_hidden = self.encoder.reset(batch_size=1, device=self.device).squeeze(0)
+            
+            # Speed and action history for features
+            self.prev_speed = 0.0
+            self.prev_action = 0.0
+            
+            # Track if encoder is frozen
+            self.encoder_frozen = cfg.sysid.freeze_encoder and cfg.sysid.pretrained_path is not None
+        else:
+            self.encoder = None
+            self.predictor = None
+            self.sysid_trainer = None
+            self.feature_builder = None
+            self.encoder_hidden = None
+
+        # Replay buffer with SysID support
+        self.replay_buffer = ReplayBuffer(obs_dim, self.policy_action_dim, cfg.training.replay_size, z_dim=z_dim)
+        
+        # SAC networks (with z_dim)
+        self.policy = GaussianPolicy(obs_dim, self.policy_action_dim, action_low, action_high, z_dim=z_dim)
+        self.q1 = QNetwork(obs_dim, self.policy_action_dim, z_dim=z_dim)
+        self.q2 = QNetwork(obs_dim, self.policy_action_dim, z_dim=z_dim)
+        self.target_q1 = QNetwork(obs_dim, self.policy_action_dim, z_dim=z_dim)
+        self.target_q2 = QNetwork(obs_dim, self.policy_action_dim, z_dim=z_dim)
         self.target_q1.load_state_dict(self.q1.state_dict())
         self.target_q2.load_state_dict(self.q2.state_dict())
 
@@ -308,20 +642,120 @@ class SACTrainer:
         return action_vec.astype(np.float32), float(env_action[0])
 
     def collect_step(self, obs: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Collect a single environment step.
+        
+        If SysID is enabled:
+            1. Extract speed from observation
+            2. Compute z_t from encoder
+            3. Augment observation with z_t
+            4. Sample action from policy(obs_aug)
+            5. Step environment
+            6. Compute z_{t+1}
+            7. Store transition with z_t, z_{t+1}, speed, etc.
+        """
+        # Get current speed from observation (first element)
+        current_speed = obs[0]
+        
+        # Compute z_t if SysID enabled
+        if self.sysid_enabled:
+            from src.sysid.integration import compute_z_online
+            
+            # Compute z_t (this updates feature_builder history internally)
+            self.encoder_hidden, z_t = compute_z_online(
+                encoder=self.encoder,
+                feature_builder=self.feature_builder,
+                encoder_norm=self.encoder_norm,
+                h_prev=self.encoder_hidden,
+                v_t=current_speed,
+                u_t=self.prev_action,
+                device=self.device
+            )
+            
+            z_t_np = z_t.cpu().numpy()
+            
+            # Augment observation with z_t
+            obs_aug = np.concatenate([obs, z_t_np])
+        else:
+            obs_aug = obs
+            z_t_np = None
+        
+        # Sample action
         if self._global_step < self.cfg.training.warmup_steps:
             env_action = self.env.action_space.sample()
             action_vec = np.tile(env_action, self.action_horizon).astype(np.float32)
             action_scalar = float(env_action[0])
         else:
-            action_vec, action_scalar = self.act(obs)
+            action_vec, action_scalar = self.act(obs_aug)
+        
+        # Step environment
         next_obs, reward, terminated, truncated, info = self.env.step(action_scalar)
         done = terminated or truncated
-        self.replay_buffer.add(obs, action_vec, reward, next_obs, done)
+        
+        # Get next speed
+        next_speed = next_obs[0]
+        
+        # Compute z_{t+1} if SysID enabled
+        if self.sysid_enabled:
+            from src.sysid.integration import compute_z_online
+            
+            # Compute z_{t+1} (updates hidden state)
+            self.encoder_hidden, z_next = compute_z_online(
+                encoder=self.encoder,
+                feature_builder=self.feature_builder,
+                encoder_norm=self.encoder_norm,
+                h_prev=self.encoder_hidden,
+                v_t=next_speed,
+                u_t=action_scalar,
+                device=self.device
+            )
+            
+            z_next_np = z_next.cpu().numpy()
+        else:
+            z_next_np = None
+        
+        # Get episode info
+        episode_id, step_in_episode = self.replay_buffer.get_current_episode_info()
+        
+        # Store transition (with SysID data if enabled)
+        self.replay_buffer.add(
+            obs=obs,
+            action=action_vec,
+            reward=reward,
+            next_obs=next_obs,
+            done=done,
+            speed=current_speed if self.sysid_enabled else None,
+            z=z_t_np,
+            z_next=z_next_np,
+            episode_id=episode_id,
+            step_in_episode=step_in_episode
+        )
+        
+        # Update replay buffer episode tracking
+        self.replay_buffer.increment_episode_step()
+        
+        # Update history
+        if self.sysid_enabled:
+            self.prev_speed = current_speed
+            self.prev_action = action_scalar
+        
+        # Episode bookkeeping
         self._episode_reward += reward
         self._episode_length += 1
         self._global_step += 1
+        
         if done:
             obs, _ = self.env.reset()
+            
+            # Reset encoder state for new episode
+            if self.sysid_enabled:
+                self.encoder_hidden = self.encoder.reset(batch_size=1, device=self.device).squeeze(0)
+                self.feature_builder.reset()
+                self.prev_speed = obs[0]
+                self.prev_action = 0.0
+            
+            # Start new episode in replay buffer
+            self.replay_buffer.start_new_episode()
+            
             self.accelerator.log(
                 {
                     "train/episode_reward": self._episode_reward,
@@ -331,6 +765,7 @@ class SACTrainer:
             )
             self._episode_reward = 0.0
             self._episode_length = 0
+        
         return (next_obs if not done else obs), reward
 
     def update(self) -> Dict[str, float]:
@@ -379,17 +814,84 @@ class SACTrainer:
         tau = self.cfg.training.tau
         for tgt_param, src_param in zip(target.parameters(), source.parameters()):
             tgt_param.data.copy_(tau * src_param.data + (1.0 - tau) * tgt_param.data)
+    
+    def update_sysid(self) -> Dict[str, float]:
+        """Update SysID encoder and predictor.
+        
+        Returns:
+            Dictionary of SysID metrics for logging
+        """
+        if not self.sysid_enabled:
+            return {}
+        
+        # Sample sequences from replay buffer
+        batch = self.replay_buffer.sample_sequences(
+            batch_size=self.cfg.training.batch_size,
+            burn_in=self.cfg.sysid.burn_in,
+            horizon=self.cfg.sysid.horizon
+        )
+        
+        if batch is None:
+            # Not enough valid sequences yet
+            return {"sysid/skipped": 1.0}
+        
+        # Train SysID
+        metrics = self.sysid_trainer.train_step(batch)
+        
+        return metrics
 
     def evaluate(self) -> Dict[str, float]:
         rewards = []
         speed_errors = []
+        
+        # For SysID: maintain separate eval encoder state
+        if self.sysid_enabled:
+            from src.sysid.encoder import FeatureBuilder
+            eval_encoder_hidden = self.encoder.reset(batch_size=1, device=self.device).squeeze(0)
+            eval_feature_builder = FeatureBuilder(dt=self.cfg.env.dt)
+            eval_prev_speed = 0.0
+            eval_prev_action = 0.0
+        
         for _ in range(self.cfg.training.eval_episodes):
             obs, _ = self.eval_env.reset()
+            
+            # Reset encoder state for new eval episode
+            if self.sysid_enabled:
+                eval_encoder_hidden = self.encoder.reset(batch_size=1, device=self.device).squeeze(0)
+                eval_feature_builder.reset()
+                eval_prev_speed = obs[0]
+                eval_prev_action = 0.0
+            
             done = False
             episode_reward = 0.0
             while not done:
-                _, action_scalar = self.act(obs, deterministic=True)
+                # Compute z_t if SysID enabled
+                if self.sysid_enabled:
+                    from src.sysid.integration import compute_z_online
+                    
+                    current_speed = obs[0]
+                    eval_encoder_hidden, z_t = compute_z_online(
+                        encoder=self.encoder,
+                        feature_builder=eval_feature_builder,
+                        encoder_norm=self.encoder_norm,
+                        h_prev=eval_encoder_hidden,
+                        v_t=current_speed,
+                        u_t=eval_prev_action,
+                        device=self.device
+                    )
+                    z_t_np = z_t.cpu().numpy()
+                    obs_aug = np.concatenate([obs, z_t_np])
+                else:
+                    obs_aug = obs
+                
+                _, action_scalar = self.act(obs_aug, deterministic=True)
                 obs, reward, terminated, truncated, info = self.eval_env.step(action_scalar)
+                
+                # Update eval history for next step
+                if self.sysid_enabled:
+                    eval_prev_speed = obs[0]
+                    eval_prev_action = action_scalar
+                
                 episode_reward += reward
                 speed_errors.append(abs(info.get("speed_error", 0.0)))
                 done = terminated or truncated
@@ -416,6 +918,7 @@ class SACTrainer:
             "config": {
                 "env": asdict(self.cfg.env),
                 "training": asdict(self.cfg.training),
+                "sysid": asdict(self.cfg.sysid),
                 "seed": self.cfg.seed,
                 "num_train_timesteps": self.cfg.training.num_train_timesteps,
             },
@@ -423,13 +926,26 @@ class SACTrainer:
                 "obs_dim": self.env.observation_space.shape[0],
                 "env_action_dim": self.env_action_dim,
                 "policy_action_dim": self.policy_action_dim,
+                "sysid_enabled": self.sysid_enabled,
             },
         }
+        
+        # Save SysID components if enabled
+        if self.sysid_enabled:
+            state["encoder"] = self.encoder.state_dict()
+            state["predictor"] = self.predictor.state_dict()
+            state["encoder_norm"] = self.encoder_norm.state_dict()
+            state["predictor_v_norm"] = self.predictor_v_norm.state_dict()
+            state["predictor_u_norm"] = self.predictor_u_norm.state_dict()
+            state["sysid_optimizer"] = self.sysid_trainer.optimizer.state_dict()
+        
         self.cfg.output.dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = self.cfg.output.dir / f"sac_step_{step}.pt"
         torch.save(state, ckpt_path)
         if self.cfg.output.save_latest:
             torch.save(state, self.cfg.output.dir / "latest.pt")
+
+        self.accelerator.print(f"[checkpoint] saved {ckpt_path}")
         self.accelerator.print(f"[checkpoint] saved {ckpt_path}")
 
 
@@ -509,6 +1025,16 @@ def train(config: ConfigBundle) -> None:
         # Load log_alpha
         trainer.log_alpha.data = checkpoint["log_alpha"].to(trainer.device)
         
+        # Load SysID components if available
+        if config.sysid.enabled and "encoder" in checkpoint:
+            accelerator.print("[resume] Loading SysID components")
+            trainer.encoder.load_state_dict(checkpoint["encoder"])
+            trainer.predictor.load_state_dict(checkpoint["predictor"])
+            trainer.encoder_norm.load_state_dict(checkpoint["encoder_norm"])
+            trainer.predictor_v_norm.load_state_dict(checkpoint["predictor_v_norm"])
+            trainer.predictor_u_norm.load_state_dict(checkpoint["predictor_u_norm"])
+            trainer.sysid_trainer.optimizer.load_state_dict(checkpoint["sysid_optimizer"])
+        
         # Update trainer's global step
         trainer._global_step = start_step
         
@@ -527,7 +1053,19 @@ def train(config: ConfigBundle) -> None:
         obs, reward = trainer.collect_step(obs)
 
         if trainer.replay_buffer.size >= config.training.batch_size:
+            # SAC update
             metrics = trainer.update()
+            
+            # SysID update (if enabled, scheduled, and not frozen)
+            if config.sysid.enabled and step % config.sysid.update_every == 0:
+                if hasattr(trainer, 'encoder_frozen') and trainer.encoder_frozen:
+                    # Skip SysID updates if encoder is frozen
+                    pass
+                else:
+                    for _ in range(config.sysid.updates_per_step):
+                        sysid_metrics = trainer.update_sysid()
+                        metrics.update(sysid_metrics)
+            
             if step % config.training.log_interval == 0:
                 accelerator.log(metrics, step=step)
 
@@ -542,9 +1080,13 @@ def train(config: ConfigBundle) -> None:
         if accelerator.is_main_process and step % config.training.log_interval == 0:
             now = time.time()
             fps = config.training.log_interval / max(now - last_log, 1e-6)
-            accelerator.print(
-                f"[train] step={step} reward={reward:.3f} buffer={trainer.replay_buffer.size} fps={fps:.1f}"
-            )
+            
+            # Build log message
+            log_msg = f"[train] step={step} reward={reward:.3f} buffer={trainer.replay_buffer.size} fps={fps:.1f}"
+            if config.sysid.enabled and "sysid/pred_loss" in metrics:
+                log_msg += f" sysid_loss={metrics['sysid/pred_loss']:.4f}"
+            
+            accelerator.print(log_msg)
             progress.set_postfix(
                 reward=f"{reward:.2f}",
                 buffer=trainer.replay_buffer.size,

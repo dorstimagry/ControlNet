@@ -474,34 +474,34 @@ def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomiz
         # Feasibility checks per new_params_randomization.md section 9
         # Skip if explicitly disabled (fitted params mode)
         if not rand.skip_feasibility_checks:
-        # Check 1: Minimum acceleration from rest
-        if caps['a_max_from_rest'] < rand.min_accel_from_rest:
-            continue
-        
-        # Check 2: Minimum top speed (no-load or steady-state)
-        if caps['v_no_load_max'] < rand.min_top_speed:
-            continue
-        if caps['v_ss_level'] < rand.min_top_speed * 0.8:  # Allow some margin
-            continue
-        
-        # Check 3: Minimum braking deceleration
-        if caps['a_brake_max'] < rand.min_brake_decel:
-            continue
+            # Check 1: Minimum acceleration from rest
+            if caps['a_max_from_rest'] < rand.min_accel_from_rest:
+                continue
+            
+            # Check 2: Minimum top speed (no-load or steady-state)
+            if caps['v_no_load_max'] < rand.min_top_speed:
+                continue
+            if caps['v_ss_level'] < rand.min_top_speed * 0.8:  # Allow some margin
+                continue
+            
+            # Check 3: Minimum braking deceleration
+            if caps['a_brake_max'] < rand.min_brake_decel:
+                continue
         
         # Sanity checks - skip if flag is set (fitted params mode)
         if not rand.skip_sanity_checks:
-        # Sanity check: viscous torque should be small compared to EM torque
-        omega_ref = 300.0  # rad/s reference
-        I_ref = min(V_max / R, 500.0)  # capped reference current
-        tau_visc = b * omega_ref
-        tau_em = K_t * I_ref
-        if tau_visc > 0.2 * tau_em:
-            continue  # Viscous damping too high
-        
-        # Sanity check: reasonable stall current (cap at 2000A for realism)
-        i_stall = V_max / R
-        if i_stall > 2000.0:
-            continue
+            # Sanity check: viscous torque should be small compared to EM torque
+            omega_ref = 300.0  # rad/s reference
+            I_ref = min(V_max / R, 500.0)  # capped reference current
+            tau_visc = b * omega_ref
+            tau_em = K_t * I_ref
+            if tau_visc > 0.2 * tau_em:
+                continue  # Viscous damping too high
+            
+            # Sanity check: reasonable stall current (cap at 2000A for realism)
+            i_stall = V_max / R
+            if i_stall > 2000.0:
+                continue
         
         # All checks passed - create parameter objects
         body = BodyParams(
