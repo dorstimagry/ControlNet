@@ -92,6 +92,12 @@ generator:
   # Speed limit safety factor
   speed_limit_safety_factor: 0.8  # Multiplier for max feasible speed (0.75 = 25% reduction from theoretical max)
 
+# Creep torque configuration (EV-style creep behavior)
+creep:
+  a_max: 0.5              # [m/s²] maximum creep acceleration
+  v_cutoff: 2.0           # [m/s] speed where creep fully fades out  
+  v_hold: 0.08            # [m/s] standstill region threshold
+
 vehicle_randomization:
   # Fitted vehicle mode (optional): use fitted params as center of randomization
   # mode: "fitted"                        # "default" for standard ranges, "fitted" for centered

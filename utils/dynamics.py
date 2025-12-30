@@ -140,11 +140,24 @@ class WheelParams:
 
 
 @dataclass(slots=True)
+class CreepParams:
+    """EV-style creep torque parameters.
+    
+    Creep provides low-speed forward motion at zero throttle, mimicking
+    ICE idle behavior without introducing idle RPMs or discontinuities.
+    """
+    a_max: float = 0.5      # [m/s²] maximum creep acceleration
+    v_cutoff: float = 1.5   # [m/s] speed where creep fully fades out
+    v_hold: float = 0.08    # [m/s] standstill region threshold
+
+
+@dataclass(slots=True)
 class ExtendedPlantParams:
     motor: MotorParams = MotorParams()
     brake: BrakeParams = BrakeParams()
     body: BodyParams = BodyParams()
     wheel: WheelParams = WheelParams()
+    creep: CreepParams = CreepParams()
 
 
 @dataclass(slots=True)
@@ -188,6 +201,11 @@ class ExtendedPlantRandomization:
     # Efficiency
     eta_gb_range: Tuple[float, float] = (0.85, 0.98)  # gearbox efficiency
     
+    # Creep parameters (optional, None = use fixed default values)
+    creep_a_max: float | None = None  # [m/s²] max creep acceleration (None = use default 0.5)
+    creep_v_cutoff: float | None = None  # [m/s] creep fade speed (None = use default 1.5)
+    creep_v_hold: float | None = None  # [m/s] standstill threshold (None = use default 0.08)
+    
     # Feasibility thresholds (for rejection sampling)
     min_accel_from_rest: float = 2.5  # m/s² - minimum required acceleration at standstill
     min_brake_decel: float = 4.0  # m/s² - minimum braking deceleration
@@ -224,6 +242,10 @@ class ExtendedPlantRandomization:
             wheel_radius_range=tuple(vr_config.get('wheel_radius_range', (0.26, 0.38))),
             wheel_inertia_range=tuple(vr_config.get('wheel_inertia_range', (0.5, 5.0))),
             eta_gb_range=tuple(vr_config.get('eta_gb_range', (0.85, 0.98))),
+            # Creep parameters (optional, from top-level 'creep' key if present)
+            creep_a_max=config.get('creep', {}).get('a_max'),
+            creep_v_cutoff=config.get('creep', {}).get('v_cutoff'),
+            creep_v_hold=config.get('creep', {}).get('v_hold'),
             # Feasibility thresholds
             min_accel_from_rest=vr_config.get('min_accel_from_rest', 2.5),
             min_brake_decel=vr_config.get('min_brake_decel', 4.0),
@@ -533,7 +555,13 @@ def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomiz
             inertia=wheel_inertia,
             v_eps=0.1,  # keep fixed
         )
-        return ExtendedPlantParams(motor=motor, brake=brake, body=body, wheel=wheel)
+        # Creep parameters: use from config if specified, otherwise use defaults
+        creep = CreepParams(
+            a_max=rand.creep_a_max if rand.creep_a_max is not None else 0.5,
+            v_cutoff=rand.creep_v_cutoff if rand.creep_v_cutoff is not None else 1.5,
+            v_hold=rand.creep_v_hold if rand.creep_v_hold is not None else 0.08,
+        )
+        return ExtendedPlantParams(motor=motor, brake=brake, body=body, wheel=wheel, creep=creep)
 
     # Fallback if rejection sampling fails
     raise RuntimeError(f"Could not find suitable parameters after {max_attempts} attempts. "
@@ -565,6 +593,7 @@ class ExtendedPlantState:
     grade_force: float
     net_force: float
     held_by_brakes: bool  # True when vehicle is held at rest by brakes/static friction
+    creep_torque: float  # Creep torque at motor shaft (Nm) - for diagnostics
     coupling_enabled: bool  # True when motor is coupled to wheel (False during braking)
 
 
@@ -599,6 +628,7 @@ class ExtendedPlant:
         self.grade_force = 0.0
         self.net_force = 0.0
         self.held_by_brakes = False
+        self.creep_torque = 0.0  # Initialize creep torque
         self._current_grade_rad = None  # Current grade override (None = use body.grade_rad)
         # Initialize previous motor states for coupling
         self.motor_current_prev = 0.0
@@ -631,6 +661,7 @@ class ExtendedPlant:
             grade_force=self.grade_force,
             net_force=self.net_force,
             held_by_brakes=self.held_by_brakes,
+            creep_torque=self.creep_torque,
             coupling_enabled=self._coupling_enabled,
         )
 
@@ -688,6 +719,50 @@ class ExtendedPlant:
         eta = motor.eta_gb
         r_w = wheel.radius
         J_w = wheel.inertia
+        
+        # ===== CREEP TORQUE COMPUTATION =====
+        # Compute EV-style creep behavior: low-speed forward motion at zero throttle
+        # Creep is parameterized by max acceleration and fades with speed
+        creep = self.params.creep
+        
+        # Step 1: Convert creep acceleration to motor torque (dynamic computation)
+        # This ensures creep adapts to vehicle mass, gear ratio, etc.
+        F_creep_max = body.mass * creep.a_max  # [N] max creep force
+        T_wheel_creep_max = F_creep_max * r_w  # [Nm] max creep torque at wheel
+        T_motor_creep_max = T_wheel_creep_max / (N * eta)  # [Nm] max creep torque at motor shaft
+        
+        # Step 2: Speed-dependent fade using cubic smoothstep
+        # Creep fades smoothly from full at v=0 to zero at v=v_cutoff
+        # Use current motor omega to compute vehicle speed
+        omega_m_current = self.motor_omega
+        v_current = (omega_m_current / N) * r_w  # current vehicle speed from motor
+        v_abs = abs(v_current)
+        x = v_abs / max(creep.v_cutoff, 1e-6)  # normalized speed
+        if x < 1.0:
+            w_fade = 1.0 - 3.0 * x**2 + 2.0 * x**3  # cubic smoothstep: C1 continuous
+        else:
+            w_fade = 0.0
+        
+        # Step 3: Brake dominance - creep must never fight the brake
+        # Smoothly suppress creep as brake is applied
+        w_brake_suppression = 1.0 - brake_cmd
+        
+        # Final creep torque at motor shaft
+        T_creep_motor = T_motor_creep_max * w_fade * w_brake_suppression
+        self.creep_torque = float(T_creep_motor)  # Store for diagnostics
+        
+        # Step 4: Convert creep torque to equivalent voltage addition
+        # When coasting (u <= 0), add creep voltage to V_cmd
+        # Creep provides a "virtual voltage" that produces the desired torque
+        # From motor equation: tau_m = K_t * i, and i = (V - K_e*omega) / R
+        # So: tau_m = K_t * (V - K_e*omega) / R
+        # Solving for V given desired tau_m: V = (tau_m * R / K_t) + K_e*omega
+        V_creep = (T_creep_motor * R / max(K_t, 1e-9)) + K_e * omega_m_current
+        
+        # Apply creep voltage only when not actively throttling (u <= 0)
+        # This ensures smooth blending: throttle dominates when u > 0, creep fills in when u ≈ 0
+        if u <= 0:
+            self.V_cmd = max(V_creep, 0.0)  # Creep voltage (non-negative)
 
         # Combined inertia at motor shaft for single-DOF rigid coupling:
         # J_eff = J_m + (J_w + m * r_w^2) / N^2

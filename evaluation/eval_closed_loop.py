@@ -347,6 +347,8 @@ def run_closed_loop_evaluation(
         rolling_forces: list[float] = []
         grade_forces: list[float] = []
         net_forces: list[float] = []
+        # SysID latent tracking
+        z_latents: list[np.ndarray] = []  # Store z values if SysID enabled
         step_idx = 0
 
         while not done:
@@ -367,6 +369,8 @@ def run_closed_loop_evaluation(
                     device=device
                 )
                 z_t_np = z_t.cpu().numpy()
+                # Store z for analysis
+                z_latents.append(z_t_np)
                 # Augment observation with z_t
                 obs_aug = np.concatenate([obs, z_t_np])
             else:
@@ -485,15 +489,6 @@ def run_closed_loop_evaluation(
                     "mismatch_fraction": mismatch_fraction,
                     "total_steps": len(valid_diffs),
                 }
-                
-                print(f"\n[C++ Comparison] Episode {episode}:")
-                print(f"  Max difference: {max_diff:.2e}")
-                print(f"  Mean difference: {mean_diff:.2e}")
-                print(f"  Mismatches (> {COMPARISON_TOLERANCE:.1e}): {num_mismatches}/{len(valid_diffs)} ({mismatch_fraction*100:.2f}%)")
-                if max_diff > COMPARISON_TOLERANCE:
-                    print(f"  [Warning] Differences exceed tolerance!")
-                else:
-                    print(f"  [OK] All differences within tolerance")
             else:
                 cpp_comparison = {"error": "No valid comparisons (all NaN)"}
 
@@ -557,6 +552,10 @@ def run_closed_loop_evaluation(
                 "net_force": net_forces,
             }
         
+        # Add SysID latent data if available
+        if sysid_enabled and len(z_latents) > 0:
+            trace_data["z_latents"] = np.array(z_latents)
+        
         # Add C++ inference data if available
         if cpp_policy is not None:
             trace_data["cpp_action"] = cpp_actions
@@ -572,6 +571,59 @@ def run_closed_loop_evaluation(
         "avg_abs_error": float(np.mean(avg_errors)),
         "action_delta_variance": float(np.mean(action_variances)),
     }
+    
+    # Compute and print aggregated C++ comparison statistics
+    if cpp_policy is not None:
+        all_max_diffs = []
+        all_mean_diffs = []
+        all_mismatch_fractions = []
+        total_steps_compared = 0
+        total_mismatches = 0
+        
+        for trace in traces:
+            cpp_comp = trace.get("cpp_comparison", {})
+            if "max_action_diff" in cpp_comp:
+                all_max_diffs.append(cpp_comp["max_action_diff"])
+                all_mean_diffs.append(cpp_comp["mean_action_diff"])
+                all_mismatch_fractions.append(cpp_comp["mismatch_fraction"])
+                total_steps_compared += cpp_comp["total_steps"]
+                total_mismatches += cpp_comp["num_mismatches"]
+        
+        if all_max_diffs:
+            overall_max_diff = float(np.max(all_max_diffs))
+            overall_mean_diff = float(np.mean(all_mean_diffs))
+            overall_mismatch_fraction = total_mismatches / total_steps_compared if total_steps_compared > 0 else 0.0
+            
+            print("\n" + "=" * 70)
+            print("[C++ vs Python Inference Comparison - Aggregated Statistics]")
+            print("=" * 70)
+            print(f"Total episodes compared: {len(all_max_diffs)}")
+            print(f"Total steps compared: {total_steps_compared}")
+            print(f"Overall max difference: {overall_max_diff:.4e}")
+            print(f"Overall mean difference: {overall_mean_diff:.4e}")
+            print(f"Per-episode mean diff - avg: {np.mean(all_mean_diffs):.4e}, std: {np.std(all_mean_diffs):.4e}")
+            print(f"Per-episode max diff - avg: {np.mean(all_max_diffs):.4e}, std: {np.std(all_max_diffs):.4e}")
+            print(f"Total mismatches (> {COMPARISON_TOLERANCE:.1e}): {total_mismatches}/{total_steps_compared} ({overall_mismatch_fraction*100:.2f}%)")
+            
+            if overall_max_diff > COMPARISON_TOLERANCE:
+                print(f"[Warning] Differences exceed tolerance of {COMPARISON_TOLERANCE:.1e}")
+            else:
+                print(f"[OK] All differences within tolerance of {COMPARISON_TOLERANCE:.1e}")
+            print("=" * 70 + "\n")
+            
+            # Add to summary
+            summary["cpp_comparison"] = {
+                "overall_max_diff": overall_max_diff,
+                "overall_mean_diff": overall_mean_diff,
+                "total_mismatches": total_mismatches,
+                "total_steps": total_steps_compared,
+                "mismatch_fraction": overall_mismatch_fraction,
+                "per_episode_mean_diff_avg": float(np.mean(all_mean_diffs)),
+                "per_episode_mean_diff_std": float(np.std(all_mean_diffs)),
+                "per_episode_max_diff_avg": float(np.mean(all_max_diffs)),
+                "per_episode_max_diff_std": float(np.std(all_max_diffs)),
+            }
+
 
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -579,9 +631,43 @@ def run_closed_loop_evaluation(
 
     if plot_dir:
         plot_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Fit PCA on all z latents if available (for per-episode plots)
+        pca_model = None
+        if sysid_enabled:
+            # Check if any traces have z_latents
+            z_available = any("z_latents" in t and t["z_latents"] is not None for t in traces)
+            if z_available:
+                from sklearn.decomposition import PCA
+                # Collect all z latents
+                all_z_for_pca = []
+                for trace in traces:
+                    if "z_latents" in trace and trace["z_latents"] is not None:
+                        all_z_for_pca.append(trace["z_latents"])
+                if len(all_z_for_pca) > 0:
+                    z_concat = np.concatenate(all_z_for_pca, axis=0)
+                    pca_model = PCA()
+                    pca_model.fit(z_concat)
+                    print(f"Fitted PCA on {z_concat.shape[0]} z samples for per-episode visualization")
+        
+        # Plot per-episode diagnostics (with PCA model if available)
         for trace in traces:
-            plot_sequence_diagnostics(trace, plot_dir / f"{trace['sequence_id']}.png")
+            plot_sequence_diagnostics(
+                trace,
+                plot_dir / f"{trace['sequence_id']}.png",
+                pca_model=pca_model
+            )
         plot_summary(per_episode_metrics, plot_dir / "closed_loop_summary.png")
+        
+        # Plot comprehensive statistics across all episodes
+        from evaluation.plotting import plot_profile_statistics, plot_z_latent_analysis
+        plot_profile_statistics(traces, plot_dir / "profile_statistics.png")
+        
+        # Plot z latent analysis if SysID is enabled
+        if sysid_enabled:
+            z_analysis_path = plot_dir / "z_latent_analysis.png"
+            print("Creating z latent analysis...")
+            plot_z_latent_analysis(traces, vehicle_params_log, z_analysis_path)
 
         # Save vehicle parameters to a text file
         vehicle_params_file = plot_dir / "vehicle_parameters.txt"

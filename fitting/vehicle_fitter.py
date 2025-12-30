@@ -781,6 +781,11 @@ class VehicleParamFitter:
         """Compute acceleration for a single timestep.
         
         Supports both DC motor model and polynomial motor map.
+        
+        NOTE: Creep torque is NOT included in this fitting model. Creep parameters
+        are fixed (not fitted) and will be applied during runtime using the fitted
+        vehicle parameters. The creep torque is dynamically computed from mass, gear ratio,
+        and other fitted parameters, ensuring it remains consistent with the fitted model.
         """
         if self.config.motor_model_type == "polynomial":
             # Polynomial model: 23 parameters

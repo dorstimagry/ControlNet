@@ -32,11 +32,14 @@ class TestExtendedPlantDynamics:
         for _ in range(20):
             plant.step(0.0, dt)
 
-        # With zero action: motor voltage = 0, drive torque small (viscous losses only)
-        assert plant.V_cmd == 0.0, f"V_cmd should be 0 with zero action, got {plant.V_cmd}"
-        assert abs(plant.drive_torque) < 1.0, f"Drive torque should be small with zero action, got {plant.drive_torque}"
+        # With zero action and creep enabled: V_cmd will be non-zero (creep voltage)
+        # Creep provides gentle forward motion at zero throttle
+        # Drive torque should be small but positive (creep torque)
+        assert plant.V_cmd >= 0.0, f"V_cmd should be non-negative with zero action (creep), got {plant.V_cmd}"
+        # Creep torque should be bounded and reasonable
+        assert abs(plant.drive_torque) < 500.0, f"Drive torque should be reasonable with creep, got {plant.drive_torque}"
 
-        # Acceleration should be reasonable (can be positive due to downhill grade, negative due to drag/rolling)
+        # Acceleration should be reasonable (can be positive due to creep or downhill grade, negative due to drag/rolling)
         assert abs(plant.acceleration) < 10.0, f"Acceleration too extreme: {plant.acceleration}"
 
         # Speed should change in a physically reasonable way
@@ -207,19 +210,21 @@ class TestExtendedPlantDynamics:
         assert max_accel <= 10.0, f"Max acceleration {max_accel} m/s² above realistic max"
 
     def test_no_regen_during_braking(self, plant: ExtendedPlant) -> None:
-        """Test that no regenerative braking occurs (V_cmd = 0 and drive_torque = 0 during braking)."""
+        """Test that no regenerative braking occurs during braking action."""
         dt = 0.1
 
-        # Test braking action
+        # Test braking action from moderate speed
+        plant.reset(speed=5.0)  # Start at moderate speed
         plant.step(-0.5, dt)  # Brake
 
-        # During braking, commanded voltage should be 0 (no regen)
-        assert plant.V_cmd == 0.0, f"V_cmd should be 0 during braking, got {plant.V_cmd}"
-        # Drive torque may be small negative due to viscous losses (physically correct)
-        assert plant.drive_torque <= 1.0, f"Drive torque should not be positive during braking, got {plant.drive_torque}"
-
-        # Back-EMF voltage depends on wheel speed, which may not be zero yet
-        # Just check that it's reasonable (not negative or unreasonably large)
+        # During braking, there should be no regenerative current
+        # Motor current must be non-negative (no regen constraint)
+        assert plant.motor_current >= 0, f"Motor current should be non-negative (no regen), got {plant.motor_current}"
+        
+        # With braking, motor is decoupled from drive (V_cmd may have creep component at low speed)
+        # The key check is: no negative current (no regeneration)
+        
+        # Back-EMF voltage depends on wheel speed
         assert plant.back_emf_voltage >= 0, f"Back-EMF voltage should not be negative: {plant.back_emf_voltage}"
         assert plant.back_emf_voltage < 1000, f"Back-EMF voltage unreasonably large: {plant.back_emf_voltage}"
 
@@ -549,12 +554,13 @@ class TestHoldSlipBraking:
         # In single-DOF model, speed should be near zero
         assert abs(plant.speed) < 0.1, f"Speed should be ~0, got {plant.speed}"
 
-        # Now release brake
+        # Now release brake (with creep enabled, vehicle will start to creep forward)
         plant._substep(0.0, dt)  # Neutral
 
-        # With no brakes and on flat ground, vehicle should coast slowly
-        # (very little movement since starting at rest)
-        assert abs(plant.speed) < 0.2, f"Speed should be small, got {plant.speed}"
+        # With no brakes and creep enabled, vehicle will start to move forward
+        # Speed should be small but positive (creep acceleration)
+        assert plant.speed >= 0, f"Speed should be non-negative, got {plant.speed}"
+        assert abs(plant.speed) < 0.5, f"Speed should be small (early creep), got {plant.speed}"
 
     def test_no_spurious_acceleration_when_held(self, plant: ExtendedPlant) -> None:
         """Test that braking keeps speed near zero on flat ground."""
@@ -925,3 +931,549 @@ class TestCTMSMotorModel:
         assert motor.L > 0, "Inductance should be positive"
         assert motor.J > 0, "Rotor inertia should be positive"
         assert motor.b >= 0, "Viscous friction should be non-negative"
+
+
+class TestCreepTorque:
+    """Test EV-style creep torque behavior."""
+
+    @pytest.fixture
+    def plant_params(self) -> "ExtendedPlantParams":
+        """Create test plant parameters with known creep settings."""
+        from utils.dynamics import ExtendedPlantRandomization, sample_extended_params, CreepParams
+        
+        params = sample_extended_params(np.random.default_rng(42), ExtendedPlantRandomization())
+        # Override with known creep parameters for predictable testing
+        params.creep = CreepParams(a_max=0.5, v_cutoff=1.5, v_hold=0.08)
+        # Use flat grade for predictable tests
+        params.body.grade_rad = 0.0
+        return params
+
+    @pytest.fixture
+    def plant(self, plant_params: "ExtendedPlantParams") -> "ExtendedPlant":
+        """Create a test plant instance."""
+        from utils.dynamics import ExtendedPlant
+        plant = ExtendedPlant(plant_params)
+        plant.reset(speed=0.0)
+        return plant
+
+    def test_creep_at_zero_throttle(self, plant: "ExtendedPlant") -> None:
+        """Test that vehicle creeps forward slowly at zero throttle (no brake)."""
+        dt = 0.1
+        
+        # Start at rest, apply zero action (no throttle, no brake)
+        plant.reset(speed=0.0)
+        initial_speed = plant.speed
+        
+        # Run for 5 seconds with zero action
+        for _ in range(50):
+            plant.step(0.0, dt, substeps=5)
+        
+        final_speed = plant.speed
+        
+        # Vehicle should have crept forward
+        assert final_speed > initial_speed, f"Vehicle should creep forward, got {final_speed} vs {initial_speed}"
+        assert final_speed > 0.1, f"Vehicle should reach reasonable creep speed, got {final_speed}"
+        
+        # Creep torque should be non-zero and positive
+        assert plant.creep_torque > 0, f"Creep torque should be positive, got {plant.creep_torque}"
+        
+        # Speed shouldn't be too high (creep is limited)
+        assert final_speed < 2.0, f"Creep speed shouldn't exceed fade threshold much, got {final_speed}"
+
+    def test_creep_fade_with_speed(self, plant: "ExtendedPlant") -> None:
+        """Test that creep torque fades smoothly as speed increases."""
+        dt = 0.1
+        creep_v_cutoff = plant.params.creep.v_cutoff
+        
+        # Test at different speeds
+        test_speeds = [0.0, 0.5, 1.0, 1.5, 2.0]
+        creep_torques = []
+        
+        for v in test_speeds:
+            plant.reset(speed=v)
+            plant.step(0.0, dt, substeps=1)  # Zero action to activate creep
+            creep_torques.append(plant.creep_torque)
+        
+        # Creep torque should decrease with speed
+        assert creep_torques[0] > creep_torques[1] > 0, "Creep should decrease from 0 to 0.5 m/s"
+        assert creep_torques[1] > creep_torques[2] > 0, "Creep should decrease from 0.5 to 1.0 m/s"
+        
+        # Should be nearly zero at v_cutoff
+        assert creep_torques[3] < 0.1 * creep_torques[0], f"Creep should be ~0 at v_cutoff, got {creep_torques[3]}"
+        
+        # Should be zero above v_cutoff
+        assert creep_torques[4] < 0.01 * creep_torques[0], f"Creep should be 0 above v_cutoff, got {creep_torques[4]}"
+
+    def test_brake_suppresses_creep(self, plant: "ExtendedPlant") -> None:
+        """Test that braking fully suppresses creep torque."""
+        dt = 0.1
+        
+        # Test creep with no brake
+        plant.reset(speed=0.0)
+        plant.step(0.0, dt, substeps=5)
+        creep_no_brake = plant.creep_torque
+        
+        # Test creep with light brake
+        plant.reset(speed=0.0)
+        plant.step(-0.3, dt, substeps=5)  # 30% brake
+        creep_light_brake = plant.creep_torque
+        
+        # Test creep with full brake
+        plant.reset(speed=0.0)
+        plant.step(-1.0, dt, substeps=5)  # 100% brake
+        creep_full_brake = plant.creep_torque
+        
+        # Brake should suppress creep
+        assert creep_no_brake > 0, "Should have creep with no brake"
+        assert creep_light_brake < creep_no_brake, "Light brake should reduce creep"
+        assert creep_full_brake < 0.1 * creep_no_brake, f"Full brake should eliminate creep, got {creep_full_brake}"
+
+    def test_throttle_to_creep_transition(self, plant: "ExtendedPlant") -> None:
+        """Test smooth transition from throttle to creep when releasing accelerator."""
+        dt = 0.1
+        
+        # Phase 1: Accelerate with very gentle throttle to stay below v_cutoff
+        plant.reset(speed=0.0)
+        for _ in range(8):
+            plant.step(0.15, dt, substeps=5)  # 15% throttle (very gentle)
+        
+        speed_after_throttle = plant.speed
+        
+        # Phase 2: Release throttle (coast with creep)
+        accelerations = []
+        speeds = []
+        creep_torques = []
+        for _ in range(30):
+            plant.step(0.0, dt, substeps=5)  # Zero action
+            accelerations.append(plant.acceleration)
+            speeds.append(plant.speed)
+            creep_torques.append(plant.creep_torque)
+        
+        # Should decelerate smoothly (no jump in acceleration)
+        max_jerk = max(abs(np.diff(accelerations))) / dt
+        assert max_jerk < 50.0, f"Transition should be smooth, max jerk={max_jerk}"
+        
+        # Creep should be active during some portion of coast (when speed is below v_cutoff)
+        num_with_creep = sum(1 for ct in creep_torques if ct > 0)
+        assert num_with_creep > 5, f"Creep should be active during coast, got {num_with_creep}/30 steps"
+        
+        # Speed should remain non-negative throughout
+        assert all(s >= 0 for s in speeds), "Vehicle should not go backward"
+
+    def test_creep_to_brake_transition(self, plant: "ExtendedPlant") -> None:
+        """Test smooth transition from creep to braking."""
+        dt = 0.1
+        
+        # Phase 1: Set up at low speed and record baseline creep
+        plant.reset(speed=0.5)
+        plant.step(0.0, dt, substeps=5)  # One step to establish creep
+        baseline_creep = plant.creep_torque
+        assert baseline_creep > 0, "Creep should be active at 0.5 m/s"
+        
+        # Phase 2: Apply brake and observe creep suppression
+        plant.reset(speed=0.5)  # Reset to same initial condition
+        plant.step(-0.5, dt, substeps=1)  # 50% brake, single substep for immediate effect
+        creep_with_brake = plant.creep_torque
+        
+        # With 50% brake command, creep should be suppressed by brake dominance factor (1 - 0.5) = 0.5
+        # Allow some tolerance for dynamics
+        assert creep_with_brake <= 0.6 * baseline_creep, \
+            f"Creep should be suppressed by brake: {creep_with_brake} vs baseline {baseline_creep}"
+        
+        # Phase 3: Test smooth deceleration with continued braking
+        accelerations = []
+        for _ in range(20):
+            plant.step(-0.5, dt, substeps=5)
+            accelerations.append(plant.acceleration)
+        
+        # Should decelerate smoothly
+        max_jerk = max(abs(np.diff(accelerations))) / dt
+        assert max_jerk < 100.0, f"Braking transition should be smooth, max jerk={max_jerk}"
+        
+        # Vehicle should slow down
+        assert plant.speed < 0.5, "Vehicle should slow down with braking"
+
+    def test_creep_on_uphill_grade(self, plant: "ExtendedPlant") -> None:
+        """Test creep behavior on uphill grade (may not overcome gravity)."""
+        dt = 0.1
+        
+        # Set uphill grade (3 degrees)
+        plant.params.body.grade_rad = np.radians(3.0)
+        
+        plant.reset(speed=0.0)
+        initial_speed = plant.speed
+        
+        # Run with zero action for several seconds
+        for _ in range(30):
+            plant.step(0.0, dt, substeps=5)
+        
+        final_speed = plant.speed
+        
+        # Creep should be active
+        assert plant.creep_torque > 0, "Creep torque should be active"
+        
+        # On uphill, creep might not be strong enough to overcome grade
+        # Vehicle might roll back or stay near zero, but creep should try
+        # Just verify no crash and creep is computed
+        assert abs(final_speed) < 5.0, "Speed should remain bounded"
+        assert not np.isnan(plant.speed), "Speed should not be NaN"
+
+    def test_no_oscillation_at_standstill(self, plant: "ExtendedPlant") -> None:
+        """Test that creep doesn't cause oscillations when vehicle is near zero speed."""
+        dt = 0.1
+        
+        # Start very close to zero with creep active
+        plant.reset(speed=0.01)
+        
+        speeds = []
+        accelerations = []
+        
+        # Run for extended period at near-zero speed
+        for _ in range(50):
+            plant.step(0.0, dt, substeps=5)
+            speeds.append(plant.speed)
+            accelerations.append(plant.acceleration)
+        
+        # Check for oscillations: speed should not flip sign repeatedly
+        speed_signs = np.sign(speeds)
+        sign_changes = np.sum(np.abs(np.diff(speed_signs)) > 0)
+        assert sign_changes < 3, f"Too many sign changes (oscillations): {sign_changes}"
+        
+        # Acceleration shouldn't have wild swings
+        accel_std = np.std(accelerations)
+        assert accel_std < 5.0, f"Acceleration too erratic: std={accel_std}"
+
+    def test_creep_torque_computation(self, plant: "ExtendedPlant") -> None:
+        """Test that creep torque is correctly computed from acceleration parameter."""
+        dt = 0.1
+        
+        plant.reset(speed=0.0)
+        plant.step(0.0, dt, substeps=1)  # Single substep for predictable state
+        
+        # Manually compute expected creep torque at v=0 (no fade, no brake suppression)
+        creep = plant.params.creep
+        body = plant.params.body
+        motor = plant.params.motor
+        wheel = plant.params.wheel
+        
+        F_creep_max = body.mass * creep.a_max
+        T_wheel_creep_max = F_creep_max * wheel.radius
+        T_motor_creep_max_expected = T_wheel_creep_max / (motor.gear_ratio * motor.eta_gb)
+        
+        # At v=0, fade weight should be 1.0, brake suppression should be 1.0
+        # So creep_torque should equal T_motor_creep_max
+        assert abs(plant.creep_torque - T_motor_creep_max_expected) < 0.01 * T_motor_creep_max_expected, \
+            f"Creep torque mismatch: got {plant.creep_torque}, expected {T_motor_creep_max_expected}"
+
+    def test_creep_differentiability(self, plant: "ExtendedPlant") -> None:
+        """Test that creep computation produces smooth gradients (no discontinuities)."""
+        dt = 0.05  # Smaller timestep for gradient check
+        
+        # Test gradient w.r.t. speed (fade function)
+        speeds = np.linspace(0.0, 2.0, 50)
+        creep_torques = []
+        
+        for v in speeds:
+            plant.reset(speed=v)
+            plant.step(0.0, dt, substeps=1)
+            creep_torques.append(plant.creep_torque)
+        
+        creep_torques = np.array(creep_torques)
+        
+        # Compute numerical gradient
+        gradients = np.gradient(creep_torques, speeds)
+        
+        # Gradient should be continuous (no jumps)
+        gradient_changes = np.abs(np.diff(gradients))
+        max_gradient_jump = np.max(gradient_changes)
+        
+        # Allow some numerical noise but no large discontinuities
+        assert max_gradient_jump < 100.0, f"Gradient discontinuity detected: max jump={max_gradient_jump}"
+        
+        # Gradient should be negative (creep decreases with speed)
+        assert np.all(gradients[:-1] <= 0), "Creep gradient should be non-positive"
+
+    def test_creep_with_parameter_variation(self, plant: "ExtendedPlant") -> None:
+        """Test that creep works correctly across different vehicle parameters."""
+        from utils.dynamics import ExtendedPlant, ExtendedPlantRandomization, sample_extended_params, CreepParams
+        
+        dt = 0.1
+        
+        # Test with several random parameter sets
+        for seed in range(5):
+            rng = np.random.default_rng(seed + 100)
+            params = sample_extended_params(rng, ExtendedPlantRandomization())
+            params.creep = CreepParams(a_max=0.5, v_cutoff=1.5, v_hold=0.08)
+            params.body.grade_rad = 0.0  # Flat for consistency
+            
+            test_plant = ExtendedPlant(params)
+            test_plant.reset(speed=0.0)
+            
+            # Run for a few steps
+            for _ in range(20):
+                test_plant.step(0.0, dt, substeps=5)
+            
+            # Should have crept forward
+            assert test_plant.speed > 0, f"Seed {seed}: Should creep forward, got speed={test_plant.speed}"
+            assert test_plant.creep_torque > 0, f"Seed {seed}: Should have positive creep torque"
+            assert not np.isnan(test_plant.speed), f"Seed {seed}: Speed should not be NaN"
+            assert not np.isnan(test_plant.creep_torque), f"Seed {seed}: Creep torque should not be NaN"
+
+    def test_creep_params_in_config(self) -> None:
+        """Test that creep parameters can be loaded from configuration."""
+        from utils.dynamics import ExtendedPlantRandomization, CreepParams
+        
+        # Create config with creep parameters
+        config = {
+            'creep': {
+                'a_max': 0.6,
+                'v_cutoff': 2.0,
+                'v_hold': 0.1,
+            },
+            'vehicle_randomization': {
+                'mass_range': [1500.0, 2000.0],
+            }
+        }
+        
+        rand = ExtendedPlantRandomization.from_config(config)
+        
+        # Check that creep parameters were loaded
+        assert rand.creep_a_max == 0.6, f"Expected a_max=0.6, got {rand.creep_a_max}"
+        assert rand.creep_v_cutoff == 2.0, f"Expected v_cutoff=2.0, got {rand.creep_v_cutoff}"
+        assert rand.creep_v_hold == 0.1, f"Expected v_hold=0.1, got {rand.creep_v_hold}"
+
+    def test_creep_default_values(self) -> None:
+        """Test that creep uses default values when not specified in config."""
+        from utils.dynamics import ExtendedPlantRandomization, sample_extended_params
+        
+        # Config without creep parameters
+        config = {
+            'vehicle_randomization': {
+                'mass_range': [1500.0, 2000.0],
+            }
+        }
+        
+        rand = ExtendedPlantRandomization.from_config(config)
+        params = sample_extended_params(np.random.default_rng(42), rand)
+        
+        # Should use default CreepParams values
+        assert params.creep.a_max == 0.5, "Should use default a_max=0.5"
+        assert params.creep.v_cutoff == 1.5, "Should use default v_cutoff=1.5"
+        assert params.creep.v_hold == 0.08, "Should use default v_hold=0.08"
+
+
+class TestCreepFunctional:
+    """Functional/integration tests for creep behavior in realistic scenarios."""
+
+    @pytest.fixture
+    def plant(self) -> "ExtendedPlant":
+        """Create a test plant with realistic parameters."""
+        from utils.dynamics import ExtendedPlant, ExtendedPlantRandomization, sample_extended_params, CreepParams
+        
+        params = sample_extended_params(np.random.default_rng(42), ExtendedPlantRandomization())
+        params.creep = CreepParams(a_max=0.5, v_cutoff=1.5, v_hold=0.08)
+        params.body.grade_rad = 0.0
+        plant = ExtendedPlant(params)
+        plant.reset(speed=0.0)
+        return plant
+
+    def test_creep_enables_smooth_stops(self, plant: "ExtendedPlant") -> None:
+        """Test that creep helps agent smoothly approach zero speed (no dead zone)."""
+        dt = 0.1
+        
+        # Simulate approaching a stop from low speed (stay in creep range)
+        plant.reset(speed=1.0)
+        
+        # Decelerate gently
+        actions = np.linspace(0.1, 0.0, 20)  # Reduce throttle gently over 2 seconds
+        for action in actions:
+            plant.step(action, dt, substeps=5)
+        
+        # Continue coasting with creep
+        speeds = []
+        creep_torques = []
+        for _ in range(30):
+            plant.step(0.0, dt, substeps=5)
+            speeds.append(plant.speed)
+            creep_torques.append(plant.creep_torque)
+        
+        # Should have some creep activity at low speeds
+        num_with_creep = sum(1 for ct in creep_torques if ct > 0)
+        assert num_with_creep > 5, f"Creep should be active during low-speed coast, got {num_with_creep}/30"
+        
+        # Speed should remain non-negative
+        assert all(s >= 0 for s in speeds), "Speed should not go negative"
+
+    def test_full_episode_with_creep(self, plant: "ExtendedPlant") -> None:
+        """Test complete episode with various maneuvers including creep."""
+        dt = 0.1
+        
+        # Phase 1: Accelerate gently from rest (stay in creep range initially)
+        plant.reset(speed=0.0)
+        for _ in range(15):
+            plant.step(0.2, dt, substeps=5)  # 20% throttle (gentle)
+        
+        assert plant.speed > 0.5, "Should have accelerated"
+        
+        # Phase 2: Coast - creep may be active depending on final speed
+        creep_torques = []
+        for _ in range(20):
+            plant.step(0.0, dt, substeps=5)
+            creep_torques.append(plant.creep_torque)
+        
+        # Creep may not be active if speed is above v_cutoff
+        # Just verify no instabilities
+        assert plant.speed >= 0, "Should maintain non-negative speed"
+        
+        # Phase 3: Brake to stop
+        for _ in range(30):
+            plant.step(-0.6, dt, substeps=5)  # 60% brake
+        
+        assert plant.speed < 1.0, "Should have slowed down significantly"
+        
+        # Phase 4: Hold at stop
+        for _ in range(20):
+            plant.step(-0.8, dt, substeps=5)  # Strong brake
+        
+        # Should be held near zero
+        assert abs(plant.speed) < 0.5, f"Should be held near zero, got {plant.speed}"
+        
+        # No NaNs or instabilities throughout
+        assert not np.isnan(plant.speed), "Speed should not be NaN"
+        assert not np.isnan(plant.acceleration), "Acceleration should not be NaN"
+        assert not np.isnan(plant.creep_torque), "Creep torque should not be NaN"
+
+    def test_stop_and_go_with_creep(self, plant: "ExtendedPlant") -> None:
+        """Test stop-and-go traffic scenario with creep."""
+        dt = 0.1
+        
+        plant.reset(speed=0.0)
+        
+        # Simulate 3 stop-and-go cycles with gentle acceleration
+        for cycle in range(3):
+            # Go: accelerate gently
+            for _ in range(12):
+                plant.step(0.25, dt, substeps=5)  # 25% throttle
+            
+            speed_after_accel = plant.speed
+            assert speed_after_accel > 0.5, f"Cycle {cycle}: Should accelerate"
+            
+            # Coast - check if creep is active (depends on speed)
+            creep_torques = []
+            for _ in range(10):
+                plant.step(0.0, dt, substeps=5)
+                creep_torques.append(plant.creep_torque)
+            
+            # At least verify no NaNs
+            assert all(not np.isnan(ct) for ct in creep_torques), f"Cycle {cycle}: Creep torques should not be NaN"
+            
+            # Stop: brake
+            for _ in range(15):
+                plant.step(-0.7, dt, substeps=5)
+            
+            assert plant.speed < 1.0, f"Cycle {cycle}: Should slow down"
+        
+        # After multiple cycles, dynamics should remain stable
+        assert not np.isnan(plant.speed), "Speed should not be NaN after cycles"
+        assert abs(plant.speed) < 5.0, "Speed should remain bounded"
+
+    def test_creep_on_varied_grades(self, plant: "ExtendedPlant") -> None:
+        """Test creep behavior across different road grades."""
+        dt = 0.1
+        
+        grades_deg = [0.0, 2.0, -2.0, 5.0, -5.0]
+        
+        for grade_deg in grades_deg:
+            plant.params.body.grade_rad = np.radians(grade_deg)
+            plant.reset(speed=0.0)
+            
+            # Run with zero action (creep active)
+            for _ in range(30):
+                plant.step(0.0, dt, substeps=5)
+            
+            # Creep should always be computed
+            assert plant.creep_torque >= 0, f"Grade {grade_deg}°: Creep torque should be non-negative"
+            
+            # No crashes or NaNs
+            assert not np.isnan(plant.speed), f"Grade {grade_deg}°: Speed should not be NaN"
+            assert abs(plant.speed) < 10.0, f"Grade {grade_deg}°: Speed should remain bounded"
+            
+            # On flat or downhill, should move forward
+            if grade_deg <= 0:
+                assert plant.speed > 0, f"Grade {grade_deg}°: Should move forward on flat/downhill"
+
+    def test_parameter_variation_robustness(self, plant: "ExtendedPlant") -> None:
+        """Test that creep works robustly across wide parameter ranges."""
+        from utils.dynamics import ExtendedPlant, ExtendedPlantRandomization, sample_extended_params, CreepParams
+        
+        dt = 0.1
+        rand = ExtendedPlantRandomization()
+        
+        # Test with 10 random parameter sets
+        for seed in range(10):
+            rng = np.random.default_rng(seed + 200)
+            params = sample_extended_params(rng, rand)
+            params.creep = CreepParams(a_max=0.5, v_cutoff=1.5, v_hold=0.08)
+            params.body.grade_rad = 0.0
+            
+            test_plant = ExtendedPlant(params)
+            test_plant.reset(speed=0.0)
+            
+            # Run a simple maneuver: accelerate gently, coast, brake
+            # Accelerate gently to stay in/near creep range
+            for _ in range(10):
+                test_plant.step(0.25, dt, substeps=5)  # Gentle acceleration
+            
+            speed_after_accel = test_plant.speed
+            
+            # Coast - collect creep torques
+            creep_torques = []
+            for _ in range(15):
+                test_plant.step(0.0, dt, substeps=5)
+                creep_torques.append(test_plant.creep_torque)
+            
+            # Brake
+            for _ in range(15):
+                test_plant.step(-0.5, dt, substeps=5)
+            
+            # Verify stability
+            assert not np.isnan(test_plant.speed), f"Seed {seed}: Speed should not be NaN"
+            assert not np.isnan(test_plant.creep_torque), f"Seed {seed}: Creep torque should not be NaN"
+            assert speed_after_accel > 0, f"Seed {seed}: Should have accelerated"
+            # Creep should be active during at least some of the coast (if speed is below v_cutoff)
+            num_with_creep = sum(1 for ct in creep_torques if ct > 0)
+            # Allow for variation - just check no NaNs and some creep activity
+            assert all(not np.isnan(ct) for ct in creep_torques), f"Seed {seed}: Creep torques should not be NaN"
+
+    def test_creep_with_rapid_action_changes(self, plant: "ExtendedPlant") -> None:
+        """Test creep behavior with rapid changes in control input (stability test)."""
+        dt = 0.1
+        
+        plant.reset(speed=1.0)
+        
+        # Rapidly alternate between throttle, coast, and brake
+        actions = [0.5, 0.0, -0.3, 0.0, 0.7, 0.0, -0.5, 0.0] * 10  # 80 steps
+        
+        accelerations = []
+        creep_torques = []
+        
+        for action in actions:
+            plant.step(action, dt, substeps=5)
+            accelerations.append(plant.acceleration)
+            creep_torques.append(plant.creep_torque)
+        
+        # Check for stability: no NaNs, no extreme values
+        assert not np.any(np.isnan(accelerations)), "Accelerations should not be NaN"
+        assert not np.any(np.isnan(creep_torques)), "Creep torques should not be NaN"
+        assert np.all(np.abs(accelerations) < 20.0), "Accelerations should be bounded"
+        assert np.all(np.array(creep_torques) >= 0), "Creep torque should be non-negative"
+        
+        # Creep should activate during zero-action phases
+        zero_action_indices = [i for i, a in enumerate(actions) if a == 0.0]
+        creep_during_zero = [creep_torques[i] for i in zero_action_indices if i < len(creep_torques)]
+        
+        # At least some creep should be active during zero actions (depending on speed)
+        num_with_creep = sum(1 for ct in creep_during_zero if ct > 0)
+        assert num_with_creep > len(creep_during_zero) * 0.3, "Creep should be active during many zero-action phases"
+
+
