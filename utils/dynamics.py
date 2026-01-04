@@ -189,7 +189,7 @@ class ExtendedPlantRandomization:
 
     # Brake parameters
     brake_tau_range: Tuple[float, float] = (0.04, 0.12)  # seconds - brake time constant
-    brake_Tmax_range: Tuple[float, float] = (5000.0, 60000.0)  # Nm - max brake torque at wheel
+    brake_accel_range: Tuple[float, float] = (8.0, 11.0)  # m/s² - max braking deceleration magnitude
     brake_p_range: Tuple[float, float] = (1.0, 1.8)  # brake exponent (per doc)
     brake_kappa_range: Tuple[float, float] = (0.02, 0.25)  # brake slip constant
     mu_range: Tuple[float, float] = (0.7, 1.0)  # tire friction coefficient
@@ -208,7 +208,7 @@ class ExtendedPlantRandomization:
     
     # Feasibility thresholds (for rejection sampling)
     min_accel_from_rest: float = 2.5  # m/s² - minimum required acceleration at standstill
-    min_brake_decel: float = 4.0  # m/s² - minimum braking deceleration
+    min_brake_decel: float = 4.0  # m/s² - minimum braking deceleration (legacy, brake_accel_range replaces this)
     min_top_speed: float = 20.0  # m/s - minimum achievable top speed
     skip_feasibility_checks: bool = False  # If True, skip feasibility checks (fitted params mode)
     skip_sanity_checks: bool = False  # If True, skip sanity checks (viscous torque, stall current)
@@ -235,7 +235,7 @@ class ExtendedPlantRandomization:
             motor_J_range=tuple(vr_config.get('motor_J_range', (1e-4, 1e-2))),
             gear_ratio_range=tuple(vr_config.get('gear_ratio_range', (4.0, 20.0))),
             brake_tau_range=tuple(vr_config.get('brake_tau_range', (0.04, 0.12))),
-            brake_Tmax_range=tuple(vr_config.get('brake_Tmax_range', (5000.0, 60000.0))),
+            brake_accel_range=tuple(vr_config.get('brake_accel_range', (8.0, 11.0))),
             brake_p_range=tuple(vr_config.get('brake_p_range', (1.0, 1.8))),
             brake_kappa_range=tuple(vr_config.get('brake_kappa_range', (0.02, 0.25))),
             mu_range=tuple(vr_config.get('mu_range', (0.7, 1.0))),
@@ -483,8 +483,11 @@ def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomiz
         gear_ratio = float(rng.uniform(*rand.gear_ratio_range))
         eta_gb = float(rng.uniform(*rand.eta_gb_range))
         
-        # Brake parameters
-        T_brake_max = float(rng.uniform(*rand.brake_Tmax_range))
+        # Brake parameters - compute T_brake_max from desired braking acceleration
+        # a_brake_max = T_brake_max / (r_w * mass)
+        # => T_brake_max = a_brake_max * r_w * mass
+        desired_brake_accel = float(rng.uniform(*rand.brake_accel_range))
+        T_brake_max = desired_brake_accel * wheel_radius * mass
         
         # Compute vehicle capabilities
         caps = compute_vehicle_capabilities(
@@ -506,8 +509,11 @@ def sample_extended_params(rng: np.random.Generator, rand: ExtendedPlantRandomiz
             if caps['v_ss_level'] < rand.min_top_speed * 0.8:  # Allow some margin
                 continue
             
-            # Check 3: Minimum braking deceleration
-            if caps['a_brake_max'] < rand.min_brake_decel:
+            # Check 3: Braking deceleration - verify it matches our constraint
+            # Since we set T_brake_max = desired_brake_accel * r_w * mass,
+            # caps['a_brake_max'] should equal desired_brake_accel
+            # Add small tolerance check for numerical precision
+            if abs(caps['a_brake_max'] - desired_brake_accel) > 0.1:
                 continue
         
         # Sanity checks - skip if flag is set (fitted params mode)
@@ -731,15 +737,21 @@ class ExtendedPlant:
         T_wheel_creep_max = F_creep_max * r_w  # [Nm] max creep torque at wheel
         T_motor_creep_max = T_wheel_creep_max / (N * eta)  # [Nm] max creep torque at motor shaft
         
-        # Step 2: Speed-dependent fade using cubic smoothstep
+        # Step 2: Speed-dependent fade using gentler power function
         # Creep fades smoothly from full at v=0 to zero at v=v_cutoff
+        # Use a gentler fade curve that maintains more torque at higher speeds
         # Use current motor omega to compute vehicle speed
         omega_m_current = self.motor_omega
         v_current = (omega_m_current / N) * r_w  # current vehicle speed from motor
         v_abs = abs(v_current)
         x = v_abs / max(creep.v_cutoff, 1e-6)  # normalized speed
         if x < 1.0:
-            w_fade = 1.0 - 3.0 * x**2 + 2.0 * x**3  # cubic smoothstep: C1 continuous
+            # Use a very gentle power fade: w = 1 - x^5
+            # Original cubic smoothstep: w = 1 - 3x^2 + 2x^3 (maintains ~50% torque at x=0.5)
+            # Power fade: w = 1 - x^5 (maintains ~97% torque at x=0.5, ~33% at x=0.925)
+            # This allows vehicle to reach very close to v_cutoff before equilibrium
+            # The fade starts immediately but decays very slowly, avoiding steep curves
+            w_fade = 1.0 - x**5  # very gentle power fade
         else:
             w_fade = 0.0
         

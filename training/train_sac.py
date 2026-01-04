@@ -6,10 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import torch
@@ -39,6 +43,7 @@ class TrainingParams:
     max_grad_norm: float = 5.0
     target_entropy_scale: float = 1.0
     action_horizon_steps: int = 1
+    reward_scale: float = 1.0  # Scale rewards to prevent exploding Q-values
 
 
 @dataclass(slots=True)
@@ -64,6 +69,47 @@ class SysIDParams:
 
 
 @dataclass(slots=True)
+class DynamicsMapParams:
+    """Dynamics map configuration for vehicle-conditioned SAC."""
+    enabled: bool = False
+    pretrained_prior_path: str | None = None
+    pretrained_encoder_path: str | None = None
+    freeze_encoder: bool = False
+    
+    # Grid
+    N_u: int = 100
+    N_v: int = 100
+    v_max: float = 30.0
+    
+    # Reconstruction
+    update_every: int = 10
+    num_inference_steps: int = 50
+    guidance_scale: float = 1.0
+    sigma_meas: float = 0.5  # Increased from 0.3 to handle observation noise better
+    warmstart_rho: float = 0.8
+    gradient_smoothing_sigma: float = 10.0  # Increased from 2.0 to reduce artifacts
+    
+    # Buffer
+    buffer_capacity: int = 10000
+    lambda_decay: float = 0.3
+    w_min: float = 0.2
+    
+    # Encoder
+    context_dim: int = 32
+    hidden_channels: list[int] | None = None
+    encoder_learning_rate: float = 3e-4
+    
+    # Patch filtering (for uniform spatial distribution)
+    patch_filtering_enabled: bool = False
+    patch_size_u: int = 10
+    patch_size_v: int = 10
+    
+    def __post_init__(self):
+        if self.hidden_channels is None:
+            self.hidden_channels = [16, 32]
+
+
+@dataclass(slots=True)
 class OutputConfig:
     dir: Path = Path("training/checkpoints")
     save_latest: bool = True
@@ -75,7 +121,9 @@ class ConfigBundle:
     env: LongitudinalEnvConfig
     training: TrainingParams
     output: OutputConfig
-    sysid: SysIDParams
+    context_mode: str = "none"  # "none" | "sysid" | "dynamics_map"
+    sysid: SysIDParams = SysIDParams()
+    dynamics_map: DynamicsMapParams = DynamicsMapParams()
     reference_dataset: str | None = None
     # Fitted vehicle randomization config
     fitted_params_path: str | None = None
@@ -116,7 +164,21 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
     seed = overrides.seed if overrides.seed is not None else raw.get("seed", 0)
     env_cfg = LongitudinalEnvConfig(**raw.get("env", {}))
     training_cfg = TrainingParams(**raw.get("training", {}))
+    
+    # Context mode
+    context_mode = raw.get("context_mode", "none")
+    
+    # SysID config
     sysid_cfg = SysIDParams(**raw.get("sysid", {}))
+    if context_mode == "sysid":
+        sysid_cfg.enabled = True
+    
+    # Dynamics map config
+    dynamics_map_raw = raw.get("dynamics_map", {})
+    dynamics_map_cfg = DynamicsMapParams(**dynamics_map_raw)
+    if context_mode == "dynamics_map":
+        dynamics_map_cfg.enabled = True
+    
     output_block = raw.get("output", {})
     output_dir = overrides.output_dir if overrides.output_dir else Path(output_block.get("dir", "training/checkpoints"))
     output = OutputConfig(dir=Path(output_dir), save_latest=output_block.get("save_latest", True))
@@ -143,7 +205,9 @@ def build_config_bundle(raw: Dict[str, Any], overrides: argparse.Namespace) -> C
         seed=seed,
         env=env_cfg,
         training=training_cfg,
+        context_mode=context_mode,
         sysid=sysid_cfg,
+        dynamics_map=dynamics_map_cfg,
         output=output,
         reference_dataset=reference_dataset,
         fitted_params_path=fitted_params_path,
@@ -405,9 +469,31 @@ class GaussianPolicy(nn.Module):
         self.register_buffer("action_bias", torch.from_numpy(action_bias))
 
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Check input for NaN/Inf
+        if torch.isnan(obs).any() or torch.isinf(obs).any():
+            print(f"[ERROR] Invalid observation input to policy:")
+            print(f"  NaN: {torch.isnan(obs).any()}, Inf: {torch.isinf(obs).any()}")
+            print(f"  Stats: min={obs.min():.4f}, max={obs.max():.4f}, mean={obs.mean():.4f}")
+            # Replace invalid values with zeros as emergency fallback
+            obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        
         features = self.net(obs)
+        
+        # Check features for NaN/Inf
+        if torch.isnan(features).any() or torch.isinf(features).any():
+            print(f"[ERROR] Invalid features in policy network:")
+            print(f"  NaN: {torch.isnan(features).any()}, Inf: {torch.isinf(features).any()}")
+            print(f"  Input obs stats: min={obs.min():.4f}, max={obs.max():.4f}, mean={obs.mean():.4f}")
+        
         mu = self.mu_head(features)
         log_std = torch.clamp(self.log_std_head(features), -20.0, 2.0)
+        
+        # Check outputs for NaN/Inf
+        if torch.isnan(mu).any() or torch.isinf(mu).any():
+            print(f"[ERROR] Invalid mu output from policy:")
+            print(f"  NaN: {torch.isnan(mu).any()}, Inf: {torch.isinf(mu).any()}")
+            print(f"  Features stats: min={features.min():.4f}, max={features.max():.4f}, mean={features.mean():.4f}")
+        
         return mu, log_std
 
     def sample(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -478,12 +564,13 @@ class SACTrainer:
         action_low = np.tile(self.env_action_low, self.action_horizon)
         action_high = np.tile(self.env_action_high, self.action_horizon)
 
-        # SysID setup
-        self.sysid_enabled = cfg.sysid.enabled
-        z_dim = cfg.sysid.dz if self.sysid_enabled else 0
+        # Context mode setup
+        self.context_mode = cfg.context_mode
+        z_dim = 0
         
         # Initialize SysID components if enabled
-        if self.sysid_enabled:
+        if self.context_mode == "sysid" and cfg.sysid.enabled:
+            z_dim = cfg.sysid.dz
             from src.sysid import (
                 ContextEncoder,
                 DynamicsPredictor,
@@ -575,7 +662,94 @@ class SACTrainer:
             
             # Track if encoder is frozen
             self.encoder_frozen = cfg.sysid.freeze_encoder and cfg.sysid.pretrained_path is not None
+            
+        elif self.context_mode == "dynamics_map" and cfg.dynamics_map.enabled:
+            z_dim = cfg.dynamics_map.context_dim
+            accelerator.print("[dynamics_map] Initializing dynamics map context...")
+            
+            from src.maps.grid import MapGrid
+            from src.maps.context_manager import DynamicsMapContext
+            from src.models.diffusion_prior import DiffusionPrior
+            from src.maps.encoder import MapEncoder
+            
+            # Load diffusion prior
+            prior_path = Path(cfg.dynamics_map.pretrained_prior_path)
+            accelerator.print(f"[dynamics_map] Loading diffusion prior from {prior_path}")
+            self.diffusion_prior = DiffusionPrior.load(prior_path, device=self.device)
+            self.diffusion_prior.eval()
+            
+            # Load normalization stats
+            norm_path = prior_path.parent / "norm_stats.json"
+            with open(norm_path, "r") as f:
+                norm_stats = json.load(f)
+            accelerator.print(f"[dynamics_map] Loaded norm stats: mean={norm_stats['mean']:.3f}, std={norm_stats['std']:.3f}")
+            
+            # Create or load encoder
+            if cfg.dynamics_map.pretrained_encoder_path:
+                encoder_path = Path(cfg.dynamics_map.pretrained_encoder_path)
+                accelerator.print(f"[dynamics_map] Loading pretrained encoder from {encoder_path}")
+                self.map_encoder = MapEncoder.load(encoder_path, device=self.device)
+                if cfg.dynamics_map.freeze_encoder:
+                    for param in self.map_encoder.parameters():
+                        param.requires_grad = False
+                    accelerator.print("[dynamics_map] Froze encoder parameters")
+            else:
+                accelerator.print("[dynamics_map] Creating new encoder (training jointly)")
+                self.map_encoder = MapEncoder(
+                    input_size=(cfg.dynamics_map.N_u, cfg.dynamics_map.N_v),
+                    context_dim=cfg.dynamics_map.context_dim,
+                    hidden_channels=tuple(cfg.dynamics_map.hidden_channels),
+                ).to(self.device)
+            
+            # Create grid
+            grid = MapGrid(
+                N_u=cfg.dynamics_map.N_u,
+                N_v=cfg.dynamics_map.N_v,
+                v_max=cfg.dynamics_map.v_max,
+            )
+            
+            # Create context manager
+            self.dynamics_map_context = DynamicsMapContext(
+                grid=grid,
+                diffusion_prior=self.diffusion_prior,
+                encoder=self.map_encoder,
+                norm_mean=norm_stats["mean"],
+                norm_std=norm_stats["std"],
+                buffer_capacity=cfg.dynamics_map.buffer_capacity,
+                lambda_decay=cfg.dynamics_map.lambda_decay,
+                w_min=cfg.dynamics_map.w_min,
+                guidance_scale=cfg.dynamics_map.guidance_scale,
+                sigma_meas=cfg.dynamics_map.sigma_meas,
+                num_inference_steps=cfg.dynamics_map.num_inference_steps,
+                warmstart_rho=cfg.dynamics_map.warmstart_rho,
+                gradient_smoothing_sigma=cfg.dynamics_map.gradient_smoothing_sigma,
+                patch_filtering_enabled=cfg.dynamics_map.patch_filtering_enabled,
+                patch_size_u=cfg.dynamics_map.patch_size_u,
+                patch_size_v=cfg.dynamics_map.patch_size_v,
+                device=self.device,
+            )
+            
+            # Create optimizer for encoder (if not frozen)
+            if not cfg.dynamics_map.freeze_encoder:
+                self.encoder_optimizer = torch.optim.Adam(
+                    self.map_encoder.parameters(),
+                    lr=cfg.dynamics_map.encoder_learning_rate,
+                )
+                self.encoder_optimizer = accelerator.prepare(self.encoder_optimizer)
+                accelerator.print(f"[dynamics_map] Encoder optimizer created (lr={cfg.dynamics_map.encoder_learning_rate})")
+            
+            accelerator.print(f"[dynamics_map] Context manager initialized (context_dim={z_dim})")
+            
+            # Set dummy attributes for compatibility
+            self.encoder = None
+            self.predictor = None
+            self.sysid_trainer = None
+            self.feature_builder = None
+            self.encoder_hidden = None
+            
         else:
+            # Baseline mode (no context)
+            self.context_mode = "none"
             self.encoder = None
             self.predictor = None
             self.sysid_trainer = None
@@ -652,12 +826,21 @@ class SACTrainer:
             5. Step environment
             6. Compute z_{t+1}
             7. Store transition with z_t, z_{t+1}, speed, etc.
+            
+        If dynamics_map is enabled:
+            1. Get context z_t from dynamics map
+            2. Augment observation with z_t
+            3. Sample action from policy(obs_aug)
+            4. Step environment
+            5. Add observation to buffer
+            6. Update map periodically
+            7. Get next context z_{t+1}
         """
         # Get current speed from observation (first element)
         current_speed = obs[0]
         
-        # Compute z_t if SysID enabled
-        if self.sysid_enabled:
+        # Compute z_t based on context mode
+        if self.context_mode == "sysid":
             from src.sysid.integration import compute_z_online
             
             # Compute z_t (this updates feature_builder history internally)
@@ -675,6 +858,24 @@ class SACTrainer:
             
             # Augment observation with z_t
             obs_aug = np.concatenate([obs, z_t_np])
+            
+        elif self.context_mode == "dynamics_map":
+            # Get context from dynamics map
+            z_t = self.dynamics_map_context.get_context()  # Returns (context_dim,) torch tensor
+            z_t_np = z_t.cpu().numpy()
+            
+            # Validate context for NaN/Inf
+            if np.isnan(z_t_np).any() or np.isinf(z_t_np).any():
+                self.accelerator.print(f"[WARNING] Invalid dynamics map context at step {self._global_step}:")
+                self.accelerator.print(f"  NaN: {np.isnan(z_t_np).any()}, Inf: {np.isinf(z_t_np).any()}")
+                self.accelerator.print(f"  Stats: min={z_t_np.min():.4f}, max={z_t_np.max():.4f}, mean={z_t_np.mean():.4f}")
+                # Use zero context as fallback
+                z_t_np = np.zeros_like(z_t_np)
+                self.accelerator.print(f"  Replaced with zero context")
+            
+            # Augment observation with z_t
+            obs_aug = np.concatenate([obs, z_t_np])
+            
         else:
             obs_aug = obs
             z_t_np = None
@@ -691,11 +892,14 @@ class SACTrainer:
         next_obs, reward, terminated, truncated, info = self.env.step(action_scalar)
         done = terminated or truncated
         
+        # Apply reward scaling to prevent exploding Q-values
+        reward = reward * self.cfg.training.reward_scale
+        
         # Get next speed
         next_speed = next_obs[0]
         
-        # Compute z_{t+1} if SysID enabled
-        if self.sysid_enabled:
+        # Compute z_{t+1} based on context mode
+        if self.context_mode == "sysid":
             from src.sysid.integration import compute_z_online
             
             # Compute z_{t+1} (updates hidden state)
@@ -710,6 +914,31 @@ class SACTrainer:
             )
             
             z_next_np = z_next.cpu().numpy()
+            
+        elif self.context_mode == "dynamics_map":
+            # Extract grade from info
+            theta = info.get("grade_rad", 0.0)
+            
+            # Get measured acceleration from info (raw_acceleration is the measured value)
+            a_meas = info.get("raw_acceleration", 0.0)
+            
+            # Add observation to dynamics map buffer
+            self.dynamics_map_context.add_observation(
+                u=action_scalar,
+                v=current_speed,
+                a_meas=a_meas,
+                theta=theta,
+                t=float(self._global_step * self.cfg.env.dt),
+            )
+            
+            # Update map periodically
+            if self._global_step % self.cfg.dynamics_map.update_every == 0:
+                self.dynamics_map_context.update_map()
+            
+            # Get next context
+            z_next = self.dynamics_map_context.get_context()
+            z_next_np = z_next.cpu().numpy()
+            
         else:
             z_next_np = None
         
@@ -723,7 +952,7 @@ class SACTrainer:
             reward=reward,
             next_obs=next_obs,
             done=done,
-            speed=current_speed if self.sysid_enabled else None,
+            speed=current_speed if self.context_mode == "sysid" else None,
             z=z_t_np,
             z_next=z_next_np,
             episode_id=episode_id,
@@ -734,7 +963,7 @@ class SACTrainer:
         self.replay_buffer.increment_episode_step()
         
         # Update history
-        if self.sysid_enabled:
+        if self.context_mode == "sysid":
             self.prev_speed = current_speed
             self.prev_action = action_scalar
         
@@ -747,11 +976,13 @@ class SACTrainer:
             obs, _ = self.env.reset()
             
             # Reset encoder state for new episode
-            if self.sysid_enabled:
+            if self.context_mode == "sysid":
                 self.encoder_hidden = self.encoder.reset(batch_size=1, device=self.device).squeeze(0)
                 self.feature_builder.reset()
                 self.prev_speed = obs[0]
                 self.prev_action = 0.0
+            elif self.context_mode == "dynamics_map":
+                self.dynamics_map_context.reset()
             
             # Start new episode in replay buffer
             self.replay_buffer.start_new_episode()
@@ -784,7 +1015,7 @@ class SACTrainer:
         q_loss = F.mse_loss(current_q1, target_value) + F.mse_loss(current_q2, target_value)
         self.q_optimizer.zero_grad()
         self.accelerator.backward(q_loss)
-        nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), self.cfg.training.max_grad_norm)
+        q_grad_norm = nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), self.cfg.training.max_grad_norm)
         self.q_optimizer.step()
 
         new_actions, log_prob, _ = self.policy.sample(obs)
@@ -792,7 +1023,7 @@ class SACTrainer:
         policy_loss = (self.alpha * log_prob - q_new_actions).mean()
         self.policy_optimizer.zero_grad()
         self.accelerator.backward(policy_loss)
-        nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.training.max_grad_norm)
+        policy_grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.training.max_grad_norm)
         self.policy_optimizer.step()
 
         alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
@@ -807,6 +1038,10 @@ class SACTrainer:
             "train/q_loss": float(q_loss.detach().cpu().item()),
             "train/policy_loss": float(policy_loss.detach().cpu().item()),
             "train/alpha": float(self.alpha.detach().cpu().item()),
+            "train/policy_grad_norm": float(policy_grad_norm),
+            "train/q_grad_norm": float(q_grad_norm),
+            "train/q_mean": float(current_q1.mean().detach().cpu().item()),
+            "train/q_std": float(current_q1.std().detach().cpu().item()),
         }
         return metrics
 
@@ -814,6 +1049,35 @@ class SACTrainer:
         tau = self.cfg.training.tau
         for tgt_param, src_param in zip(target.parameters(), source.parameters()):
             tgt_param.data.copy_(tau * src_param.data + (1.0 - tau) * tgt_param.data)
+    
+    def _check_for_nans(self, step: int) -> bool:
+        """Check if any network has NaN parameters.
+        
+        Args:
+            step: Current training step
+            
+        Returns:
+            True if NaN detected, False otherwise
+        """
+        has_nan = False
+        
+        for name, param in self.policy.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                self.accelerator.print(f"[ERROR] NaN/Inf detected in policy.{name} at step {step}")
+                self.accelerator.print(f"  Stats: min={param.min():.4f}, max={param.max():.4f}, mean={param.mean():.4f}")
+                has_nan = True
+                
+        for name, param in self.q1.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                self.accelerator.print(f"[ERROR] NaN/Inf detected in q1.{name} at step {step}")
+                has_nan = True
+                
+        for name, param in self.q2.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                self.accelerator.print(f"[ERROR] NaN/Inf detected in q2.{name} at step {step}")
+                has_nan = True
+                
+        return has_nan
     
     def update_sysid(self) -> Dict[str, float]:
         """Update SysID encoder and predictor.
@@ -845,28 +1109,35 @@ class SACTrainer:
         speed_errors = []
         
         # For SysID: maintain separate eval encoder state
-        if self.sysid_enabled:
+        if self.context_mode == "sysid":
             from src.sysid.encoder import FeatureBuilder
             eval_encoder_hidden = self.encoder.reset(batch_size=1, device=self.device).squeeze(0)
             eval_feature_builder = FeatureBuilder(dt=self.cfg.env.dt)
             eval_prev_speed = 0.0
             eval_prev_action = 0.0
+        elif self.context_mode == "dynamics_map":
+            # For dynamics map: create separate context manager for eval
+            # (reuse the same pretrained models but fresh state)
+            eval_dynamics_map_context = None  # Will use training context for simplicity
         
         for _ in range(self.cfg.training.eval_episodes):
             obs, _ = self.eval_env.reset()
             
             # Reset encoder state for new eval episode
-            if self.sysid_enabled:
+            if self.context_mode == "sysid":
                 eval_encoder_hidden = self.encoder.reset(batch_size=1, device=self.device).squeeze(0)
                 eval_feature_builder.reset()
                 eval_prev_speed = obs[0]
                 eval_prev_action = 0.0
+            elif self.context_mode == "dynamics_map":
+                # Reset dynamics map context for new episode
+                self.dynamics_map_context.reset()
             
             done = False
             episode_reward = 0.0
             while not done:
-                # Compute z_t if SysID enabled
-                if self.sysid_enabled:
+                # Compute z_t based on context mode
+                if self.context_mode == "sysid":
                     from src.sysid.integration import compute_z_online
                     
                     current_speed = obs[0]
@@ -881,6 +1152,11 @@ class SACTrainer:
                     )
                     z_t_np = z_t.cpu().numpy()
                     obs_aug = np.concatenate([obs, z_t_np])
+                elif self.context_mode == "dynamics_map":
+                    # Get context from dynamics map (frozen encoder)
+                    z_t = self.dynamics_map_context.get_context()
+                    z_t_np = z_t.cpu().numpy()
+                    obs_aug = np.concatenate([obs, z_t_np])
                 else:
                     obs_aug = obs
                 
@@ -888,7 +1164,7 @@ class SACTrainer:
                 obs, reward, terminated, truncated, info = self.eval_env.step(action_scalar)
                 
                 # Update eval history for next step
-                if self.sysid_enabled:
+                if self.context_mode == "sysid":
                     eval_prev_speed = obs[0]
                     eval_prev_action = action_scalar
                 
@@ -901,7 +1177,13 @@ class SACTrainer:
             "eval/avg_abs_speed_error": float(np.mean(speed_errors)) if speed_errors else 0.0,
         }
 
-    def save_checkpoint(self, step: int) -> None:
+    def save_checkpoint(self, step: int, checkpoint_path: Path | None = None) -> None:
+        """Save a checkpoint.
+        
+        Args:
+            step: Current training step
+            checkpoint_path: Optional custom path for checkpoint. If None, uses default naming.
+        """
         if not self.accelerator.is_main_process:
             return
         state = {
@@ -919,6 +1201,8 @@ class SACTrainer:
                 "env": asdict(self.cfg.env),
                 "training": asdict(self.cfg.training),
                 "sysid": asdict(self.cfg.sysid),
+                "dynamics_map": asdict(self.cfg.dynamics_map),
+                "context_mode": self.cfg.context_mode,
                 "seed": self.cfg.seed,
                 "num_train_timesteps": self.cfg.training.num_train_timesteps,
             },
@@ -926,12 +1210,12 @@ class SACTrainer:
                 "obs_dim": self.env.observation_space.shape[0],
                 "env_action_dim": self.env_action_dim,
                 "policy_action_dim": self.policy_action_dim,
-                "sysid_enabled": self.sysid_enabled,
+                "context_mode": self.context_mode,
             },
         }
         
         # Save SysID components if enabled
-        if self.sysid_enabled:
+        if self.context_mode == "sysid":
             state["encoder"] = self.encoder.state_dict()
             state["predictor"] = self.predictor.state_dict()
             state["encoder_norm"] = self.encoder_norm.state_dict()
@@ -939,13 +1223,24 @@ class SACTrainer:
             state["predictor_u_norm"] = self.predictor_u_norm.state_dict()
             state["sysid_optimizer"] = self.sysid_trainer.optimizer.state_dict()
         
+        # Save dynamics map encoder if enabled and not frozen
+        if self.context_mode == "dynamics_map":
+            state["map_encoder"] = self.map_encoder.state_dict()
+            if not self.cfg.dynamics_map.freeze_encoder:
+                state["encoder_optimizer"] = self.encoder_optimizer.state_dict()
+        
         self.cfg.output.dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = self.cfg.output.dir / f"sac_step_{step}.pt"
+        
+        # Use custom path if provided, otherwise use default naming
+        if checkpoint_path is not None:
+            ckpt_path = checkpoint_path
+        else:
+            ckpt_path = self.cfg.output.dir / f"sac_step_{step}.pt"
+        
         torch.save(state, ckpt_path)
         if self.cfg.output.save_latest:
             torch.save(state, self.cfg.output.dir / "latest.pt")
 
-        self.accelerator.print(f"[checkpoint] saved {ckpt_path}")
         self.accelerator.print(f"[checkpoint] saved {ckpt_path}")
 
 
@@ -1049,12 +1344,39 @@ def train(config: ConfigBundle) -> None:
         disable=not accelerator.is_main_process,
         desc="Training",
     )
+    
+    # Track last good checkpoint for NaN recovery
+    last_good_checkpoint_step = start_step
+    
     for step in progress:
         obs, reward = trainer.collect_step(obs)
 
         if trainer.replay_buffer.size >= config.training.batch_size:
             # SAC update
             metrics = trainer.update()
+            
+            # Check for NaN in networks after update
+            if trainer._check_for_nans(step):
+                accelerator.print(f"[ERROR] NaN detected at step {step}! Training cannot continue safely.")
+                accelerator.print(f"[ERROR] Last good checkpoint was at step {last_good_checkpoint_step}")
+                accelerator.print(f"[ERROR] Consider:")
+                accelerator.print(f"  1. Resuming from checkpoint: training/checkpoints_dynamics_map/sac_step_{last_good_checkpoint_step}.pt")
+                accelerator.print(f"  2. Reducing learning rate (current: {config.training.learning_rate})")
+                accelerator.print(f"  3. Increasing reward scaling (current: {config.training.reward_scale})")
+                accelerator.print(f"  4. Checking dynamics map context for extreme values")
+                
+                # Save emergency checkpoint for debugging
+                emergency_path = config.output.dir / f"sac_step_{step}_NaN_ERROR.pt"
+                try:
+                    trainer.save_checkpoint(step, checkpoint_path=emergency_path)
+                    accelerator.print(f"[ERROR] Saved emergency checkpoint to {emergency_path} for debugging")
+                except Exception as e:
+                    accelerator.print(f"[ERROR] Failed to save emergency checkpoint: {e}")
+                
+                # Exit training
+                progress.close()
+                accelerator.end_training()
+                raise RuntimeError(f"NaN detected in network parameters at step {step}")
             
             # SysID update (if enabled, scheduled, and not frozen)
             if config.sysid.enabled and step % config.sysid.update_every == 0:
@@ -1076,6 +1398,8 @@ def train(config: ConfigBundle) -> None:
 
         if step % config.training.checkpoint_interval == 0:
             trainer.save_checkpoint(step)
+            # Update last good checkpoint tracker after successful save
+            last_good_checkpoint_step = step
 
         if accelerator.is_main_process and step % config.training.log_interval == 0:
             now = time.time()

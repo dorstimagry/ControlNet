@@ -17,7 +17,12 @@ except ImportError as exc:  # pragma: no cover - explicit guidance for users
         "The 'datasets' package is required. Install via `pip install datasets`."
     ) from exc
 
-from src.data.datasets import EVSequenceDataset, SequenceWindowConfig
+try:
+    from src.data.datasets import EVSequenceDataset, SequenceWindowConfig
+except ImportError:
+    # These classes will be imported when they're needed
+    EVSequenceDataset = None
+    SequenceWindowConfig = None
 
 
 @dataclass(slots=True)

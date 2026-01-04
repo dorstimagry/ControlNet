@@ -1,0 +1,149 @@
+# SAC Training with Dynamics Map Context
+# This config enables the online dynamics map reconstruction module
+
+# Context mode selection
+context_mode: "dynamics_map"  # Options: "none", "sysid", "dynamics_map"
+
+# Environment configuration
+env:
+  action_high: 1.0
+  action_low: -1.0
+  accel_filter_alpha: 0.2
+  action_weight: 0.5
+  brake_weight: 0.0001
+  negative_speed_weight: 10.0
+  zero_speed_error_weight: 0.25
+  zero_speed_throttle_weight: 0.25
+  horizon_penalty_weight: 0.0
+  horizon_penalty_decay: 0.99
+  jerk_weight: 0.1
+  smooth_action_weight: 15.0
+  track_weight: 1.0
+  comfort_anneal_enabled: true
+  comfort_anneal_start_mult: 0.0
+  comfort_anneal_end_mult: 1.0
+  comfort_anneal_steps: 10000000
+  voltage_weight: 0.0
+  dt: 0.1
+  max_episode_steps: 2048
+  max_position: 5000.0
+  max_speed: 25.0
+  plant_substeps: 5
+  preview_horizon_s: 3.0
+  use_extended_plant: true
+
+# Training parameters
+training:
+  gamma: 0.95
+  learning_rate: 0.00003  # Reduced by 10x for stability
+  tau: 0.005  # Slower target updates for stability
+  target_entropy_scale: 0.98
+  num_train_timesteps: 1000000
+  warmup_steps: 10000
+  batch_size: 256
+  replay_size: 1000000
+  log_interval: 1000
+  checkpoint_interval: 10000
+  max_grad_norm: 5.0
+  eval_interval: 5000
+  eval_episodes: 5
+  action_horizon_steps: 10
+  reward_scale: 0.001  # Scale rewards to prevent exploding Q-values
+
+# Output configuration
+output:
+  dir: training/checkpoints_dynamics_map
+  save_latest: true
+
+# Dynamics Map Configuration
+dynamics_map:
+  enabled: true
+  pretrained_prior_path: "training/diffusion_prior/best.pt"  # Path to trained diffusion prior
+  pretrained_encoder_path: "training/map_encoder/best_encoder.pt"  # Use pretrained autoencoder
+  freeze_encoder: true  # Freeze encoder during SAC training
+  
+  # Map grid
+  N_u: 100
+  N_v: 100
+  v_max: 30.0
+  
+  # Reconstruction
+  update_every: 10  # Update map every M steps
+  num_inference_steps: 50  # Diffusion steps (use DDPM for smooth samples)
+  guidance_scale: 100.0  # eta (guidance strength) - tuned for normalized gradients
+  sigma_meas: 0.5  # Measurement noise std (m/s²) - increased from 0.3 to handle observation noise
+  warmstart_rho: 0.8  # Warm-start mixing coefficient
+  gradient_smoothing_sigma: 10.0  # Gaussian smoothing sigma for guidance gradient - increased from 2.0 to reduce artifacts
+  
+  # Buffer & decay
+  buffer_capacity: 10000
+  lambda_decay: 0.3  # Decay rate (1/seconds)
+  w_min: 0.30  # Minimum weight floor (optimized via w_min comparison study)
+  
+  # Encoder
+  context_dim: 32
+  hidden_channels: [16, 32]
+  encoder_learning_rate: 0.0003  # LR for encoder (if training jointly)
+  
+  # Patch filtering (for uniform spatial distribution)
+  patch_filtering_enabled: false  # Enable patch-based filtering
+  patch_size_u: 10  # Patch size in u direction
+  patch_size_v: 10  # Patch size in v direction
+
+# SysID Configuration (disabled when using dynamics_map)
+sysid:
+  enabled: false
+
+# Generator configuration
+generator:
+  freq_cutoff: 0.8
+  zeta: 3.0
+  dt: 0.02
+  jerk_max: 4.0
+  p_change: 0.03
+  p_zero_stop: 0.08
+  v_min: 0.0
+  v_max_sample: 25.0
+  t_min: 2.0
+  t_max: 12.0
+  stop_hold_min: 1.0
+  stop_hold_max: 5.0
+  p_change_acc: 0.01
+  p_change_jerk: 0.01
+  ds: 1.0
+  l_corr: 300.0
+  sigma_g_stat: 0.02
+  g_min: -0.08
+  g_max: 0.08
+  speed_limit_safety_factor: 0.8
+
+# Vehicle randomization
+vehicle_randomization:
+  mass_range: [1500.0, 6000.0]
+  rolling_coeff_range: [0.007, 0.015]
+  drag_area_range: [0.2, 0.8]
+  actuator_tau_range: [0.05, 0.30]
+  grade_range_deg: [-5.7, 5.7]
+  motor_Vmax_range: [200.0, 800.0]
+  motor_R_range: [0.02, 0.6]
+  motor_L_range: [0.0001, 0.01]
+  motor_K_range: [0.05, 0.4]
+  motor_b_range: [0.000001, 0.005]
+  motor_J_range: [0.0001, 0.01]
+  gear_ratio_range: [4.0, 20.0]
+  eta_gb_range: [0.85, 0.98]
+  brake_tau_range: [0.04, 0.12]
+  brake_accel_range: [8.0, 11.0]
+  brake_p_range: [1.0, 1.8]
+  brake_kappa_range: [0.02, 0.25]
+  wheel_radius_range: [0.26, 0.38]
+  wheel_inertia_range: [0.5, 5.0]
+  mu_range: [0.7, 1.0]
+  min_accel_from_rest: 2.5
+  min_brake_decel: 4.0
+  min_top_speed: 20.0
+
+# Reference dataset and seed
+reference_dataset: null
+seed: 42
+

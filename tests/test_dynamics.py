@@ -671,7 +671,7 @@ class TestInitialTargetFeasibility:
         from utils.data_utils import adjust_initial_target
 
         # Start with infeasible speed on flat grade
-        original_speed = 35.0
+        original_speed = 30.0
         original_grade = 0.0
 
         adjusted_speed, adjusted_grade, _, _ = adjust_initial_target(

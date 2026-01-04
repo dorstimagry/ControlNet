@@ -301,6 +301,12 @@ class CenteredRandomizationConfig:
             enforce_positivity=True,  # Only enforce T_max > 0
         )
         
+        # Compute brake acceleration range from torque range
+        # a_brake = T_brake / (r_w * mass)
+        brake_accel_low = brake_Tmax_range[0] / (self.wheel_radius * self.mass)
+        brake_accel_high = brake_Tmax_range[1] / (self.wheel_radius * self.mass)
+        brake_accel_range = (brake_accel_low, brake_accel_high)
+        
         brake_p_range = _make_range(
             self.brake_p,
             brake_spread * 0.5,
@@ -351,7 +357,7 @@ class CenteredRandomizationConfig:
                 "eta_gb_range": list(eta_gb_range),
                 # Brake
                 "brake_tau_range": list(brake_tau_range),
-                "brake_Tmax_range": list(brake_Tmax_range),
+                "brake_accel_range": list(brake_accel_range),
                 "brake_p_range": list(brake_p_range),
                 "brake_kappa_range": list(brake_kappa_range),
                 "mu_range": list(mu_range),

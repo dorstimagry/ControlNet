@@ -381,6 +381,7 @@ class LongitudinalEnv(gym.Env):
             "rolling_force": plant_state.rolling_force,
             "grade_force": plant_state.grade_force,
             "net_force": plant_state.net_force,
+            "grade_rad": current_grade if self.config.use_extended_plant and self.grade_profile is not None else 0.0,  # Current grade for dynamics map
         }
 
         return obs, reward, terminated, truncated, info

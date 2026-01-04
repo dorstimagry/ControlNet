@@ -31,10 +31,19 @@ class TestFittedVehicleParams:
             rolling_coeff=0.012,
             motor_V_max=400.0,
             motor_R=0.2,
+            motor_L=0.001,
             motor_K=0.2,
+            motor_b=0.0001,
+            motor_J=0.001,
             gear_ratio=10.0,
+            eta_gb=0.95,
             brake_T_max=15000.0,
+            brake_tau=0.08,
+            brake_p=1.5,
+            brake_kappa=0.1,
+            mu=0.85,
             wheel_radius=0.346,
+            wheel_inertia=2.0,
             fit_loss=0.1,
             num_samples=10000,
             r_squared=0.85,
@@ -61,10 +70,19 @@ class TestFittedVehicleParams:
             rolling_coeff=0.010,
             motor_V_max=450.0,
             motor_R=0.15,
+            motor_L=0.001,
             motor_K=0.18,
+            motor_b=0.0001,
+            motor_J=0.001,
             gear_ratio=12.0,
+            eta_gb=0.95,
             brake_T_max=18000.0,
+            brake_tau=0.08,
+            brake_p=1.5,
+            brake_kappa=0.1,
+            mu=0.85,
             wheel_radius=0.340,
+            wheel_inertia=2.0,
             fit_loss=0.05,
             num_samples=50000,
             r_squared=0.92,
@@ -118,10 +136,19 @@ class TestFittedVehicleParams:
             rolling_coeff=0.011,
             motor_V_max=500.0,
             motor_R=0.25,
+            motor_L=0.001,
             motor_K=0.22,
+            motor_b=0.0001,
+            motor_J=0.001,
             gear_ratio=9.0,
+            eta_gb=0.95,
             brake_T_max=16000.0,
+            brake_tau=0.08,
+            brake_p=1.5,
+            brake_kappa=0.1,
+            mu=0.85,
             wheel_radius=0.350,
+            wheel_inertia=2.0,
             fit_loss=0.08,
             num_samples=25000,
             r_squared=0.88,
@@ -152,10 +179,19 @@ class TestFittedVehicleParams:
             rolling_coeff=0.012,
             motor_V_max=400.0,
             motor_R=0.2,
+            motor_L=0.001,
             motor_K=0.2,
+            motor_b=0.0001,
+            motor_J=0.001,
             gear_ratio=10.0,
+            eta_gb=0.95,
             brake_T_max=15000.0,
+            brake_tau=0.08,
+            brake_p=1.5,
+            brake_kappa=0.1,
+            mu=0.85,
             wheel_radius=0.346,
+            wheel_inertia=2.0,
         )
         
         plant_dict = params.to_extended_plant_params()
@@ -164,9 +200,9 @@ class TestFittedVehicleParams:
         assert plant_dict["motor"]["R"] == 0.2
         assert plant_dict["motor"]["K_t"] == 0.2
         assert plant_dict["motor"]["K_e"] == 0.2
-        assert plant_dict["motor"]["gear_ratio"] == 10.0
-        assert plant_dict["body"]["mass"] == 1800.0
-        assert plant_dict["brake"]["T_br_max"] == 15000.0
+        assert plant_dict["gear_ratio"] == 10.0
+        assert plant_dict["mass"] == 1800.0
+        assert plant_dict["brake"]["T_max"] == 15000.0
 
 
 class TestFitterConfig:

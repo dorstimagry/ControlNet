@@ -1,0 +1,24 @@
+# Diffusion Prior Training Configuration
+
+# Model architecture (simplified for 2D acceleration maps)
+sample_size: [100, 100]  # (N_u, N_v)
+block_out_channels: [32, 64]  # Reduced from [32, 64, 128] - 76% fewer params
+num_train_timesteps: 1000
+
+# Training
+num_epochs: 1000
+batch_size: 64
+learning_rate: 1.0e-4
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+# Logging and checkpointing
+log_interval: 10
+checkpoint_interval: 1000
+
+# Data
+num_workers: 4
+
+# Output
+output_dir: "training/diffusion_prior"
+

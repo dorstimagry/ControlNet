@@ -82,6 +82,51 @@ evaluation/results/
 evaluation/results/plots/
 evaluation/results/*.json
 
+# Evaluation folders with images and animations
+evaluation/artifact_debug/
+evaluation/debug_comparison/
+evaluation/debug_seed_test/
+evaluation/diffusion/
+evaluation/diffusion_1000epochs/
+evaluation/diffusion_final/
+evaluation/diffusion_gs100/
+evaluation/diffusion_test/
+evaluation/diffusion_x0_guidance/
+evaluation/final_fixed/
+evaluation/final_with_smoothing/
+evaluation/guidance_debug/
+evaluation/guidance_scale_comparison/
+evaluation/map0_only/
+evaluation/online_simulation/
+evaluation/online_simulation_10k/
+evaluation/online_simulation_ddpm/
+evaluation/online_simulation_gs100_10k/
+evaluation/online_simulation_gs100_10k_uniform/
+evaluation/online_simulation_hq/
+evaluation/online_simulation_offline_params/
+evaluation/online_simulation_patch_filtering/
+evaluation/online_simulation_spatial/
+evaluation/online_simulation_spatial_final/
+evaluation/online_simulation_spatial_offline_params/
+evaluation/spatial_weighting/
+evaluation/test_rerun/
+evaluation/wmin_1.0_study/
+evaluation/wmin_comparison/
+evaluation/wmin_uniform_ddpm/
+evaluation/wmin_uniform_sampling/
+
+# Evaluation images and animations
+evaluation/*.png
+evaluation/*.gif
+evaluation/*.jpg
+evaluation/*.jpeg
+evaluation/*.svg
+evaluation/**/*.png
+evaluation/**/*.gif
+evaluation/**/*.jpg
+evaluation/**/*.jpeg
+evaluation/**/*.svg
+
 # Fitting results
 fitting/results/
 
