@@ -95,6 +95,8 @@ class SingleEpisodeGenerator:
             # Stochastic parameters
             p_change_acc=self.batch_config.p_change_acc,
             p_change_jerk=self.batch_config.p_change_jerk,
+            p_zero_accel=self.batch_config.p_zero_accel,
+            accel_beta=self.batch_config.accel_beta,
             # Grade parameters
             ds=self.batch_config.ds,
             l_corr=self.batch_config.l_corr,
@@ -177,6 +179,11 @@ def create_reference_generator(
             t_max=generator_config.get('t_max', 12.0),
             stop_hold_min=generator_config.get('stop_hold_min', 1.0),
             stop_hold_max=generator_config.get('stop_hold_max', 5.0),
+            # Stochastic acceleration/jerk parameters
+            p_change_acc=generator_config.get('p_change_acc', 0.04),
+            p_change_jerk=generator_config.get('p_change_jerk', 0.03),
+            p_zero_accel=generator_config.get('p_zero_accel', 0.15),
+            accel_beta=generator_config.get('accel_beta', 2.0),
             # Grade parameters
             ds=generator_config.get('ds', 1.0),
             l_corr=generator_config.get('l_corr', 50.0),

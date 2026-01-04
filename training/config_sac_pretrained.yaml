@@ -130,6 +130,8 @@ generator:
   # Stochastic acceleration/jerk sampling parameters
   p_change_acc: 0.01       # Probability of changing acceleration scale per step (0-1)
   p_change_jerk: 0.01      # Probability of changing jerk scale per step (0-1)
+  p_zero_accel: 0.15        # Probability of sampling zero acceleration when acceleration changes
+  accel_beta: 2.0          # Beta distribution parameter (higher = more small accelerations)
 
   # Road grade generation parameters (Ornstein-Uhlenbeck process)
   ds: 1.0                  # Spatial grid step size (meters) - resolution of grade map

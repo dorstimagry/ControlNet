@@ -49,6 +49,8 @@ class GeneratorConfig:
     # Stochastic acceleration & jerk parameters
     p_change_acc: float = 0.04  # Probability of changing acceleration scale per step
     p_change_jerk: float = 0.03  # Probability of changing jerk scale per step
+    p_zero_accel: float = 0.15  # Probability of sampling zero acceleration when acceleration changes
+    accel_beta: float = 2.0  # Beta distribution parameter for acceleration sampling (higher = more small accelerations)
 
     # Road grade parameters
     ds: float = 1.0  # Spatial grid step (m)
@@ -297,7 +299,21 @@ class BatchTargetGenerator:
             C_jerk = (rand_jerk < self.config.p_change_jerk)
 
             # Sample new scalars where coin is True
-            s_acc_new = torch.rand(C_acc.sum(), device=self.device)  # [0,1]
+            # For acceleration: first check if we should sample zero, otherwise use beta distribution
+            num_acc_changes = C_acc.sum()
+            s_acc_new = torch.zeros(num_acc_changes, device=self.device)
+            if num_acc_changes > 0:
+                # Check if we should sample zero acceleration
+                zero_accel_rand = torch.rand(num_acc_changes, device=self.device)
+                zero_accel_mask = (zero_accel_rand < self.config.p_zero_accel)
+                
+                # For non-zero accelerations, sample from beta distribution (favors smaller values)
+                non_zero_mask = ~zero_accel_mask
+                if non_zero_mask.any():
+                    beta_dist = torch.distributions.Beta(1.0, self.config.accel_beta)
+                    s_acc_new[non_zero_mask] = beta_dist.sample([non_zero_mask.sum()])
+                # Zero accelerations remain at 0.0
+            
             s_jerk_new = torch.rand(C_jerk.sum(), device=self.device)  # [0,1]
 
             # Initialize with previous values
