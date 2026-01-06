@@ -219,7 +219,7 @@ def export_to_onnx(
     # Load raw checkpoint to get metadata and SysID components
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     meta = checkpoint.get("meta", {})
-    sysid_enabled = meta.get("sysid_enabled", False)
+    sysid_enabled_meta = meta.get("sysid_enabled", False)
     
     # Load the policy and configuration
     policy, env_cfg, horizon = load_policy_from_checkpoint(
@@ -230,6 +230,21 @@ def export_to_onnx(
     obs_dim = policy.net[0].in_features
     action_dim = int(meta.get("policy_action_dim", policy.action_dim))
     env_action_dim = int(meta.get("env_action_dim", 1))
+    
+    # Auto-detect SysID from model dimensions (more reliable than metadata)
+    # Base observation: 4 (speed, prev_speed, prev_prev_speed, prev_action) + preview_steps
+    preview_steps = max(int(round(env_cfg.preview_horizon_s / env_cfg.dt)), 1)
+    base_obs_dim = 4 + preview_steps
+    
+    # If policy expects more dimensions than base, SysID is enabled
+    if obs_dim > base_obs_dim:
+        sysid_enabled = True
+        z_dim_auto = obs_dim - base_obs_dim
+        print(f"[export] Auto-detected SysID from model dimensions: obs_dim={obs_dim}, base_obs_dim={base_obs_dim}, z_dim={z_dim_auto}")
+        if not sysid_enabled_meta:
+            print(f"[Warning] Checkpoint metadata says sysid_enabled=false, but model expects {obs_dim}D obs (base={base_obs_dim}D). Using auto-detection.")
+    else:
+        sysid_enabled = sysid_enabled_meta
     
     print(f"[export] Model dimensions:")
     print(f"         obs_dim: {obs_dim}")
@@ -244,8 +259,16 @@ def export_to_onnx(
         
         config = checkpoint.get("config", {})
         sysid_config = config.get("sysid", {})
-        z_dim = int(sysid_config.get("dz", 12))
+        # Use auto-detected z_dim if available, otherwise from config
+        z_dim = z_dim_auto if 'z_dim_auto' in locals() else int(sysid_config.get("dz", 12))
         gru_hidden = int(sysid_config.get("gru_hidden", 64))
+        
+        # Check if encoder weights exist in checkpoint
+        if "encoder" not in checkpoint or "encoder_norm" not in checkpoint:
+            raise ValueError(
+                f"SysID is enabled (model expects {obs_dim}D obs), but encoder weights "
+                f"are missing from checkpoint. Checkpoint may have been saved incorrectly."
+            )
         
         # Create encoder and normalization
         encoder = ContextEncoder(input_dim=4, hidden_dim=gru_hidden, z_dim=z_dim)

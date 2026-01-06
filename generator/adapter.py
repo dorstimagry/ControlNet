@@ -67,7 +67,7 @@ class SingleEpisodeGenerator:
         self.device = device or torch.device('cpu')
         self.generator = BatchTargetGenerator(batch_config, batch_size=1, episode_length=1000, device=device)
 
-    def sample(self, length: int, rng: np.random.Generator | None = None, vehicle: VehicleCapabilities | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def sample(self, length: int, rng: np.random.Generator | None = None, vehicle: VehicleCapabilities | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Generate a single reference profile and grade profile of given length.
 
         Args:
@@ -76,7 +76,7 @@ class SingleEpisodeGenerator:
             vehicle: Optional VehicleCapabilities object. If None, uses default vehicle.
 
         Returns:
-            Tuple of (speed_profile, grade_profile) as numpy arrays [length]
+            Tuple of (filtered_speed_profile, grade_profile, raw_speed_profile) as numpy arrays [length]
         """
         # Adjust config for single episode
         single_config = GeneratorConfig(
@@ -115,13 +115,14 @@ class SingleEpisodeGenerator:
         generator = BatchTargetGenerator(single_config, batch_size=1, episode_length=length, device=self.device)
         # Override the prediction_horizon in the config
         generator.config.prediction_horizon = min(self.prediction_horizon, length)
-        targets, grades = generator.generate_batch(vehicle)
+        targets, grades, raw_targets = generator.generate_batch(vehicle)
 
-        # Extract the speed profile (first element of each horizon)
-        speed_profile = targets[0, :, 0].cpu().numpy()  # [length]
+        # Extract the speed profiles (first element of each horizon)
+        filtered_speed_profile = targets[0, :, 0].cpu().numpy()  # [length] - filtered profile
         grade_profile = grades[0, :length].cpu().numpy()  # [length]
+        raw_speed_profile = raw_targets[0, :, 0].cpu().numpy()  # [length] - raw (unfiltered) profile
 
-        return speed_profile, grade_profile
+        return filtered_speed_profile, grade_profile, raw_speed_profile
 
     def _create_default_vehicle(self) -> VehicleCapabilities:
         """Create default vehicle parameters for generation.

@@ -1292,6 +1292,129 @@ def train(config: ConfigBundle) -> None:
     env.reset(seed=config.seed)
     eval_env.reset(seed=config.seed + 1)
 
+    # Generate example plot for violent profile mode
+    if config.env.violent_profile_mode:
+        accelerator.print("[violent_profile] Generating example plot...")
+        try:
+            from generator.lpf import SecondOrderLPF
+            import matplotlib
+            # Try to use interactive backend if available, otherwise fall back to Agg
+            # Note: matplotlib.use() must be called before importing pyplot
+            backend_set = False
+            interactive_backend = None
+            for backend in ['TkAgg', 'Qt5Agg', 'Qt4Agg']:
+                try:
+                    matplotlib.use(backend)
+                    backend_set = True
+                    interactive_backend = backend
+                    accelerator.print(f"[violent_profile] Successfully set interactive backend: {backend}")
+                    break
+                except Exception as e:
+                    accelerator.print(f"[violent_profile] Failed to set backend {backend}: {e}")
+                    continue
+            if not backend_set:
+                matplotlib.use('Agg')  # Fall back to non-interactive
+                accelerator.print("[violent_profile] WARNING: Using non-interactive backend (Agg) - plot will be saved but not displayed")
+                accelerator.print("[violent_profile] To display plots, install: sudo apt-get install python3-tk (for TkAgg)")
+            import matplotlib.pyplot as plt
+            
+            # Enable interactive mode if we have an interactive backend
+            if backend_set:
+                plt.ion()  # Turn on interactive mode
+            
+            # Generate a sample profile using the environment's generator
+            profile_length = 200
+            filtered_profile, grade_profile, raw_profile = env._generate_reference(profile_length)
+            
+            # Apply reward filter to raw profile (as done in reset)
+            if env._reward_filter is not None:
+                import torch
+                raw_tensor = torch.from_numpy(raw_profile).unsqueeze(0)  # [1, T]
+                filtered_by_reward_filter = torch.zeros_like(raw_tensor)
+                
+                # Reset filter state with initial value from raw profile
+                initial_y = torch.tensor([[raw_profile[0]]], device=torch.device('cpu'), dtype=torch.float32)
+                env._reward_filter.reset(initial_y=initial_y)
+                
+                # Process each timestep through the filter
+                for t in range(len(raw_profile)):
+                    u_t = raw_tensor[:, t:t+1]  # [1, 1]
+                    filtered_y = env._reward_filter.update(u_t)
+                    filtered_by_reward_filter[:, t] = filtered_y.squeeze(0)
+                
+                reward_filtered_profile = filtered_by_reward_filter.squeeze(0).cpu().numpy().astype(np.float32)
+            else:
+                reward_filtered_profile = raw_profile.copy()
+            
+            # Create time axis
+            dt = config.env.dt
+            time_axis = np.arange(profile_length) * dt
+            
+            # Clamp filtered profile to non-negative for visualization
+            reward_filtered_profile_clamped = np.maximum(reward_filtered_profile, 0.0)
+            
+            # Create plot
+            fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+            
+            # Top plot: Raw profile vs Reward filter profile
+            axes[0].plot(time_axis, raw_profile, label="Raw Profile (RL observations in violent mode)", 
+                         color="#d62728", linewidth=2.5, linestyle="-", alpha=0.9)
+            axes[0].plot(time_axis, reward_filtered_profile_clamped, label="Reward Filtered Profile (for reward computation)", 
+                         color="#2ca02c", linewidth=2, linestyle="--", alpha=0.9)
+            axes[0].plot(time_axis, filtered_profile, label="Generator Filtered Profile (normal mode)", 
+                         color="#1f77b4", linewidth=1.5, linestyle=":", alpha=0.7)
+            axes[0].set_ylabel("Speed (m/s)", fontsize=12)
+            axes[0].set_title("Training Initialization: Profiles Generated During Reset (Violent Mode)", fontsize=14, fontweight="bold")
+            axes[0].legend(loc="upper right", fontsize=10)
+            axes[0].grid(alpha=0.3, linestyle=":")
+            axes[0].set_ylim([-1, max(25, raw_profile.max() * 1.1)])
+            
+            # Bottom plot: Show the difference/smoothing effect
+            speed_diff = reward_filtered_profile_clamped - raw_profile
+            axes[1].plot(time_axis, speed_diff, label="Reward Filtered - Raw (smoothing effect)", 
+                         color="#9467bd", linewidth=2, linestyle="-")
+            axes[1].axhline(y=0, color="black", linestyle="--", linewidth=1, alpha=0.5)
+            axes[1].set_xlabel("Time (s)", fontsize=12)
+            axes[1].set_ylabel("Speed Difference (m/s)", fontsize=12)
+            axes[1].set_title("Smoothing Effect: How the Reward Filter Smooths the Raw Profile", fontsize=14, fontweight="bold")
+            axes[1].legend(loc="upper right", fontsize=10)
+            axes[1].grid(alpha=0.3, linestyle=":")
+            
+            # Add text annotation explaining what happens during training
+            fig.text(0.5, 0.02, 
+                     "During training initialization: Generator creates raw_profile (discontinuous). "
+                     "In violent mode: RL model receives raw_profile in observations, "
+                     "but reward is computed against reward-filtered (smooth) version of raw_profile.",
+                     ha="center", fontsize=10, style="italic")
+            
+            fig.suptitle("Violent Profile Mode: Training Initialization Example", fontsize=16, fontweight="bold", y=0.98)
+            fig.tight_layout(rect=(0, 0.05, 1, 0.97))
+            
+            # Save plot to output directory
+            output_path = config.output.dir / "violent_profile_example.png"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(output_path, dpi=150, bbox_inches="tight")
+            
+            # Show the plot
+            if backend_set:
+                # Interactive backend available - display the plot
+                accelerator.print(f"[violent_profile] Displaying plot window (close window to continue training)...")
+                plt.show(block=True)  # Block until window is closed
+                accelerator.print(f"[violent_profile] Plot window closed, continuing training...")
+            else:
+                # Non-interactive backend - can't display, just inform user
+                accelerator.print(f"[violent_profile] Non-interactive backend - plot saved to {output_path}")
+                accelerator.print(f"[violent_profile] To view: open {output_path}")
+                plt.close(fig)
+            
+            accelerator.print(f"[violent_profile] Example plot saved to {output_path}")
+            accelerator.print(f"[violent_profile] Raw profile: min={raw_profile.min():.2f} m/s, max={raw_profile.max():.2f} m/s, std={raw_profile.std():.2f} m/s")
+            accelerator.print(f"[violent_profile] Reward filtered: min={reward_filtered_profile.min():.2f} m/s, max={reward_filtered_profile.max():.2f} m/s, std={reward_filtered_profile.std():.2f} m/s")
+        except Exception as e:
+            accelerator.print(f"[violent_profile] Warning: Failed to generate example plot: {e}")
+            import traceback
+            accelerator.print(traceback.format_exc())
+
     trainer = SACTrainer(env, eval_env, config, accelerator)
 
     # Load checkpoint if specified

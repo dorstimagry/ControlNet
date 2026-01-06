@@ -765,6 +765,138 @@ def plot_z_latent_analysis(
     print(f"Z latent analysis saved to {output_path}")
 
 
-__all__ = ["plot_sequence_diagnostics", "plot_summary", "plot_feasibility_diagnostics", "plot_profile_statistics", "plot_z_latent_analysis"]
+def plot_step_function_results(step_traces: list[dict], output_path: Path) -> None:
+    """Plot all step function evaluation results in a single figure with multiple subplots.
+    
+    Creates a 10x5 grid of subplots with alternating rows:
+    - Even rows (0, 2, 4, 6, 8): Speed tracking plots (reference step function and actual speed)
+    - Odd rows (1, 3, 5, 7, 9): Actuation plots (action commands) directly below each speed plot
+    
+    Each column represents an end speed [0, 5, 10, 15, 20] m/s.
+    Each row pair (speed + actuation) represents a start speed [0, 5, 10, 15, 20] m/s.
+    
+    Args:
+        step_traces: List of trace dictionaries from step function evaluations.
+                    Each trace should have 'start_speed', 'end_speed', 'time', 'speed', 'reference', 'action'
+        output_path: Path to save the figure
+    """
+    start_speeds = [0.0, 5.0, 10.0, 15.0, 20.0]
+    end_speeds = [0.0, 5.0, 10.0, 15.0, 20.0]
+    
+    # Create a dictionary for quick lookup: (start_speed, end_speed) -> trace
+    trace_dict = {}
+    for trace in step_traces:
+        start = trace.get("start_speed")
+        end = trace.get("end_speed")
+        if start is not None and end is not None:
+            trace_dict[(start, end)] = trace
+    
+    # Create figure with 10x5 subplots (alternating speed and actuation rows)
+    fig, axes = plt.subplots(10, 5, figsize=(20, 40), sharex='col')
+    
+    # Iterate over all combinations
+    for i, start_speed in enumerate(start_speeds):
+        for j, end_speed in enumerate(end_speeds):
+            key = (start_speed, end_speed)
+            
+            # Speed subplot (even rows: 0, 2, 4, 6, 8)
+            ax_speed = axes[i * 2, j]
+            
+            if key in trace_dict:
+                trace = trace_dict[key]
+                time = _to_numpy(trace.get("time", []))
+                speed = _to_numpy(trace.get("speed", []))
+                reference = _to_numpy(trace.get("reference", []))
+                action = _to_numpy(trace.get("action", []))
+                v_max_theoretical = trace.get("v_max_theoretical")
+                is_feasible = trace.get("is_feasible", True)
+                
+                # Plot reference (step function) as dashed line
+                ax_speed.plot(time, reference, label="Reference", linestyle="--", color="#ff7f0e", linewidth=1.5)
+                # Plot actual speed as solid line
+                ax_speed.plot(time, speed, label="Speed", color="#1f77b4", linewidth=1.5)
+                
+                # Add max feasible speed line if available
+                if v_max_theoretical is not None:
+                    ax_speed.axhline(
+                        y=v_max_theoretical,
+                        color="#d62728",
+                        linestyle=":",
+                        linewidth=1,
+                        alpha=0.7,
+                        label=f"Max feasible ({v_max_theoretical:.1f} m/s)"
+                    )
+                
+                # Set title with feasibility indicator
+                title = f"Start: {start_speed:.0f} m/s → End: {end_speed:.0f} m/s"
+                if not is_feasible:
+                    title += " [INFEASIBLE]"
+                ax_speed.set_title(title, fontsize=10, color="#d62728" if not is_feasible else "black")
+                
+                # Set labels only on edges
+                if i == 4:  # Last speed row
+                    # X-label will be on actuation plot below
+                    pass
+                if j == 0:  # Left column
+                    ax_speed.set_ylabel("Speed (m/s)", fontsize=9)
+                
+                ax_speed.grid(alpha=0.3)
+                ax_speed.legend(loc="upper right", fontsize=7)
+                
+                # Actuation subplot (odd rows: 1, 3, 5, 7, 9) - directly below speed plot
+                ax_action = axes[i * 2 + 1, j]
+                
+                if len(action) > 0:
+                    ax_action.plot(time, action, label="Action", color="#2ca02c", linewidth=1.5)
+                    ax_action.axhline(y=0, color="black", linestyle="--", linewidth=0.5, alpha=0.3)
+                    ax_action.set_ylim(-1.1, 1.1)
+                    
+                    # Set labels only on edges
+                    if i == 4:  # Bottom row of actuation plots
+                        ax_action.set_xlabel("Time (s)", fontsize=9)
+                    if j == 0:  # Left column
+                        ax_action.set_ylabel("Action", fontsize=9)
+                    
+                    ax_action.grid(alpha=0.3)
+                    ax_action.legend(loc="upper right", fontsize=7)
+                else:
+                    ax_action.text(0.5, 0.5, "No action data", ha="center", va="center", transform=ax_action.transAxes)
+                    ax_action.set_ylim(-1.1, 1.1)
+                    if i == 4:
+                        ax_action.set_xlabel("Time (s)", fontsize=9)
+                    if j == 0:
+                        ax_action.set_ylabel("Action", fontsize=9)
+                    ax_action.grid(alpha=0.3)
+            else:
+                # No data for this combination
+                ax_speed.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax_speed.transAxes)
+                ax_speed.set_title(f"Start: {start_speed:.0f} m/s → End: {end_speed:.0f} m/s", fontsize=10)
+                
+                # Empty actuation subplot
+                ax_action = axes[i * 2 + 1, j]
+                ax_action.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax_action.transAxes)
+                
+                # Set labels only on edges
+                if i == 4:
+                    ax_action.set_xlabel("Time (s)", fontsize=9)
+                if j == 0:
+                    ax_speed.set_ylabel("Speed (m/s)", fontsize=9)
+                    ax_action.set_ylabel("Action", fontsize=9)
+                
+                ax_speed.grid(alpha=0.3)
+                ax_action.grid(alpha=0.3)
+    
+    # Overall title
+    fig.suptitle("Step Function Evaluation Results", fontsize=16, y=0.995)
+    
+    fig.tight_layout(rect=(0, 0, 1, 0.99))
+    _ensure_parent(output_path)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    
+    print(f"Step function results plot saved to {output_path}")
+
+
+__all__ = ["plot_sequence_diagnostics", "plot_summary", "plot_feasibility_diagnostics", "plot_profile_statistics", "plot_z_latent_analysis", "plot_step_function_results"]
 
 

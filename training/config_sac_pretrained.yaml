@@ -9,6 +9,9 @@
 #   2. Then train SAC with this config:
 #      python training/train_sac.py --config training/config_sac_pretrained.yaml
 
+# Context mode selection
+context_mode: "sysid"  # Options: "none", "sysid", "dynamics_map"
+
 env:
   # Action space bounds (dimensionless, -1 to 1)
   action_high: 1.0          # Maximum action value (full throttle/brake)
@@ -20,12 +23,21 @@ env:
   brake_weight: 0.0001         # Penalty weight for brake usage (set to 0 to disable)
   negative_speed_weight: 10.0   # Penalty weight for negative vehicle speeds (prevents reverse)
   zero_speed_error_weight: 0.25    # Penalty for speed error when target speed is 0
-  zero_speed_throttle_weight: 0.5 # Penalty for throttle usage when target speed is 0
+  zero_speed_throttle_weight: 10.0 # Penalty for throttle usage when target speed is 0
   horizon_penalty_weight: 0.0  # Weight for future horizon tracking penalties
   horizon_penalty_decay: 0.99  # Exponential decay factor for future penalties (0.9-1.0)
-  jerk_weight: 0.1          # Penalty weight for acceleration changes (smoothness)
+  jerk_weight: 0.5          # Penalty weight for acceleration changes (smoothness)
   smooth_action_weight: 20.0 # Penalty weight for action changes (stability)
   track_weight: 1.0         # Weight for speed tracking error in reward
+  
+  # Oscillation and overshoot penalty configuration
+  # See docs/oscillation_and_overshoot_penalties_for_rl_longitudinal_control.md for details
+  oscillation_weight: 0.2  # Weight for oscillatory switching penalty (λ_osc) - start small (1-5% of track_weight)
+  overshoot_weight: 0.1  # Weight for overshoot crossing penalty (λ_over) - typically 0.1-0.3 × oscillation_weight
+  oscillation_epsilon: 0.05  # Smoothing parameter for action sign (ε) - typical range: 0.03-0.08
+  oscillation_error_scale: 0.3  # Error scale for proximity gate (e_s in m/s) - typical range: 0.2-0.5
+  oscillation_ref_scale: 0.3  # Reference rate scale for stationarity gate (r_s in m/s²) - typical range: 0.2-0.5
+  overshoot_crossing_scale: 0.02  # Crossing detection scale (c_s) - typical range: 0.01-0.05
   
   # Comfort penalty annealing - gradually increase comfort penalties during training
   # This allows the agent to first learn tracking, then refine for smoothness
@@ -43,6 +55,15 @@ env:
   plant_substeps: 5         # Physics simulation substeps per policy step (stability)
   preview_horizon_s: 3.0    # How far ahead the agent can see reference speeds (seconds)
   use_extended_plant: true  # Use detailed vehicle dynamics model (true) or simple (false)
+  
+  # Violent profile training mode configuration
+  violent_profile_mode: false  # Enable/disable violent profile mode (non-smooth profiles in observations)
+  reward_filter_freq_cutoff: 0.6  # Filter cutoff frequency for reward (Hz)
+  reward_filter_zeta: 0.9  # Filter damping ratio for reward
+  reward_filter_dt: 0.1  # Filter timestep for reward (should match env dt)
+  reward_filter_rate_max: 15.0  # Default max acceleration for reward filter (m/s²) - overridden per episode based on vehicle
+  reward_filter_rate_neg_max: 20.0  # Default max deceleration for reward filter (m/s²) - overridden per episode based on vehicle
+  reward_filter_jerk_max: 12.0  # Default max jerk for reward filter (m/s³)
 output:
   dir: training/checkpoints_sac_pretrained     # Directory to save model checkpoints
   save_latest: true             # Whether to save the latest checkpoint during training

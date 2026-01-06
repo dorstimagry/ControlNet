@@ -1,3 +1,21 @@
+# Configuration for SAC training with pretrained SysID encoder
+# 
+# This config loads a pretrained SysID encoder and freezes it during SAC training.
+# The encoder provides vehicle-specific dynamics features to the policy/critic.
+#
+# Usage:
+#   1. First pretrain SysID:
+#      python scripts/pretrain_sysid.py --config training/config_sysid.yaml --num-steps 50000
+#   2. Then train SAC with this config:
+#      python training/train_sac.py --config training/config_sac_pretrained_violent.yaml
+#
+# NOTE: This config enables violent profile mode, where the RL model receives
+# non-smooth (discontinuous) target profiles in observations, while rewards
+# are computed against a filtered version of the profile.
+
+# Context mode selection
+context_mode: "sysid"  # Options: "none", "sysid", "dynamics_map"
+
 env:
   # Action space bounds (dimensionless, -1 to 1)
   action_high: 1.0          # Maximum action value (full throttle/brake)
@@ -9,12 +27,21 @@ env:
   brake_weight: 0.0001         # Penalty weight for brake usage (set to 0 to disable)
   negative_speed_weight: 10.0   # Penalty weight for negative vehicle speeds (prevents reverse)
   zero_speed_error_weight: 0.25    # Penalty for speed error when target speed is 0
-  zero_speed_throttle_weight: 0.25 # Penalty for throttle usage when target speed is 0
+  zero_speed_throttle_weight: 10.0 # Penalty for throttle usage when target speed is 0
   horizon_penalty_weight: 0.0  # Weight for future horizon tracking penalties
   horizon_penalty_decay: 0.99  # Exponential decay factor for future penalties (0.9-1.0)
-  jerk_weight: 0.1          # Penalty weight for acceleration changes (smoothness)
-  smooth_action_weight: 15.0 # Penalty weight for action changes (stability)
+  jerk_weight: 0.5          # Penalty weight for acceleration changes (smoothness)
+  smooth_action_weight: 20.0 # Penalty weight for action changes (stability)
   track_weight: 1.0         # Weight for speed tracking error in reward
+  
+  # Oscillation and overshoot penalty configuration
+  # See docs/oscillation_and_overshoot_penalties_for_rl_longitudinal_control.md for details
+  oscillation_weight: 0.2  # Weight for oscillatory switching penalty (λ_osc) - start small (1-5% of track_weight)
+  overshoot_weight: 0.1  # Weight for overshoot crossing penalty (λ_over) - typically 0.1-0.3 × oscillation_weight
+  oscillation_epsilon: 0.05  # Smoothing parameter for action sign (ε) - typical range: 0.03-0.08
+  oscillation_error_scale: 0.3  # Error scale for proximity gate (e_s in m/s) - typical range: 0.2-0.5
+  oscillation_ref_scale: 0.3  # Reference rate scale for stationarity gate (r_s in m/s²) - typical range: 0.2-0.5
+  overshoot_crossing_scale: 0.02  # Crossing detection scale (c_s) - typical range: 0.01-0.05
   
   # Comfort penalty annealing - gradually increase comfort penalties during training
   # This allows the agent to first learn tracking, then refine for smoothness
@@ -34,12 +61,15 @@ env:
   use_extended_plant: true  # Use detailed vehicle dynamics model (true) or simple (false)
   
   # Violent profile training mode configuration
-  violent_profile_mode: false  # Enable/disable violent profile mode (non-smooth profiles in observations)
-  reward_filter_freq_cutoff: 0.6  # Filter cutoff frequency for reward (Hz)
-  reward_filter_zeta: 0.9  # Filter damping ratio for reward
+  violent_profile_mode: true  # Enable/disable violent profile mode (non-smooth profiles in observations)
+  reward_filter_freq_cutoff: 1.2  # Filter cutoff frequency for reward (Hz)
+  reward_filter_zeta: 5.0  # Filter damping ratio for reward
   reward_filter_dt: 0.1  # Filter timestep for reward (should match env dt)
+  reward_filter_rate_max: 1.6  # Default max acceleration for reward filter (m/s²) - overridden per episode based on vehicle
+  reward_filter_rate_neg_max: 2.2  # Default max deceleration for reward filter (m/s²) - overridden per episode based on vehicle
+  reward_filter_jerk_max: 1.5  # Default max jerk for reward filter (m/s³)
 output:
-  dir: training/checkpoints     # Directory to save model checkpoints
+  dir: training/checkpoints_sac_pretrained_violent     # Directory to save model checkpoints
   save_latest: true             # Whether to save the latest checkpoint during training
 reference_dataset: null         # Path to reference dataset (null = use generator)
 seed: 42                        # Random seed for reproducibility
@@ -67,6 +97,44 @@ training:
 
   # Action planning (for MPC-style policies, if used)
   action_horizon_steps: 10    # Planning horizon for action sequences (steps)
+
+# ========================================================================
+# SysID Configuration: Load pretrained encoder, freeze during SAC training
+# ========================================================================
+sysid:
+  enabled: true
+  
+  # IMPORTANT: Path to pretrained SysID checkpoint
+  pretrained_path: "training/sysid_pretrained/sysid_best.pt"
+  
+  # IMPORTANT: Freeze encoder during SAC training (recommended)
+  # Set to false to fine-tune encoder alongside SAC
+  freeze_encoder: true
+  
+  # Architecture (must match pretrained model)
+  dz: 12
+  gru_hidden: 64
+  predictor_hidden: 128
+  predictor_layers: 2
+  
+  # Training windows (must match pretrained model)
+  burn_in: 20
+  horizon: 40
+  
+  # Loss weights (only used if freeze_encoder: false)
+  lambda_slow: 0.005
+  lambda_z: 0.0005
+  
+  # Optimization (only used if freeze_encoder: false)
+  learning_rate: 0.001
+  update_every: 1
+  updates_per_step: 1
+  pretrain_steps: 0
+  
+  # Normalization
+  norm_clip: 10.0
+  norm_eps: 1.0e-6
+
 generator:
   # Low-Pass Filter (LPF) parameters for smoothing target speed profiles
   freq_cutoff: 0.8         # LPF cutoff frequency (Hz) - higher = more responsive but less smooth
@@ -99,12 +167,6 @@ generator:
 
   # Speed limit safety factor
   speed_limit_safety_factor: 0.8  # Multiplier for max feasible speed (0.75 = 25% reduction from theoretical max)
-
-# Creep torque configuration (EV-style creep behavior)
-creep:
-  a_max: 0.5              # [m/s²] maximum creep acceleration
-  v_cutoff: 2.0           # [m/s] speed where creep fully fades out  
-  v_hold: 0.08            # [m/s] standstill region threshold
 
 vehicle_randomization:
   # Fitted vehicle mode (optional): use fitted params as center of randomization
@@ -148,3 +210,4 @@ vehicle_randomization:
   min_accel_from_rest: 2.5             # m/s² - minimum acceleration at standstill
   min_brake_decel: 4.0                 # m/s² - minimum braking deceleration
   min_top_speed: 20.0                  # m/s - minimum achievable top speed
+

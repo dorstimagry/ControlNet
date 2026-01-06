@@ -189,16 +189,17 @@ class BatchTargetGenerator:
     def generate_batch(
         self,
         vehicle: VehicleCapabilities
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate a batch of target speed sequences.
 
         Args:
             vehicle: Vehicle capabilities [B] tensors
 
         Returns:
-            Tuple of (targets, grades) tensors:
-            - targets: [B, T, H] target speeds for each episode step and horizon
+            Tuple of (targets, grades, raw_targets) tensors:
+            - targets: [B, T, H] filtered target speeds for each episode step and horizon
             - grades: [B, T, H] corresponding grade profiles
+            - raw_targets: [B, T, H] raw (unfiltered) target speeds for each episode step and horizon
         """
         B, T, H = self.batch_size, self.episode_length, self.config.prediction_horizon
 
@@ -254,6 +255,7 @@ class BatchTargetGenerator:
 
         # Initialize output tensors
         targets = torch.zeros(B, T, H, device=self.device)
+        raw_targets = torch.zeros(B, T, H, device=self.device)  # Track raw (unfiltered) targets
 
         # Simulation time
         t_now = 0.0
@@ -387,6 +389,9 @@ class BatchTargetGenerator:
             lpf.rate_neg_max = original_rate_neg_max
             lpf.jerk_max = original_jerk_max
 
+            # Store raw target (u_target) for all horizon steps (for violent profile mode)
+            raw_target_window = u_target.unsqueeze(-1).expand(-1, H)  # [B, H] - repeat u_target for all H steps
+            
             # Generate raw H-step lookahead by simulating LPF for H steps
             # Use the same stochastic bounds for the entire lookahead window
             y_h = lpf.y.clone()
@@ -439,11 +444,12 @@ class BatchTargetGenerator:
                 )
 
             targets[:, t, :] = feasible_window
+            raw_targets[:, t, :] = raw_target_window  # Store raw targets
 
             # Advance time
             t_now += self.config.dt
 
-        return targets, grades[:, :T]  # Trim grades to episode length
+        return targets, grades[:, :T], raw_targets  # Return filtered targets, grades, and raw targets
 
 
 def generate_batch_targets(

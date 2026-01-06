@@ -96,7 +96,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force re-export ONNX model from checkpoint before evaluation to ensure weight matching.",
     )
+    parser.add_argument(
+        "--step-functions",
+        action="store_true",
+        help="Evaluate over sharp step functions (no filtering) in addition to standard generator profiles.",
+    )
     return parser.parse_args()
+
+
+def generate_step_function(start_speed: float, end_speed: float, length: int, dt: float) -> np.ndarray:
+    """Generate a sharp step function profile with no filtering.
+    
+    Args:
+        start_speed: Initial speed (m/s)
+        end_speed: Target speed after step (m/s)
+        length: Number of timesteps in the profile
+        dt: Timestep duration (seconds)
+    
+    Returns:
+        Array of speed values: [start_speed, end_speed, end_speed, ...]
+    """
+    profile = np.full(length, end_speed, dtype=np.float32)
+    profile[0] = start_speed  # First timestep is start_speed, then jumps to end_speed
+    return profile
 
 
 def run_closed_loop_evaluation(
@@ -115,6 +137,7 @@ def run_closed_loop_evaluation(
     use_cpp_inference: bool = False,
     onnx_model_path: Optional[Path] = None,
     force_export_onnx: bool = False,
+    step_functions: bool = False,
 ) -> dict[str, float]:
     device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy, env_cfg, _ = load_policy_from_checkpoint(checkpoint, device=device)
@@ -122,7 +145,32 @@ def run_closed_loop_evaluation(
     # Check if SysID is enabled
     checkpoint_data = torch.load(checkpoint, map_location=device, weights_only=False)
     meta = checkpoint_data.get("meta", {})
-    sysid_enabled = meta.get("sysid_enabled", False)
+    sysid_enabled_meta = meta.get("sysid_enabled", False)
+    
+    # Auto-detect SysID from model dimensions (more reliable than metadata)
+    # Base observation: 4 (speed, prev_speed, prev_prev_speed, prev_action) + preview_steps
+    preview_steps = max(int(round(env_cfg.preview_horizon_s / env_cfg.dt)), 1)
+    base_obs_dim = 4 + preview_steps
+    
+    # Get obs_dim from policy weights (most reliable) or metadata
+    policy_state = checkpoint_data.get("policy", {})
+    if "net.0.weight" in policy_state:
+        policy_obs_dim_from_weights = int(policy_state["net.0.weight"].shape[1])
+    else:
+        policy_obs_dim_from_weights = None
+    
+    policy_obs_dim = policy_obs_dim_from_weights if policy_obs_dim_from_weights else int(meta.get("obs_dim", base_obs_dim))
+    z_dim_auto = None  # Initialize for scope
+    
+    # If policy expects more dimensions than base, SysID is enabled
+    if policy_obs_dim > base_obs_dim:
+        z_dim_auto = policy_obs_dim - base_obs_dim
+        sysid_enabled = True
+        print(f"[SysID] Auto-detected from model dimensions: obs_dim={policy_obs_dim}, base_obs_dim={base_obs_dim}, z_dim={z_dim_auto}")
+        if not sysid_enabled_meta:
+            print(f"[Warning] Checkpoint metadata says sysid_enabled=false, but model expects {policy_obs_dim}D obs (base={base_obs_dim}D). Using auto-detection.")
+    else:
+        sysid_enabled = sysid_enabled_meta
     
     # Initialize SysID components if enabled
     encoder = None
@@ -139,11 +187,19 @@ def run_closed_loop_evaluation(
         
         config = checkpoint_data.get("config", {})
         sysid_config = config.get("sysid", {})
-        z_dim = int(sysid_config.get("dz", 12))
+        # Use auto-detected z_dim if available, otherwise from config
+        z_dim = z_dim_auto if z_dim_auto is not None else int(sysid_config.get("dz", 12))
         gru_hidden = int(sysid_config.get("gru_hidden", 64))
         
         encoder = ContextEncoder(input_dim=4, hidden_dim=gru_hidden, z_dim=z_dim)
         encoder_norm = RunningNorm(dim=4, eps=1e-6, clip=10.0)
+        
+        # Check if encoder weights exist in checkpoint
+        if "encoder" not in checkpoint_data or "encoder_norm" not in checkpoint_data:
+            raise ValueError(
+                f"SysID is enabled (model expects {policy_obs_dim}D obs), but encoder weights "
+                f"are missing from checkpoint. Checkpoint may have been saved incorrectly."
+            )
         
         encoder.load_state_dict(checkpoint_data["encoder"])
         encoder_norm.load_state_dict(checkpoint_data["encoder_norm"])
@@ -154,7 +210,7 @@ def run_closed_loop_evaluation(
         
         feature_builder = FeatureBuilder(dt=env_cfg.dt)
         
-        print(f"[SysID] Enabled: z_dim={z_dim}, gru_hidden={gru_hidden}")
+        print(f"[SysID] Enabled: z_dim={z_dim}, gru_hidden={gru_hidden}, policy_obs_dim={policy_obs_dim}, base_obs_dim={base_obs_dim}")
 
     # Override environment config if specified
     raw_config = {}
@@ -359,6 +415,11 @@ def run_closed_loop_evaluation(
             
             # Compute z_t if SysID enabled (for Python inference)
             if sysid_enabled:
+                if encoder is None or encoder_norm is None or feature_builder is None:
+                    raise RuntimeError(
+                        f"SysID is enabled but encoder components are not initialized. "
+                        f"obs_dim={len(obs)}, expected={policy_obs_dim}"
+                    )
                 py_encoder_hidden, z_t = compute_z_online(
                     encoder=encoder,
                     feature_builder=feature_builder,
@@ -373,6 +434,11 @@ def run_closed_loop_evaluation(
                 z_latents.append(z_t_np)
                 # Augment observation with z_t
                 obs_aug = np.concatenate([obs, z_t_np])
+                if len(obs_aug) != policy_obs_dim:
+                    raise RuntimeError(
+                        f"Observation dimension mismatch: obs={len(obs)}, z={len(z_t_np)}, "
+                        f"augmented={len(obs_aug)}, expected={policy_obs_dim}"
+                    )
             else:
                 obs_aug = obs
             
@@ -564,6 +630,197 @@ def run_closed_loop_evaluation(
         
         traces.append(trace_data)
 
+    # Step function evaluation (if enabled)
+    step_traces = []
+    if step_functions:
+        start_speeds = [0.0, 5.0, 10.0, 15.0, 20.0]
+        end_speeds = [0.0, 5.0, 10.0, 15.0, 20.0]
+        profile_length = env.config.max_episode_steps
+        
+        print(f"\n[Step Functions] Evaluating {len(start_speeds) * len(end_speeds)} step function combinations...")
+        
+        # Import required modules for validation
+        from generator.adapter import extended_params_to_vehicle_capabilities
+        from generator.feasibility import compute_max_feasible_speed
+        
+        invalid_combinations = []
+        
+        for start_speed in start_speeds:
+            for end_speed in end_speeds:
+                # Generate step function profile
+                step_profile = generate_step_function(start_speed, end_speed, profile_length, env.config.dt)
+                
+                # Reset environment with step function profile
+                obs, _ = env.reset(options={"reference_profile": step_profile, "initial_speed": start_speed})
+                
+                # Validate that vehicle can achieve the target speeds
+                # Convert extended params to vehicle capabilities
+                vehicle_caps = extended_params_to_vehicle_capabilities(env.extended_params, device=torch.device('cpu'))
+                v_max_theoretical = compute_max_feasible_speed(vehicle_caps).item()
+                
+                # Check if speeds exceed maximum feasible speed
+                max_speed_in_profile = max(start_speed, end_speed)
+                if max_speed_in_profile > v_max_theoretical:
+                    invalid_combinations.append({
+                        "start": start_speed,
+                        "end": end_speed,
+                        "max_speed": max_speed_in_profile,
+                        "v_max_theoretical": v_max_theoretical
+                    })
+                    print(f"[Warning] Step function {start_speed:.0f}→{end_speed:.0f} m/s exceeds vehicle max speed "
+                          f"({v_max_theoretical:.2f} m/s). Vehicle cannot achieve this speed.")
+                
+                # Reset SysID encoder state for new episode
+                if sysid_enabled:
+                    py_encoder_hidden = encoder.reset(batch_size=1, device=device).squeeze(0)
+                    cpp_encoder_hidden = encoder.reset(batch_size=1, device=device).squeeze(0)
+                    feature_builder.reset()
+                    prev_speed = start_speed
+                    prev_action = 0.0
+                    prev_prev_action = 0.0
+                    prev_prev_prev_action = 0.0
+                
+                # Reset PID controller
+                pid_controller.reset()
+                
+                # Track episode data
+                done = False
+                errors: list[float] = []
+                actions: list[float] = []
+                rl_actions: list[float] = []
+                pid_actions: list[float] = []
+                cpp_actions: list[float] = []
+                action_diffs: list[float] = []
+                accelerations: list[float] = []
+                jerks: list[float] = []
+                speeds: list[float] = []
+                references: list[float] = []
+                time_axis: list[float] = []
+                z_latents: list[np.ndarray] = []
+                step_idx = 0
+                
+                while not done:
+                    current_speed = float(obs[0])
+                    reference_speed = float(obs[4])
+                    
+                    # Compute z_t if SysID enabled
+                    if sysid_enabled:
+                        py_encoder_hidden, z_t = compute_z_online(
+                            encoder=encoder,
+                            feature_builder=feature_builder,
+                            encoder_norm=encoder_norm,
+                            h_prev=py_encoder_hidden,
+                            v_t=current_speed,
+                            u_t=prev_action,
+                            device=device
+                        )
+                        z_t_np = z_t.cpu().numpy()
+                        z_latents.append(z_t_np)
+                        obs_aug = np.concatenate([obs, z_t_np])
+                    else:
+                        obs_aug = obs
+                    
+                    obs_tensor = torch.as_tensor(obs_aug, dtype=torch.float32, device=device).unsqueeze(0)
+                    plan, stats = select_action(policy, obs_tensor, deterministic=True)
+                    rl_action = float(plan[0])
+                    
+                    # C++ inference if enabled
+                    if cpp_policy is not None:
+                        try:
+                            if sysid_enabled and hasattr(cpp_policy, 'is_sysid_model') and cpp_policy.is_sysid_model:
+                                cpp_plan, cpp_hidden_new = cpp_policy.infer_sysid(
+                                    base_obs=obs,
+                                    speed=current_speed,
+                                    prev_action=prev_prev_action,
+                                    prev_speed=prev_speed,
+                                    prev_prev_action=prev_prev_prev_action,
+                                    hidden_state=cpp_encoder_hidden.cpu().numpy()
+                                )
+                                cpp_encoder_hidden = torch.from_numpy(cpp_hidden_new).to(device)
+                            else:
+                                obs_array = np.array(obs_aug, dtype=np.float32)
+                                cpp_plan = cpp_policy.infer(obs_array)
+                            cpp_action = float(cpp_plan[0])
+                            action_diff = abs(rl_action - cpp_action)
+                            cpp_actions.append(cpp_action)
+                            action_diffs.append(action_diff)
+                        except Exception as e:
+                            cpp_actions.append(float('nan'))
+                            action_diffs.append(float('nan'))
+                    
+                    # PID action
+                    speed_error = reference_speed - current_speed
+                    pid_action = pid_controller.compute(speed_error, env.config.dt)
+                    
+                    # Final action
+                    final_action = np.clip(rl_action + pid_action, -1.0, 1.0)
+                    
+                    rl_actions.append(rl_action)
+                    pid_actions.append(pid_action)
+                    
+                    # Step environment
+                    obs, reward, terminated, truncated, info = env.step(final_action)
+                    
+                    # Update SysID history
+                    if sysid_enabled:
+                        prev_prev_prev_action = prev_prev_action
+                        prev_prev_action = prev_action
+                        prev_action = rl_action
+                        prev_speed = current_speed
+                    
+                    if pid_feedback_rl_only:
+                        env._prev_action = rl_action
+                    
+                    errors.append(abs(info.get("speed_error", 0.0)))
+                    actions.append(final_action)
+                    accelerations.append(float(info.get("acceleration", 0.0)))
+                    jerks.append(float(info.get("jerk", 0.0)))
+                    speeds.append(float(info.get("speed", 0.0)))
+                    references.append(float(info.get("reference_speed", 0.0)))
+                    time_axis.append(step_idx * env.config.dt)
+                    done = terminated or truncated
+                    step_idx += 1
+                
+                # Create trace data for this step function
+                step_episode_id = f"step_{start_speed:.0f}_to_{end_speed:.0f}"
+                step_trace = {
+                    "sequence_id": step_episode_id,
+                    "start_speed": start_speed,
+                    "end_speed": end_speed,
+                    "v_max_theoretical": v_max_theoretical,
+                    "is_feasible": max_speed_in_profile <= v_max_theoretical,
+                    "time": time_axis,
+                    "speed": speeds,
+                    "reference": references,
+                    "acceleration": accelerations,
+                    "action": actions,
+                    "rl_action": rl_actions,
+                    "pid_action": pid_actions,
+                    "jerk": jerks,
+                }
+                
+                if sysid_enabled and len(z_latents) > 0:
+                    step_trace["z_latents"] = np.array(z_latents)
+                
+                if cpp_policy is not None:
+                    step_trace["cpp_action"] = cpp_actions
+                    step_trace["action_diff"] = action_diffs
+                
+                step_traces.append(step_trace)
+        
+        # Print summary of validation results
+        if invalid_combinations:
+            print(f"\n[Step Functions] Validation Summary:")
+            print(f"  Total combinations evaluated: {len(start_speeds) * len(end_speeds)}")
+            print(f"  Invalid combinations (exceed max speed): {len(invalid_combinations)}")
+            print(f"  Valid combinations: {len(start_speeds) * len(end_speeds) - len(invalid_combinations)}")
+            if len(invalid_combinations) > 0:
+                print(f"\n  Invalid combinations:")
+                for inv in invalid_combinations:
+                    print(f"    {inv['start']:.0f}→{inv['end']:.0f} m/s (max feasible: {inv['v_max_theoretical']:.2f} m/s)")
+        else:
+            print(f"\n[Step Functions] All {len(start_speeds) * len(end_speeds)} combinations are feasible for the sampled vehicle.")
+
     summary = {
         "episodes": episodes,
         "reward_mean": float(np.mean(episode_rewards)),
@@ -668,6 +925,13 @@ def run_closed_loop_evaluation(
             z_analysis_path = plot_dir / "z_latent_analysis.png"
             print("Creating z latent analysis...")
             plot_z_latent_analysis(traces, vehicle_params_log, z_analysis_path)
+        
+        # Plot step function results if available
+        if step_functions and len(step_traces) > 0:
+            from evaluation.plotting import plot_step_function_results
+            step_function_plot_path = plot_dir / "step_function_results.png"
+            print("Creating step function results plot...")
+            plot_step_function_results(step_traces, step_function_plot_path)
 
         # Save vehicle parameters to a text file
         vehicle_params_file = plot_dir / "vehicle_parameters.txt"
@@ -709,6 +973,7 @@ def main() -> None:
         use_cpp_inference=args.use_cpp_inference,
         onnx_model_path=args.onnx_model,
         force_export_onnx=args.force_export_onnx,
+        step_functions=args.step_functions,
     )
     print(json.dumps(summary, indent=2))
 
