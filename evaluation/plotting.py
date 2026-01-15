@@ -780,8 +780,9 @@ def plot_step_function_results(step_traces: list[dict], output_path: Path) -> No
                     Each trace should have 'start_speed', 'end_speed', 'time', 'speed', 'reference', 'action'
         output_path: Path to save the figure
     """
-    start_speeds = [0.0, 5.0, 10.0, 15.0, 20.0]
-    end_speeds = [0.0, 5.0, 10.0, 15.0, 20.0]
+    # Extract unique speed values from traces (dynamically determine from data)
+    start_speeds = sorted(set(trace.get('start_speed', 0.0) for trace in step_traces))
+    end_speeds = sorted(set(trace.get('end_speed', 0.0) for trace in step_traces))
     
     # Create a dictionary for quick lookup: (start_speed, end_speed) -> trace
     trace_dict = {}
@@ -791,8 +792,12 @@ def plot_step_function_results(step_traces: list[dict], output_path: Path) -> No
         if start is not None and end is not None:
             trace_dict[(start, end)] = trace
     
-    # Create figure with 10x5 subplots (alternating speed and actuation rows)
-    fig, axes = plt.subplots(10, 5, figsize=(20, 40), sharex='col')
+    # Create figure with dynamic subplot grid (alternating speed and actuation rows)
+    num_start_speeds = len(start_speeds)
+    num_end_speeds = len(end_speeds)
+    num_rows = num_start_speeds * 2  # Each start speed gets 2 rows (speed + actuation)
+    num_cols = num_end_speeds
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 4 * num_start_speeds), sharex='col')
     
     # Iterate over all combinations
     for i, start_speed in enumerate(start_speeds):
@@ -816,25 +821,16 @@ def plot_step_function_results(step_traces: list[dict], output_path: Path) -> No
                 # Plot actual speed as solid line
                 ax_speed.plot(time, speed, label="Speed", color="#1f77b4", linewidth=1.5)
                 
-                # Add max feasible speed line if available
-                if v_max_theoretical is not None:
-                    ax_speed.axhline(
-                        y=v_max_theoretical,
-                        color="#d62728",
-                        linestyle=":",
-                        linewidth=1,
-                        alpha=0.7,
-                        label=f"Max feasible ({v_max_theoretical:.1f} m/s)"
-                    )
+                # Max feasible speed line removed per user request
                 
-                # Set title with feasibility indicator
-                title = f"Start: {start_speed:.0f} m/s → End: {end_speed:.0f} m/s"
+                # Set title with feasibility indicator (show 2 decimal places for precision)
+                title = f"Start: {start_speed:.2f} m/s → End: {end_speed:.2f} m/s"
                 if not is_feasible:
                     title += " [INFEASIBLE]"
                 ax_speed.set_title(title, fontsize=10, color="#d62728" if not is_feasible else "black")
                 
                 # Set labels only on edges
-                if i == 4:  # Last speed row
+                if i == num_start_speeds - 1:  # Last speed row
                     # X-label will be on actuation plot below
                     pass
                 if j == 0:  # Left column
@@ -852,7 +848,7 @@ def plot_step_function_results(step_traces: list[dict], output_path: Path) -> No
                     ax_action.set_ylim(-1.1, 1.1)
                     
                     # Set labels only on edges
-                    if i == 4:  # Bottom row of actuation plots
+                    if i == num_start_speeds - 1:  # Bottom row of actuation plots
                         ax_action.set_xlabel("Time (s)", fontsize=9)
                     if j == 0:  # Left column
                         ax_action.set_ylabel("Action", fontsize=9)
@@ -862,7 +858,7 @@ def plot_step_function_results(step_traces: list[dict], output_path: Path) -> No
                 else:
                     ax_action.text(0.5, 0.5, "No action data", ha="center", va="center", transform=ax_action.transAxes)
                     ax_action.set_ylim(-1.1, 1.1)
-                    if i == 4:
+                    if i == num_start_speeds - 1:
                         ax_action.set_xlabel("Time (s)", fontsize=9)
                     if j == 0:
                         ax_action.set_ylabel("Action", fontsize=9)
@@ -897,6 +893,97 @@ def plot_step_function_results(step_traces: list[dict], output_path: Path) -> No
     print(f"Step function results plot saved to {output_path}")
 
 
-__all__ = ["plot_sequence_diagnostics", "plot_summary", "plot_feasibility_diagnostics", "plot_profile_statistics", "plot_z_latent_analysis", "plot_step_function_results"]
+def plot_initial_error_analysis(initial_error_traces: list[dict], output_path: Path) -> None:
+    """Plot throttle/brake response to different initial speed errors.
+    
+    Creates a figure with 3 subplots:
+    - Speed tracking: Reference and actual speeds for each initial error
+    - Throttle commands: Positive actions (throttle) for each initial error
+    - Brake commands: Negative actions (brake) for each initial error
+    
+    Args:
+        initial_error_traces: List of trace dictionaries from initial error evaluations.
+                            Each trace should have 'initial_error', 'time', 'speed', 'reference', 'rl_action'
+        output_path: Path to save the figure
+    """
+    if len(initial_error_traces) == 0:
+        print("[Warning] No initial error traces to plot.")
+        return
+    
+    # Sort traces by initial error for consistent coloring
+    initial_error_traces = sorted(initial_error_traces, key=lambda x: x.get("initial_error", 0.0))
+    
+    # Create figure with 3 subplots
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    ax_speed, ax_throttle, ax_brake = axes
+    
+    # Use colormap for different initial errors
+    colors = plt.cm.RdYlGn(np.linspace(0.2, 0.8, len(initial_error_traces)))  # Red-Yellow-Green colormap
+    
+    # Plot each trace
+    for i, trace in enumerate(initial_error_traces):
+        initial_error = trace.get("initial_error", 0.0)
+        time = _to_numpy(trace.get("time", []))
+        speed = _to_numpy(trace.get("speed", []))
+        reference = _to_numpy(trace.get("reference", []))
+        rl_action = _to_numpy(trace.get("rl_action", []))
+        
+        if len(time) == 0 or len(speed) == 0:
+            continue
+        
+        # Extract throttle (positive) and brake (negative) from actions
+        throttle = np.maximum(rl_action, 0.0)  # Positive actions only
+        brake = np.maximum(-rl_action, 0.0)   # Negative actions only (as positive values)
+        
+        # Label for legend
+        label = f"Error: {initial_error:+.1f} m/s"
+        
+        # Speed tracking subplot
+        if i == 0:
+            # Plot reference only once (it's the same for all)
+            ax_speed.plot(time, reference, 'k--', label='Reference', linewidth=2, alpha=0.7)
+        ax_speed.plot(time, speed, color=colors[i], label=label, linewidth=1.5, alpha=0.8)
+        
+        # Throttle commands subplot
+        ax_throttle.plot(time, throttle, color=colors[i], label=label, linewidth=1.5, alpha=0.8)
+        
+        # Brake commands subplot
+        ax_brake.plot(time, brake, color=colors[i], label=label, linewidth=1.5, alpha=0.8)
+    
+    # Configure speed subplot
+    ax_speed.set_ylabel("Speed (m/s)", fontsize=12)
+    ax_speed.set_title("Speed Tracking for Different Initial Errors", fontsize=13, fontweight='bold')
+    ax_speed.grid(alpha=0.3)
+    ax_speed.legend(loc='upper right', fontsize=9, ncol=2)
+    
+    # Configure throttle subplot
+    ax_throttle.set_ylabel("Throttle Command", fontsize=12)
+    ax_throttle.set_title("Throttle Response to Initial Errors", fontsize=13, fontweight='bold')
+    ax_throttle.set_ylim(-0.05, 1.05)
+    ax_throttle.grid(alpha=0.3)
+    ax_throttle.legend(loc='upper right', fontsize=9, ncol=2)
+    
+    # Configure brake subplot
+    ax_brake.set_ylabel("Brake Command", fontsize=12)
+    ax_brake.set_xlabel("Time (s)", fontsize=12)
+    ax_brake.set_title("Brake Response to Initial Errors", fontsize=13, fontweight='bold')
+    ax_brake.set_ylim(-0.05, 1.05)
+    ax_brake.grid(alpha=0.3)
+    ax_brake.legend(loc='upper right', fontsize=9, ncol=2)
+    
+    # Add overall title
+    target_speed = initial_error_traces[0].get("target_speed", 10.0)
+    fig.suptitle(f"RL Controller Response to Initial Speed Errors (Target: {target_speed:.1f} m/s)", 
+                 fontsize=14, fontweight='bold', y=0.995)
+    
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    _ensure_parent(output_path)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    
+    print(f"Initial error analysis plot saved to {output_path}")
+
+
+__all__ = ["plot_sequence_diagnostics", "plot_summary", "plot_feasibility_diagnostics", "plot_profile_statistics", "plot_z_latent_analysis", "plot_step_function_results", "plot_initial_error_analysis"]
 
 

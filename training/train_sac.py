@@ -44,6 +44,10 @@ class TrainingParams:
     target_entropy_scale: float = 1.0
     action_horizon_steps: int = 1
     reward_scale: float = 1.0  # Scale rewards to prevent exploding Q-values
+    # Animation options
+    enable_animation: bool = False  # Enable online animation during training
+    animation_interval: int = 5_000  # Steps between animation updates (default: same as eval_interval)
+    num_animation_episodes: int = 3  # Number of example episodes to show (each with different initial speed error)
 
 
 @dataclass(slots=True)
@@ -1323,7 +1327,7 @@ def train(config: ConfigBundle) -> None:
                 plt.ion()  # Turn on interactive mode
             
             # Generate a sample profile using the environment's generator
-            profile_length = 200
+            profile_length = 800  # 4x longer for better visualization
             filtered_profile, grade_profile, raw_profile = env._generate_reference(profile_length)
             
             # Apply reward filter to raw profile (as done in reset)
@@ -1416,6 +1420,90 @@ def train(config: ConfigBundle) -> None:
             accelerator.print(traceback.format_exc())
 
     trainer = SACTrainer(env, eval_env, config, accelerator)
+
+    # Initialize animation if enabled
+    animation_history = []
+    fixed_reference_for_animation = None
+    if config.training.enable_animation:
+        from training.training_animation import load_animation_history, create_training_animation
+        animation_output_dir = config.output.dir / "animations"
+        
+        # Check if checkpoint folder exists (indicates previous training run)
+        checkpoint_dir_exists = False
+        if config.output.dir.exists():
+            # Check for checkpoint files (e.g., sac_step_*.pt)
+            checkpoint_files = list(config.output.dir.glob("sac_step_*.pt")) + list(config.output.dir.glob("checkpoint_*.pt"))
+            checkpoint_dir_exists = len(checkpoint_files) > 0
+        
+        if checkpoint_dir_exists:
+            # Start with clean animation history if checkpoint folder exists
+            accelerator.print("[animation] Checkpoint folder detected - starting with clean animation history")
+            animation_history = []
+        else:
+            # Load history only if no checkpoint folder exists (fresh start)
+            animation_history = load_animation_history(animation_output_dir)
+        
+        # Generate a fixed reference profile for consistent evaluation
+        # Create a deterministic profile that covers full speed range with acceleration and deceleration
+        accelerator.print("[animation] Generating fixed reference profile for animation...")
+        profile_length = config.env.max_episode_steps
+        max_speed = config.env.max_speed
+        dt = config.env.dt
+        
+        # Create a profile: start low -> accelerate to max -> decelerate to low
+        # Split into 3 segments: acceleration (1/3), constant max (1/6), deceleration (1/2)
+        accel_steps = profile_length // 3
+        constant_steps = profile_length // 6
+        decel_steps = profile_length - accel_steps - constant_steps
+        
+        v_start = 2.0  # Start at low speed (m/s)
+        v_max = max_speed * 0.9  # Use 90% of max speed to ensure feasibility
+        v_end = 3.0  # End at low speed (m/s)
+        
+        # Generate acceleration segment (linear ramp)
+        accel_profile = np.linspace(v_start, v_max, accel_steps, dtype=np.float32)
+        
+        # Constant speed segment
+        constant_profile = np.full(constant_steps, v_max, dtype=np.float32)
+        
+        # Deceleration segment (linear ramp)
+        decel_profile = np.linspace(v_max, v_end, decel_steps, dtype=np.float32)
+        
+        # Combine segments
+        fixed_reference_for_animation = np.concatenate([accel_profile, constant_profile, decel_profile])
+        
+        # Ensure length matches exactly
+        if len(fixed_reference_for_animation) > profile_length:
+            fixed_reference_for_animation = fixed_reference_for_animation[:profile_length]
+        elif len(fixed_reference_for_animation) < profile_length:
+            # Pad with final value
+            padding = np.full(profile_length - len(fixed_reference_for_animation), 
+                            fixed_reference_for_animation[-1], dtype=np.float32)
+            fixed_reference_for_animation = np.concatenate([fixed_reference_for_animation, padding])
+        
+        # Note: grade_profile will be automatically set to zeros by the environment when using custom reference_profile
+        
+        reference_initial_speed = float(fixed_reference_for_animation[0])
+        reference_max_speed = float(np.max(fixed_reference_for_animation))
+        reference_min_speed = float(np.min(fixed_reference_for_animation))
+        accelerator.print(f"[animation] Fixed reference profile generated: length={len(fixed_reference_for_animation)}")
+        accelerator.print(f"[animation] Speed range: {reference_min_speed:.2f} - {reference_max_speed:.2f} m/s")
+        accelerator.print(f"[animation] Reference initial speed: {reference_initial_speed:.2f} m/s")
+        
+        # Generate initial speed errors for episodes (configurable via training.num_animation_episodes)
+        num_animation_episodes = getattr(config.training, 'num_animation_episodes', 3)
+        if num_animation_episodes == 1:
+            initial_speed_errors_for_animation = [0.5]
+        elif num_animation_episodes == 2:
+            initial_speed_errors_for_animation = [0.5, 2.5]
+        elif num_animation_episodes == 3:
+            initial_speed_errors_for_animation = [0.5, 1.5, 3.0]
+        else:
+            # For more episodes, distribute evenly from small to large
+            min_error = 0.3
+            max_error = 3.5
+            initial_speed_errors_for_animation = np.linspace(min_error, max_error, num_animation_episodes).tolist()
+        accelerator.print(f"[animation] Initial speed errors: {initial_speed_errors_for_animation}")
 
     # Load checkpoint if specified
     start_step = 0
@@ -1518,6 +1606,27 @@ def train(config: ConfigBundle) -> None:
             eval_metrics = trainer.evaluate()
             accelerator.log(eval_metrics, step=step)
             accelerator.print(f"[eval] step={step} metrics={json.dumps(eval_metrics)}")
+            
+            # Create animation if enabled
+            if config.training.enable_animation and fixed_reference_for_animation is not None:
+                if step % config.training.animation_interval == 0:
+                    accelerator.print(f"[animation] Updating animation at step {step}...")
+                    num_animation_episodes = getattr(config.training, 'num_animation_episodes', 3)
+                    animation_path = create_training_animation(
+                        trainer=trainer,
+                        eval_env=eval_env,
+                        fixed_reference=fixed_reference_for_animation,
+                        output_dir=config.output.dir / "animations",
+                        step=step,
+                        animation_history=animation_history,
+                        max_history=50,
+                        initial_speed_errors=initial_speed_errors_for_animation,
+                        num_episodes=num_animation_episodes
+                    )
+                    if animation_path:
+                        accelerator.print(f"[animation] Animation saved to {animation_path}")
+                    else:
+                        accelerator.print(f"[animation] Animation displayed (interactive mode)")
 
         if step % config.training.checkpoint_interval == 0:
             trainer.save_checkpoint(step)

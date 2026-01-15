@@ -148,9 +148,14 @@ def run_closed_loop_evaluation(
     sysid_enabled_meta = meta.get("sysid_enabled", False)
     
     # Auto-detect SysID from model dimensions (more reliable than metadata)
-    # Base observation: 4 (speed, prev_speed, prev_prev_speed, prev_action) + preview_steps
+    # Base observation: 6 (speed, prev_speed, prev_prev_speed, prev_action, speed_error, grade) + preview_steps
+    # Note: Older checkpoints may have been trained with:
+    #   - 4 base features (without speed_error and grade)
+    #   - 5 base features (with speed_error but without grade)
     preview_steps = max(int(round(env_cfg.preview_horizon_s / env_cfg.dt)), 1)
-    base_obs_dim = 4 + preview_steps
+    base_obs_dim_current = 6 + preview_steps  # Current environment (with speed_error and grade)
+    base_obs_dim_without_grade = 5 + preview_steps  # Checkpoints with speed_error but without grade
+    base_obs_dim_without_error = 4 + preview_steps  # Older checkpoints (without speed_error and grade)
     
     # Get obs_dim from policy weights (most reliable) or metadata
     policy_state = checkpoint_data.get("policy", {})
@@ -159,18 +164,58 @@ def run_closed_loop_evaluation(
     else:
         policy_obs_dim_from_weights = None
     
-    policy_obs_dim = policy_obs_dim_from_weights if policy_obs_dim_from_weights else int(meta.get("obs_dim", base_obs_dim))
+    policy_obs_dim = policy_obs_dim_from_weights if policy_obs_dim_from_weights else int(meta.get("obs_dim", base_obs_dim_current))
     z_dim_auto = None  # Initialize for scope
     
     # If policy expects more dimensions than base, SysID is enabled
-    if policy_obs_dim > base_obs_dim:
-        z_dim_auto = policy_obs_dim - base_obs_dim
+    if policy_obs_dim > base_obs_dim_current:
+        # Policy has more dims than current base -> SysID enabled (with speed_error)
+        z_dim_auto = policy_obs_dim - base_obs_dim_current
         sysid_enabled = True
-        print(f"[SysID] Auto-detected from model dimensions: obs_dim={policy_obs_dim}, base_obs_dim={base_obs_dim}, z_dim={z_dim_auto}")
+        print(f"[SysID] Auto-detected from model dimensions: obs_dim={policy_obs_dim}, base_obs_dim={base_obs_dim_current}, z_dim={z_dim_auto}")
         if not sysid_enabled_meta:
-            print(f"[Warning] Checkpoint metadata says sysid_enabled=false, but model expects {policy_obs_dim}D obs (base={base_obs_dim}D). Using auto-detection.")
+            print(f"[Warning] Checkpoint metadata says sysid_enabled=false, but model expects {policy_obs_dim}D obs (base={base_obs_dim_current}D). Using auto-detection.")
+    elif policy_obs_dim == base_obs_dim_current:
+        # Policy matches current base exactly -> No SysID (with speed_error and grade)
+        z_dim_auto = 0
+        sysid_enabled = False
+        print(f"[SysID] Auto-detected: obs_dim={policy_obs_dim} matches base_obs_dim={base_obs_dim_current} -> No SysID")
+        if sysid_enabled_meta:
+            print(f"[Warning] Checkpoint metadata says sysid_enabled=true, but model expects {policy_obs_dim}D obs (matches base). Using auto-detection.")
+    elif policy_obs_dim == base_obs_dim_without_grade:
+        # Policy matches format without grade -> No SysID (with speed_error but without grade)
+        z_dim_auto = 0
+        sysid_enabled = False
+        base_obs_dim_checkpoint = base_obs_dim_without_grade
+        print(f"[SysID] Auto-detected: obs_dim={policy_obs_dim} matches base_obs_dim_without_grade={base_obs_dim_without_grade} -> No SysID (checkpoint trained without grade)")
+    elif policy_obs_dim > base_obs_dim_without_error:
+        # Policy has more dims than old base (without speed_error) -> Could be SysID or intermediate format
+        # Check if it matches exactly the old base + speed_error (no SysID, no grade)
+        if policy_obs_dim == base_obs_dim_without_error + 1:
+            # This is just speed_error, not SysID
+            z_dim_auto = 0
+            sysid_enabled = False
+            base_obs_dim_checkpoint = base_obs_dim_without_error
+            print(f"[SysID] Auto-detected: obs_dim={policy_obs_dim} = base_obs_dim_without_error+1 -> No SysID (just speed_error added, no grade)")
+        elif policy_obs_dim == base_obs_dim_without_error + 2:
+            # This is speed_error + grade, no SysID
+            z_dim_auto = 0
+            sysid_enabled = False
+            base_obs_dim_checkpoint = base_obs_dim_without_error
+            print(f"[SysID] Auto-detected: obs_dim={policy_obs_dim} = base_obs_dim_without_error+2 -> No SysID (speed_error + grade added)")
+        else:
+            # This is SysID (with or without speed_error/grade)
+            z_dim_auto = policy_obs_dim - base_obs_dim_without_error
+            base_obs_dim_checkpoint = base_obs_dim_without_error
+            sysid_enabled = True
+            print(f"[SysID] Auto-detected from model dimensions: obs_dim={policy_obs_dim}, base_obs_dim={base_obs_dim_without_error} (without speed_error), z_dim={z_dim_auto}")
+            if not sysid_enabled_meta:
+                print(f"[Warning] Checkpoint metadata says sysid_enabled=false, but model expects {policy_obs_dim}D obs (base={base_obs_dim_without_error}D). Using auto-detection.")
     else:
+        # Policy matches old base exactly -> No SysID (without speed_error and grade)
+        z_dim_auto = 0
         sysid_enabled = sysid_enabled_meta
+        print(f"[SysID] Auto-detected: obs_dim={policy_obs_dim} matches base_obs_dim_without_error={base_obs_dim_without_error} -> No SysID")
     
     # Initialize SysID components if enabled
     encoder = None
@@ -187,8 +232,40 @@ def run_closed_loop_evaluation(
         
         config = checkpoint_data.get("config", {})
         sysid_config = config.get("sysid", {})
-        # Use auto-detected z_dim if available, otherwise from config
-        z_dim = z_dim_auto if z_dim_auto is not None else int(sysid_config.get("dz", 12))
+        
+        # Determine z_dim: check encoder weights first (most reliable), then auto-detection, then config
+        z_dim = None
+        if "encoder" in checkpoint_data:
+            # Extract z_dim from encoder weights (handles cases where base_obs_dim changed)
+            encoder_state = checkpoint_data["encoder"]
+            if "z_proj.weight" in encoder_state:
+                z_dim_from_checkpoint = int(encoder_state["z_proj.weight"].shape[0])
+                z_dim = z_dim_from_checkpoint
+                print(f"[SysID] Using z_dim={z_dim} from checkpoint encoder weights")
+                
+                # Determine actual base_obs_dim from checkpoint: policy_obs_dim - z_dim
+                # Always recalculate when we have encoder weights (most reliable source)
+                base_obs_dim_checkpoint = policy_obs_dim - z_dim
+                if base_obs_dim_checkpoint == base_obs_dim_without_error:
+                    print(f"[SysID] Checkpoint was trained with base_obs_dim={base_obs_dim_checkpoint} (without speed_error and grade)")
+                elif base_obs_dim_checkpoint == base_obs_dim_without_grade:
+                    print(f"[SysID] Checkpoint was trained with base_obs_dim={base_obs_dim_checkpoint} (with speed_error but without grade)")
+                elif base_obs_dim_checkpoint == base_obs_dim_current:
+                    print(f"[SysID] Checkpoint was trained with base_obs_dim={base_obs_dim_checkpoint} (with speed_error and grade)")
+                else:
+                    print(f"[SysID] Checkpoint was trained with base_obs_dim={base_obs_dim_checkpoint} (unexpected format)")
+        
+        if z_dim is None:
+            # Fall back to auto-detection or config
+            z_dim = z_dim_auto if z_dim_auto is not None else int(sysid_config.get("dz", 12))
+            if z_dim_auto is not None:
+                print(f"[SysID] Using auto-detected z_dim={z_dim} (no encoder weights found)")
+            else:
+                print(f"[SysID] Using z_dim={z_dim} from config")
+            # If we don't have base_obs_dim_checkpoint yet, infer it
+            if base_obs_dim_checkpoint is None:
+                base_obs_dim_checkpoint = policy_obs_dim - z_dim
+        
         gru_hidden = int(sysid_config.get("gru_hidden", 64))
         
         encoder = ContextEncoder(input_dim=4, hidden_dim=gru_hidden, z_dim=z_dim)
@@ -210,7 +287,7 @@ def run_closed_loop_evaluation(
         
         feature_builder = FeatureBuilder(dt=env_cfg.dt)
         
-        print(f"[SysID] Enabled: z_dim={z_dim}, gru_hidden={gru_hidden}, policy_obs_dim={policy_obs_dim}, base_obs_dim={base_obs_dim}")
+        print(f"[SysID] Enabled: z_dim={z_dim}, gru_hidden={gru_hidden}, policy_obs_dim={policy_obs_dim}, base_obs_dim_checkpoint={base_obs_dim_checkpoint}")
 
     # Override environment config if specified
     raw_config = {}
@@ -432,12 +509,26 @@ def run_closed_loop_evaluation(
                 z_t_np = z_t.cpu().numpy()
                 # Store z for analysis
                 z_latents.append(z_t_np)
+                
+                # Adjust observation to match checkpoint's expected base_obs_dim
+                # Current observation: [speed, prev_speed, prev_prev_speed, prev_action, speed_error, grade, ...preview]
+                obs_adjusted = obs.copy()
+                if base_obs_dim_checkpoint is not None and len(obs) == base_obs_dim_current:
+                    if base_obs_dim_checkpoint == base_obs_dim_without_error:
+                        # Remove speed_error (index 4) and grade (index 5)
+                        # Keep: [speed, prev_speed, prev_prev_speed, prev_action, ...preview]
+                        obs_adjusted = np.concatenate([obs[:4], obs[6:]])  # Skip speed_error and grade
+                    elif base_obs_dim_checkpoint == base_obs_dim_without_grade:
+                        # Remove grade (index 5) only
+                        # Keep: [speed, prev_speed, prev_prev_speed, prev_action, speed_error, ...preview]
+                        obs_adjusted = np.concatenate([obs[:5], obs[6:]])  # Skip grade at index 5
+                
                 # Augment observation with z_t
-                obs_aug = np.concatenate([obs, z_t_np])
+                obs_aug = np.concatenate([obs_adjusted, z_t_np])
                 if len(obs_aug) != policy_obs_dim:
                     raise RuntimeError(
-                        f"Observation dimension mismatch: obs={len(obs)}, z={len(z_t_np)}, "
-                        f"augmented={len(obs_aug)}, expected={policy_obs_dim}"
+                        f"Observation dimension mismatch: obs={len(obs)}, obs_adjusted={len(obs_adjusted)}, z={len(z_t_np)}, "
+                        f"augmented={len(obs_aug)}, expected={policy_obs_dim}, base_obs_dim_checkpoint={base_obs_dim_checkpoint}"
                     )
             else:
                 obs_aug = obs
@@ -633,8 +724,9 @@ def run_closed_loop_evaluation(
     # Step function evaluation (if enabled)
     step_traces = []
     if step_functions:
-        start_speeds = [0.0, 5.0, 10.0, 15.0, 20.0]
-        end_speeds = [0.0, 5.0, 10.0, 15.0, 20.0]
+        # Use small speed values between 0 and 2 m/s with 10 evenly spaced values
+        start_speeds = np.linspace(0.0, 2.0, 10).tolist()
+        end_speeds = np.linspace(0.0, 2.0, 10).tolist()
         profile_length = env.config.max_episode_steps
         
         print(f"\n[Step Functions] Evaluating {len(start_speeds) * len(end_speeds)} step function combinations...")
@@ -652,6 +744,15 @@ def run_closed_loop_evaluation(
                 
                 # Reset environment with step function profile
                 obs, _ = env.reset(options={"reference_profile": step_profile, "initial_speed": start_speed})
+                
+                # Ensure previous action is 0 and previous speeds are set to initial speed for step function evaluation
+                # (Override any randomization that might have been applied)
+                env._prev_action = 0.0
+                env.prev_speed = start_speed
+                env._prev_prev_speed = start_speed
+                
+                # Rebuild observation with correct values
+                obs = env._build_observation()
                 
                 # Validate that vehicle can achieve the target speeds
                 # Convert extended params to vehicle capabilities
@@ -716,7 +817,24 @@ def run_closed_loop_evaluation(
                         )
                         z_t_np = z_t.cpu().numpy()
                         z_latents.append(z_t_np)
-                        obs_aug = np.concatenate([obs, z_t_np])
+                        
+                        # Adjust observation to match checkpoint's expected base_obs_dim
+                        # Current observation: [speed, prev_speed, prev_prev_speed, prev_action, speed_error, grade, ...preview]
+                        obs_adjusted = obs.copy()
+                        if base_obs_dim_checkpoint is not None and len(obs) == base_obs_dim_current:
+                            if base_obs_dim_checkpoint == base_obs_dim_without_error:
+                                # Remove speed_error (index 4) and grade (index 5)
+                                obs_adjusted = np.concatenate([obs[:4], obs[6:]])  # Skip speed_error and grade
+                            elif base_obs_dim_checkpoint == base_obs_dim_without_grade:
+                                # Remove grade (index 5) only
+                                obs_adjusted = np.concatenate([obs[:5], obs[6:]])  # Skip grade
+                        
+                        obs_aug = np.concatenate([obs_adjusted, z_t_np])
+                        if len(obs_aug) != policy_obs_dim:
+                            raise RuntimeError(
+                                f"Observation dimension mismatch: obs={len(obs)}, obs_adjusted={len(obs_adjusted)}, z={len(z_t_np)}, "
+                                f"augmented={len(obs_aug)}, expected={policy_obs_dim}, base_obs_dim_checkpoint={base_obs_dim_checkpoint}"
+                            )
                     else:
                         obs_aug = obs
                     
@@ -932,6 +1050,127 @@ def run_closed_loop_evaluation(
             step_function_plot_path = plot_dir / "step_function_results.png"
             print("Creating step function results plot...")
             plot_step_function_results(step_traces, step_function_plot_path)
+        
+        # Initial error step function analysis (if step_functions enabled)
+        initial_error_traces = []
+        if step_functions:
+            print("\n[Initial Error Analysis] Evaluating throttle/brake response to different initial speed errors...")
+            target_speed = 10.0  # Fixed target speed
+            initial_errors = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]  # m/s error
+            initial_speeds = [target_speed + err for err in initial_errors]
+            profile_length = min(env.config.max_episode_steps, int(10.0 / env.config.dt))  # 10 seconds
+            
+            for initial_speed, initial_error in zip(initial_speeds, initial_errors):
+                # Generate step function profile (constant target speed)
+                step_profile = generate_step_function(initial_speed, target_speed, profile_length, env.config.dt)
+                
+                # Reset environment
+                obs, _ = env.reset(options={"reference_profile": step_profile, "initial_speed": initial_speed})
+                
+                # Reset SysID encoder state
+                if sysid_enabled:
+                    py_encoder_hidden = encoder.reset(batch_size=1, device=device).squeeze(0)
+                    feature_builder.reset()
+                    prev_speed = initial_speed
+                    prev_action = 0.0
+                    prev_prev_action = 0.0
+                    prev_prev_prev_action = 0.0
+                
+                # Reset PID controller
+                pid_controller.reset()
+                
+                # Track episode data
+                done = False
+                actions: list[float] = []
+                rl_actions: list[float] = []
+                speeds: list[float] = []
+                references: list[float] = []
+                time_axis: list[float] = []
+                step_idx = 0
+                
+                while not done and step_idx < profile_length:
+                    current_speed = float(obs[0])
+                    reference_speed = float(obs[4])
+                    
+                    # Compute z_t if SysID enabled
+                    if sysid_enabled:
+                        py_encoder_hidden, z_t = compute_z_online(
+                            encoder=encoder,
+                            feature_builder=feature_builder,
+                            encoder_norm=encoder_norm,
+                            h_prev=py_encoder_hidden,
+                            v_t=current_speed,
+                            u_t=prev_action,
+                            device=device
+                        )
+                        z_t_np = z_t.cpu().numpy()
+                        
+                        # Adjust observation to match checkpoint's expected base_obs_dim
+                        obs_adjusted = obs.copy()
+                        if base_obs_dim_checkpoint is not None and len(obs) == base_obs_dim_current:
+                            if base_obs_dim_checkpoint == base_obs_dim_without_error:
+                                obs_adjusted = np.concatenate([obs[:4], obs[6:]])
+                            elif base_obs_dim_checkpoint == base_obs_dim_without_grade:
+                                obs_adjusted = np.concatenate([obs[:5], obs[6:]])
+                        
+                        obs_aug = np.concatenate([obs_adjusted, z_t_np])
+                    else:
+                        obs_aug = obs
+                    
+                    obs_tensor = torch.as_tensor(obs_aug, dtype=torch.float32, device=device).unsqueeze(0)
+                    plan, stats = select_action(policy, obs_tensor, deterministic=True)
+                    rl_action = float(plan[0])
+                    
+                    # PID action
+                    speed_error = reference_speed - current_speed
+                    pid_action = pid_controller.compute(speed_error, env.config.dt)
+                    
+                    # Final action
+                    final_action = np.clip(rl_action + pid_action, -1.0, 1.0)
+                    
+                    rl_actions.append(rl_action)
+                    
+                    # Step environment
+                    obs, reward, terminated, truncated, info = env.step(final_action)
+                    
+                    # Update SysID history
+                    if sysid_enabled:
+                        prev_prev_prev_action = prev_prev_action
+                        prev_prev_action = prev_action
+                        prev_action = rl_action
+                        prev_speed = current_speed
+                    
+                    if pid_feedback_rl_only:
+                        env._prev_action = rl_action
+                    
+                    actions.append(final_action)
+                    speeds.append(float(info.get("speed", 0.0)))
+                    references.append(float(info.get("reference_speed", 0.0)))
+                    time_axis.append(step_idx * env.config.dt)
+                    done = terminated or truncated
+                    step_idx += 1
+                
+                # Create trace data
+                initial_error_trace = {
+                    "initial_error": initial_error,
+                    "initial_speed": initial_speed,
+                    "target_speed": target_speed,
+                    "time": time_axis,
+                    "speed": speeds,
+                    "reference": references,
+                    "action": actions,
+                    "rl_action": rl_actions,
+                }
+                initial_error_traces.append(initial_error_trace)
+            
+            print(f"[Initial Error Analysis] Completed {len(initial_error_traces)} initial error evaluations.")
+            
+            # Plot initial error analysis
+            if len(initial_error_traces) > 0:
+                from evaluation.plotting import plot_initial_error_analysis
+                initial_error_plot_path = plot_dir / "initial_error_analysis.png"
+                print("Creating initial error analysis plot...")
+                plot_initial_error_analysis(initial_error_traces, initial_error_plot_path)
 
         # Save vehicle parameters to a text file
         vehicle_params_file = plot_dir / "vehicle_parameters.txt"

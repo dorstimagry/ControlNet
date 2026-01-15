@@ -14,7 +14,7 @@
 # are computed against a filtered version of the profile.
 
 # Context mode selection
-context_mode: "sysid"  # Options: "none", "sysid", "dynamics_map"
+context_mode: "none"  # Options: "none", "sysid", "dynamics_map"
 
 env:
   # Action space bounds (dimensionless, -1 to 1)
@@ -23,21 +23,21 @@ env:
 
   # Reward function weights (dimensionless, affect reward scaling)
   accel_filter_alpha: 0.2   # Exponential smoothing factor for acceleration (0=no smoothing, 1=instant)
-  action_weight: 0.5       # Penalty weight for action magnitude (reduces aggressive control)
-  brake_weight: 0.0001         # Penalty weight for brake usage (set to 0 to disable)
-  negative_speed_weight: 10.0   # Penalty weight for negative vehicle speeds (prevents reverse)
+  action_weight: 0.0       # Penalty weight for action magnitude (reduces aggressive control)
+  brake_weight: 0.0         # Penalty weight for brake usage (set to 0 to disable)
+  negative_speed_weight: 0.0   # Penalty weight for negative vehicle speeds (prevents reverse)
   zero_speed_error_weight: 0.25    # Penalty for speed error when target speed is 0
-  zero_speed_throttle_weight: 10.0 # Penalty for throttle usage when target speed is 0
+  zero_speed_throttle_weight: 0.0 # Penalty for throttle usage when target speed is 0
   horizon_penalty_weight: 0.0  # Weight for future horizon tracking penalties
   horizon_penalty_decay: 0.99  # Exponential decay factor for future penalties (0.9-1.0)
-  jerk_weight: 0.5          # Penalty weight for acceleration changes (smoothness)
-  smooth_action_weight: 20.0 # Penalty weight for action changes (stability)
+  jerk_weight: 0.0          # Penalty weight for acceleration changes (smoothness)
+  smooth_action_weight: 0.0 # Penalty weight for action changes (stability)
   track_weight: 1.0         # Weight for speed tracking error in reward
   
   # Oscillation and overshoot penalty configuration
   # See docs/oscillation_and_overshoot_penalties_for_rl_longitudinal_control.md for details
-  oscillation_weight: 0.2  # Weight for oscillatory switching penalty (λ_osc) - start small (1-5% of track_weight)
-  overshoot_weight: 0.1  # Weight for overshoot crossing penalty (λ_over) - typically 0.1-0.3 × oscillation_weight
+  oscillation_weight: 0.0  # Weight for oscillatory switching penalty (λ_osc) - start small (1-5% of track_weight)
+  overshoot_weight: 0.0  # Weight for overshoot crossing penalty (λ_over) - typically 0.1-0.3 × oscillation_weight
   oscillation_epsilon: 0.05  # Smoothing parameter for action sign (ε) - typical range: 0.03-0.08
   oscillation_error_scale: 0.3  # Error scale for proximity gate (e_s in m/s) - typical range: 0.2-0.5
   oscillation_ref_scale: 0.3  # Reference rate scale for stationarity gate (r_s in m/s²) - typical range: 0.2-0.5
@@ -62,12 +62,15 @@ env:
   
   # Violent profile training mode configuration
   violent_profile_mode: true  # Enable/disable violent profile mode (non-smooth profiles in observations)
-  reward_filter_freq_cutoff: 1.2  # Filter cutoff frequency for reward (Hz)
-  reward_filter_zeta: 5.0  # Filter damping ratio for reward
+  reward_filter_freq_cutoff: 0.8  # Filter cutoff frequency for reward (Hz)
+  reward_filter_zeta: 3.0  # Filter damping ratio for reward
   reward_filter_dt: 0.1  # Filter timestep for reward (should match env dt)
-  reward_filter_rate_max: 1.6  # Default max acceleration for reward filter (m/s²) - overridden per episode based on vehicle
+  reward_filter_rate_max: 1.8  # Default max acceleration for reward filter (m/s²) - overridden per episode based on vehicle
   reward_filter_rate_neg_max: 2.2  # Default max deceleration for reward filter (m/s²) - overridden per episode based on vehicle
-  reward_filter_jerk_max: 1.5  # Default max jerk for reward filter (m/s³)
+  reward_filter_jerk_max: 2.6  # Default max jerk for reward filter (m/s³)
+  
+  # Initial speed randomization
+  initial_speed_error_range: 0.0  # Maximum absolute error for random initial speed (m/s). When > 0, initial speed is sampled from [reference[0] - error_range, reference[0] + error_range]. 0.0 = disabled (use reference[0])
 output:
   dir: training/checkpoints_sac_pretrained_violent     # Directory to save model checkpoints
   save_latest: true             # Whether to save the latest checkpoint during training
@@ -102,7 +105,7 @@ training:
 # SysID Configuration: Load pretrained encoder, freeze during SAC training
 # ========================================================================
 sysid:
-  enabled: true
+  enabled: false
   
   # IMPORTANT: Path to pretrained SysID checkpoint
   pretrained_path: "training/sysid_pretrained/sysid_best.pt"
@@ -141,6 +144,9 @@ generator:
   zeta: 3.0                # Damping ratio - higher = more stable but slower response
   dt: 0.02                 # LPF internal timestep (seconds) - affects smoothness resolution
   jerk_max: 4.0            # Maximum allowed jerk (m/s³) - limits acceleration changes
+  rate_max_limit: 15.0     # Maximum acceleration limit for LPF (m/s²) - clamps vehicle-based acceleration
+  rate_neg_max_limit: 20.0 # Maximum deceleration limit for LPF (m/s²) - clamps vehicle-based deceleration
+  lpf_safety_factor: 0.85  # Safety factor applied to vehicle-based acceleration limits (0.0-1.0) - lower = more conservative
 
   # Event-driven target generation parameters
   p_change: 0.03           # Probability of changing target speed per step (0-1)
@@ -169,13 +175,13 @@ generator:
   speed_limit_safety_factor: 0.8  # Multiplier for max feasible speed (0.75 = 25% reduction from theoretical max)
 
 vehicle_randomization:
-  # Fitted vehicle mode (optional): use fitted params as center of randomization
-  # mode: "fitted"                        # "default" for standard ranges, "fitted" for centered
-  # fitted_params_path: null              # Path to fitted_params.json (e.g., "data/processed/NiroEV/NIROEV_HA_02/fitted_params.json")
-  # spread_pct: 0.1                       # Spread around fitted mean (0.1 = ±10%)
+  Fitted vehicle mode (optional): use fitted params as center of randomization
+  mode: "fitted"                        # "default" for standard ranges, "fitted" for centered
+  fitted_params_path: "data/processed/NiroEV/NIROEV_HA_02/fitted_params.json"              # Path to fitted_params.json (e.g., "data/processed/NiroEV/NIROEV_HA_02/fitted_params.json")
+  spread_pct: 0.1                       # Spread around fitted mean (0.1 = ±10%)
   
   # Basic vehicle parameters (per new_params_randomization.md)
-  mass_range: [1500.0, 6000.0]          # kg - vehicle mass range
+  mass_range: [1900.0, 2500.0]          # kg - vehicle mass range
   rolling_coeff_range: [0.007, 0.015]   # C_rr - rolling resistance coefficient
   drag_area_range: [0.2, 0.8]           # CdA (m²) - drag coefficient * frontal area
   actuator_tau_range: [0.05, 0.30]      # seconds - actuator time constant

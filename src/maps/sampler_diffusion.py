@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from tqdm.auto import tqdm
 
 from src.maps.buffer import ObservationBuffer
 from src.maps.energy import compute_energy_gradient
@@ -66,6 +67,7 @@ class GuidedDiffusionSampler(nn.Module):
         device: torch.device = torch.device("cpu"),
         x_init: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        progress_desc: Optional[str] = None,
     ) -> torch.Tensor:
         """Sample posterior map given observations.
         
@@ -140,7 +142,10 @@ class GuidedDiffusionSampler(nn.Module):
         sigma_meas_normalized = self.sigma_meas / norm_std
         
         # Reverse diffusion with guidance on predicted x0
-        for i, t in enumerate(self.diffusion_prior.inference_scheduler.timesteps):
+        timesteps = self.diffusion_prior.inference_scheduler.timesteps
+        timesteps_iter = tqdm(timesteps, desc=progress_desc, unit="step") if progress_desc else timesteps
+        
+        for i, t in enumerate(timesteps_iter):
             # Predict noise from prior
             noise_pred = self.diffusion_prior(x, t.unsqueeze(0).expand(batch_size).to(device))
             

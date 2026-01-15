@@ -64,6 +64,9 @@ env:
   reward_filter_rate_max: 15.0  # Default max acceleration for reward filter (m/s²) - overridden per episode based on vehicle
   reward_filter_rate_neg_max: 20.0  # Default max deceleration for reward filter (m/s²) - overridden per episode based on vehicle
   reward_filter_jerk_max: 12.0  # Default max jerk for reward filter (m/s³)
+  
+  # Initial speed randomization
+  initial_speed_error_range: 0.0  # Maximum absolute error for random initial speed (m/s). When > 0, initial speed is sampled from [reference[0] - error_range, reference[0] + error_range]. 0.0 = disabled (use reference[0])
 output:
   dir: training/checkpoints_sac_pretrained     # Directory to save model checkpoints
   save_latest: true             # Whether to save the latest checkpoint during training
@@ -137,6 +140,9 @@ generator:
   zeta: 3.0                # Damping ratio - higher = more stable but slower response
   dt: 0.02                 # LPF internal timestep (seconds) - affects smoothness resolution
   jerk_max: 4.0            # Maximum allowed jerk (m/s³) - limits acceleration changes
+  rate_max_limit: 15.0     # Maximum acceleration limit for LPF (m/s²) - clamps vehicle-based acceleration
+  rate_neg_max_limit: 20.0 # Maximum deceleration limit for LPF (m/s²) - clamps vehicle-based deceleration
+  lpf_safety_factor: 0.85  # Safety factor applied to vehicle-based acceleration limits (0.0-1.0) - lower = more conservative
 
   # Event-driven target generation parameters
   p_change: 0.03           # Probability of changing target speed per step (0-1)

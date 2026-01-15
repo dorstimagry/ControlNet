@@ -232,9 +232,9 @@ def export_to_onnx(
     env_action_dim = int(meta.get("env_action_dim", 1))
     
     # Auto-detect SysID from model dimensions (more reliable than metadata)
-    # Base observation: 4 (speed, prev_speed, prev_prev_speed, prev_action) + preview_steps
+    # Base observation: 5 (speed, prev_speed, prev_prev_speed, prev_action, speed_error) + preview_steps
     preview_steps = max(int(round(env_cfg.preview_horizon_s / env_cfg.dt)), 1)
-    base_obs_dim = 4 + preview_steps
+    base_obs_dim = 5 + preview_steps
     
     # If policy expects more dimensions than base, SysID is enabled
     if obs_dim > base_obs_dim:
@@ -280,8 +280,9 @@ def export_to_onnx(
         encoder.eval()
         encoder_norm.eval()
         
-        # Base observation dim (without z_t) - use meta["obs_dim"] which is the base dimension
-        base_obs_dim = int(meta.get("obs_dim", obs_dim - z_dim))
+        # Base observation dim (without z_t) - calculate from policy dimensions
+        # The policy expects obs_dim = base_obs_dim + z_dim, so base_obs_dim = obs_dim - z_dim
+        base_obs_dim = obs_dim - z_dim
         
         print(f"[export] SysID configuration:")
         print(f"         z_dim: {z_dim}")

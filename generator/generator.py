@@ -35,6 +35,9 @@ class GeneratorConfig:
     zeta: float = 0.9
     dt: float = 0.02  # 50 Hz policy step
     jerk_max: float = 12.0  # m/s³ max jerk
+    rate_max_limit: float = 15.0  # Maximum acceleration limit for LPF (m/s²)
+    rate_neg_max_limit: float = 20.0  # Maximum deceleration limit for LPF (m/s²)
+    lpf_safety_factor: float = 0.85  # Safety factor applied to vehicle-based acceleration limits (0.0-1.0)
 
     # Generator parameters
     p_change: float = 0.03
@@ -90,11 +93,11 @@ class BatchTargetGenerator:
         a_brake_min_raw = -vehicle.T_brake_max / vehicle.r_w / vehicle.m
 
         # Apply safety margins for conservative operation
-        safety_factor = 0.85  # Conservative safety margin
+        safety_factor = self.config.lpf_safety_factor
 
         # Ensure reasonable bounds and positive values
-        rate_max = torch.clamp(a_drive_max_raw * safety_factor, min=1.0, max=15.0)
-        rate_neg_max = torch.clamp(-a_brake_min_raw * safety_factor, min=1.0, max=20.0)
+        rate_max = torch.clamp(a_drive_max_raw * safety_factor, min=1.0, max=self.config.rate_max_limit)
+        rate_neg_max = torch.clamp(-a_brake_min_raw * safety_factor, min=1.0, max=self.config.rate_neg_max_limit)
 
         return rate_max, rate_neg_max
 

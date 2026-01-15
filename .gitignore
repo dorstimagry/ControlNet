@@ -182,3 +182,10 @@ secrets.yml
 htmlcov/
 test-results/
 test_outputs/
+
+# Additional training checkpoints
+training/checkpoints_sac_with_initial_error/
+
+# Additional evaluation directories
+evaluation/offline_niroev/
+evaluation/online_niroev/

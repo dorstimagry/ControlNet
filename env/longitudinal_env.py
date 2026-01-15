@@ -82,6 +82,12 @@ class LongitudinalEnvConfig:
     reward_filter_rate_neg_max: float = 20.0  # Default max deceleration for reward filter (m/s²) - overridden per episode based on vehicle
     reward_filter_jerk_max: float = 12.0  # Default max jerk for reward filter (m/s³)
     
+    # Initial speed randomization
+    initial_speed_error_range: float = 0.0  # Maximum absolute error for random initial speed (m/s). When > 0, initial speed is sampled from [reference[0] - error_range, reference[0] + error_range]. 0.0 = disabled (use reference[0])
+    
+    # Initial action randomization
+    randomize_initial_action: bool = False  # If True, initialize the first previous action to a random value in [action_low, action_high]. If False, initialize to 0.0.
+    
     # Deprecated parameters (kept for backward compatibility with config files)
     force_initial_speed_zero: bool = False  # Ignored - new generator handles feasibility
     post_feasibility_smoothing: bool = False  # Ignored - new generator handles feasibility
@@ -130,10 +136,11 @@ class LongitudinalEnv(gym.Env):
             low=np.array([self.config.action_low], dtype=np.float32),
             high=np.array([self.config.action_high], dtype=np.float32),
         )
-        # Observation: [speed, prev_speed, prev_prev_speed, prev_action, speed_error] + [refs]
+        # Observation: [speed, prev_speed, prev_prev_speed, prev_action, speed_error, grade] + [refs]
         # This allows the agent to estimate acceleration, jerk, and action smoothness
         # Speed error is always included regardless of mode
-        obs_dim = 5 + self.preview_steps
+        # Grade (road grade) is included to help the agent account for road slope
+        obs_dim = 6 + self.preview_steps
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self.params: VehicleParams | None = None
@@ -356,12 +363,28 @@ class LongitudinalEnv(gym.Env):
         self._vehicle_caps = None  # Not used with new generator
         self._feasible_reference = self.reference.copy()
 
-        initial_speed = float(options.get("initial_speed", self.reference[0]))
-        self.speed = max(0.0, initial_speed)
+        # Determine initial speed: explicit override > randomization > default
+        if "initial_speed" in options:
+            # Explicit override - use provided value
+            initial_speed = float(options["initial_speed"])
+        elif self.config.initial_speed_error_range > 0:
+            # Randomize around reference[0]
+            error = self._rng.uniform(-self.config.initial_speed_error_range, 
+                                       self.config.initial_speed_error_range)
+            initial_speed = self.reference[0] + error
+        else:
+            # Default behavior
+            initial_speed = self.reference[0]
+        
+        self.speed = initial_speed  # No clamping - allow negative speeds if sampled
         self.prev_speed = self.speed  # Start with consistent prev_speed
         self._prev_prev_speed = self.speed  # Initialize speed history to initial speed
         self.position = 0.0
-        self._prev_action = 0.0
+        # Initialize previous action: randomize if enabled, otherwise use 0.0
+        if self.config.randomize_initial_action:
+            self._prev_action = self._rng.uniform(self.config.action_low, self.config.action_high)
+        else:
+            self._prev_action = 0.0
         self._prev_accel = 0.0  # Start with zero acceleration
         self._filtered_accel = 0.0  # Start filtered accel at zero
         # Initialize tracking variables for oscillation and overshoot penalties
@@ -453,7 +476,19 @@ class LongitudinalEnv(gym.Env):
         assert self.filtered_reference is not None
         current_filtered_ref = float(self.filtered_reference[self._ref_idx])
         speed_error = self.speed - current_filtered_ref
-        reward = -self.config.track_weight * (speed_error**2)
+        tracking_error_penalty = -self.config.track_weight * (speed_error**2)
+        reward = tracking_error_penalty
+
+        # Track reward components for animation/debugging
+        reward_components = {
+            'tracking_error': tracking_error_penalty,
+            'jerk_penalty': 0.0,
+            'action_penalty': 0.0,
+            'smooth_action_penalty': 0.0,
+            'horizon_penalty': 0.0,
+            'oscillation_penalty': 0.0,
+            'overshoot_penalty': 0.0,
+        }
 
         # Horizon penalty: encourage anticipation of future speed changes
         # Penalize deviations from future reference speeds with exponential decay
@@ -473,13 +508,24 @@ class LongitudinalEnv(gym.Env):
                 # Apply exponential decay for future timesteps
                 decay_factor *= self.config.horizon_penalty_decay
 
-            reward += self.config.horizon_penalty_weight * horizon_penalty
+            horizon_penalty_scaled = self.config.horizon_penalty_weight * horizon_penalty
+            reward += horizon_penalty_scaled
+            reward_components['horizon_penalty'] = horizon_penalty_scaled
 
         # Other penalties (comfort penalties use annealing multiplier)
         comfort_mult = self.get_comfort_anneal_multiplier()
-        reward -= comfort_mult * self.config.jerk_weight * abs(jerk)
-        reward -= self.config.action_weight * (abs(action_value))
-        reward -= comfort_mult * self.config.smooth_action_weight * abs(action_value - self._prev_action)
+        jerk_penalty = -comfort_mult * self.config.jerk_weight * abs(jerk)
+        reward += jerk_penalty
+        reward_components['jerk_penalty'] = jerk_penalty
+        
+        action_penalty = -self.config.action_weight * (abs(action_value))
+        reward += action_penalty
+        reward_components['action_penalty'] = action_penalty
+        
+        smooth_action_penalty = -comfort_mult * self.config.smooth_action_weight * abs(action_value - self._prev_action)
+        reward += smooth_action_penalty
+        reward_components['smooth_action_penalty'] = smooth_action_penalty
+        
         if self.config.use_extended_plant and plant_state is not None:
             reward -= self.config.brake_weight * abs(plant_state.brake_torque)
 
@@ -529,6 +575,7 @@ class LongitudinalEnv(gym.Env):
                     * stationarity_gate
                 )
                 reward += oscillation_penalty
+                reward_components['oscillation_penalty'] = oscillation_penalty
             
             # Term 2: Overshoot Crossing Penalty
             if self.config.overshoot_weight > 0.0:
@@ -557,6 +604,7 @@ class LongitudinalEnv(gym.Env):
                     * proximity_gate
                 )
                 reward += overshoot_penalty
+                reward_components['overshoot_penalty'] = overshoot_penalty
             
             # Update tracking variables for next step
             if self.config.oscillation_weight > 0.0:
@@ -607,6 +655,7 @@ class LongitudinalEnv(gym.Env):
             "grade_force": plant_state.grade_force,
             "net_force": plant_state.net_force,
             "grade_rad": current_grade if self.config.use_extended_plant and self.grade_profile is not None else 0.0,  # Current grade for dynamics map
+            "reward_components": reward_components,  # Individual reward components for visualization
         }
 
         return obs, reward, terminated, truncated, info
@@ -675,19 +724,25 @@ class LongitudinalEnv(gym.Env):
         current_filtered_ref = float(self.filtered_reference[self._ref_idx])
         speed_error = speed_meas - current_filtered_ref
 
-        # Include speed history, previous action, and speed error for observation
-        # Observation: [speed, prev_speed, prev_prev_speed, prev_action, speed_error, refs...]
+        # Include speed history, previous action, speed error, and road grade for observation
+        # Observation: [speed, prev_speed, prev_prev_speed, prev_action, speed_error, grade, refs...]
         # This allows the agent to estimate:
         #   - Acceleration: (speed - prev_speed) / dt
         #   - Jerk: ((speed - prev_speed) - (prev_speed - prev_prev_speed)) / dt^2
         #   - Action smoothness: action - prev_action
         #   - Speed error: direct feedback on tracking performance
+        #   - Road grade: current road slope (affects vehicle dynamics)
+        
+        # Get current road grade
+        current_grade = float(self.grade_profile[self._ref_idx]) if self.grade_profile is not None else 0.0
+        
         base = np.array([
             speed_meas,             # Current speed
             self.prev_speed,        # Previous speed (for acceleration)
             self._prev_prev_speed,  # Speed from 2 steps ago (for jerk)
             self._prev_action,      # Previous action (for action smoothness)
             speed_error,            # Speed error (always included)
+            current_grade,          # Current road grade (radians)
         ], dtype=np.float32)
 
         # Use reference based on mode: raw for violent mode, filtered otherwise
