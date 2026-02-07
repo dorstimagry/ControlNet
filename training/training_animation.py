@@ -46,15 +46,25 @@ class RewardComponentTracker:
     def reset(self):
         """Reset tracking for new episode."""
         self.tracking_error = []
+        self.bias_penalty = []
         self.jerk_penalty = []
         self.action_penalty = []
         self.smooth_action_penalty = []
         self.horizon_penalty = []
         self.oscillation_penalty = []
         self.overshoot_penalty = []
+        self.max_acc_penalty = []  # Maximum acceleration penalty (single value at episode end)
+        self.max_jerk_penalty = []  # Maximum jerk penalty (single value at episode end)
+        self.lqr_error_penalty = []  # LQR error (tracking) penalty
+        self.lqr_accel_penalty = []  # LQR acceleration penalty
+        self.lqr_jerk_penalty = []  # LQR jerk penalty
+        self.negative_speed_penalty = []  # Negative speed penalty
+        self.zero_speed_error_penalty = []  # Zero speed error penalty
+        self.zero_speed_throttle_penalty = []  # Zero speed throttle penalty
         self.total_reward = []
         self.speeds = []
         self.references = []
+        self.filtered_references = []  # Filtered reference for reward calculation
         self.actions = []
         self.time_steps = []
         self.annealing_multiplier = []  # Track annealing multiplier
@@ -67,25 +77,65 @@ class RewardComponentTracker:
         action: float,
         time_step: float,
         reward_components: Optional[Dict[str, float]] = None,
-        annealing_multiplier: float = 1.0
+        annealing_multiplier: float = 1.0,
+        filtered_reference: Optional[float] = None
     ):
         """Add a step's data."""
         self.total_reward.append(reward)
         self.speeds.append(speed)
         self.references.append(reference)
+        self.filtered_references.append(filtered_reference if filtered_reference is not None else reference)
         self.actions.append(action)
         self.time_steps.append(time_step)
         self.annealing_multiplier.append(annealing_multiplier)
         
         if reward_components:
-            # reward_components already contain weighted values (with annealing applied)
+            # reward_components already contain weighted values (with annealing applied and normalized)
             self.tracking_error.append(reward_components.get('tracking_error', 0.0))
+            self.bias_penalty.append(reward_components.get('bias_penalty', 0.0))
             self.jerk_penalty.append(reward_components.get('jerk_penalty', 0.0))
             self.action_penalty.append(reward_components.get('action_penalty', 0.0))
             self.smooth_action_penalty.append(reward_components.get('smooth_action_penalty', 0.0))
             self.horizon_penalty.append(reward_components.get('horizon_penalty', 0.0))
             self.oscillation_penalty.append(reward_components.get('oscillation_penalty', 0.0))
             self.overshoot_penalty.append(reward_components.get('overshoot_penalty', 0.0))
+            self.max_acc_penalty.append(reward_components.get('max_acc_penalty', 0.0))
+            self.max_jerk_penalty.append(reward_components.get('max_jerk_penalty', 0.0))
+            self.lqr_error_penalty.append(reward_components.get('lqr_error_penalty', 0.0))
+            self.lqr_accel_penalty.append(reward_components.get('lqr_accel_penalty', 0.0))
+            self.lqr_jerk_penalty.append(reward_components.get('lqr_jerk_penalty', 0.0))
+            self.negative_speed_penalty.append(reward_components.get('negative_speed_penalty', 0.0))
+            self.zero_speed_error_penalty.append(reward_components.get('zero_speed_error_penalty', 0.0))
+            self.zero_speed_throttle_penalty.append(reward_components.get('zero_speed_throttle_penalty', 0.0))
+
+
+def get_active_reward_components(env_config: LongitudinalEnvConfig) -> Dict[str, bool]:
+    """Determine which reward components are active based on config weights.
+    
+    Args:
+        env_config: Environment configuration
+        
+    Returns:
+        Dictionary mapping component names to whether they're active (weight > 0)
+    """
+    return {
+        'tracking_error': env_config.track_weight > 0.0,
+        'bias_penalty': env_config.bias_penalty_enabled and env_config.bias_penalty_weight > 0.0,
+        'jerk_penalty': env_config.jerk_weight > 0.0,
+        'action_penalty': env_config.action_weight > 0.0,
+        'smooth_action_penalty': env_config.smooth_action_weight > 0.0,
+        'horizon_penalty': env_config.horizon_penalty_weight > 0.0,
+        'oscillation_penalty': env_config.oscillation_weight > 0.0,
+        'overshoot_penalty': env_config.overshoot_weight > 0.0,
+        'max_acc_penalty': env_config.max_acc_penalty_weight > 0.0,
+        'max_jerk_penalty': env_config.max_jerk_penalty_weight > 0.0,
+        'lqr_error_penalty': env_config.lqr_penalty_enabled and env_config.lqr_error_weight > 0.0,
+        'lqr_accel_penalty': env_config.lqr_penalty_enabled and env_config.lqr_accel_weight > 0.0,
+        'lqr_jerk_penalty': env_config.lqr_penalty_enabled and env_config.lqr_jerk_weight > 0.0,
+        'negative_speed_penalty': env_config.negative_speed_weight > 0.0,
+        'zero_speed_error_penalty': env_config.zero_speed_error_weight > 0.0,
+        'zero_speed_throttle_penalty': env_config.zero_speed_throttle_weight > 0.0,
+    }
 
 
 def create_training_animation(
@@ -97,6 +147,7 @@ def create_training_animation(
     animation_history: List[Dict],
     max_history: int = 50,
     initial_speed_errors: List[float] | None = None,
+    initial_actions: List[float] | None = None,
     num_episodes: int = 3
 ) -> Optional[Path]:
     """Create an animated visualization of policy performance.
@@ -111,6 +162,8 @@ def create_training_animation(
         max_history: Maximum number of historical steps to keep
         initial_speed_errors: List of initial speed errors (m/s) for each episode.
                              If None, generates errors covering small, medium, and large ranges.
+        initial_actions: List of initial actions for each episode (constant across training).
+                        If None, generates random but fixed actions.
         num_episodes: Number of example episodes to show (default: 3)
     
     Returns:
@@ -120,43 +173,50 @@ def create_training_animation(
         # Determine initial speed errors if not provided
         reference_initial_speed = float(fixed_reference[0])
         if initial_speed_errors is None:
-            # Generate errors covering small, medium, and large ranges
-            # Distribute evenly across the range
+            # Default to -2, 0, 2 m/s errors for 3 episodes
             if num_episodes == 1:
-                initial_speed_errors = [0.5]
+                initial_speed_errors = [0.0]
             elif num_episodes == 2:
-                initial_speed_errors = [0.5, 2.5]
+                initial_speed_errors = [-1.0, 1.0]
             elif num_episodes == 3:
-                initial_speed_errors = [0.5, 1.5, 3.0]
+                initial_speed_errors = [-2.0, 0.0, 2.0]
             else:
-                # For more episodes, distribute evenly from small to large
-                min_error = 0.3
-                max_error = 3.5
-                initial_speed_errors = np.linspace(min_error, max_error, num_episodes).tolist()
+                # For more episodes, distribute evenly from -2 to 2
+                initial_speed_errors = np.linspace(-2.0, 2.0, num_episodes).tolist()
         
         # Ensure we have the right number of errors
         if len(initial_speed_errors) != num_episodes:
             raise ValueError(f"Number of initial_speed_errors ({len(initial_speed_errors)}) "
                            f"must match num_episodes ({num_episodes})")
         
+        # Generate fixed initial actions if not provided
+        if initial_actions is None:
+            # Generate random but fixed initial actions (using a fixed seed for reproducibility)
+            import random
+            rng = random.Random(42)  # Fixed seed for reproducibility
+            initial_actions = [rng.uniform(eval_env.config.action_low, eval_env.config.action_high) 
+                              for _ in range(num_episodes)]
+        
+        # Ensure we have the right number of actions
+        if len(initial_actions) != num_episodes:
+            raise ValueError(f"Number of initial_actions ({len(initial_actions)}) "
+                           f"must match num_episodes ({num_episodes})")
+        
         # Run multiple episodes and collect data
         episode_trackers = []
-        initial_actions = []  # Store initial previous actions for each episode
         for episode_idx in range(num_episodes):
             # Calculate initial speed: reference speed + error
             initial_speed_error = initial_speed_errors[episode_idx]
             initial_speed = reference_initial_speed + initial_speed_error
+            initial_action = initial_actions[episode_idx]
             
-            # Reset environment with fixed reference and episode-specific initial speed
+            # Reset environment with fixed reference, episode-specific initial speed, and fixed initial action
             reset_options = {
                 "reference_profile": fixed_reference,
-                "initial_speed": initial_speed
+                "initial_speed": initial_speed,
+                "initial_action": initial_action
             }
             obs, _ = eval_env.reset(options=reset_options)
-            
-            # Capture initial previous action from observation (index 3: prev_action)
-            initial_prev_action = float(obs[3]) if len(obs) > 3 else 0.0
-            initial_actions.append(initial_prev_action)
             
             # Set global step in eval_env for correct annealing multiplier
             eval_env.set_global_step(step)
@@ -225,6 +285,10 @@ def create_training_animation(
                 # Track data
                 current_speed = float(obs[0])
                 current_ref = float(fixed_reference[min(step_count, len(fixed_reference) - 1)])
+                # Get filtered reference for reward calculation (if available)
+                filtered_ref = None
+                if eval_env.filtered_reference is not None and eval_env._ref_idx < len(eval_env.filtered_reference):
+                    filtered_ref = float(eval_env.filtered_reference[eval_env._ref_idx])
                 tracker.add_step(
                     reward=reward,
                     speed=current_speed,
@@ -232,7 +296,8 @@ def create_training_animation(
                     action=action_scalar,
                     time_step=step_count * eval_env.config.dt,
                     reward_components=reward_components if reward_components else None,
-                    annealing_multiplier=annealing_mult
+                    annealing_multiplier=annealing_mult,
+                    filtered_reference=filtered_ref
                 )
                 
                 # Update context state for SysID
@@ -283,10 +348,10 @@ def create_training_animation(
         else:
             # Create new figure with layout for multiple episodes
             # Layout: 4 rows x num_episodes cols
-            # Row 1: Speed tracking for all episodes (shared x-axis)
-            # Row 2: Actions for all episodes (shared x-axis)
-            # Row 3: Reward breakdown for all episodes (shared x-axis)
-            # Row 4: Training trends (spans first 2 cols) + Annealing multiplier (last col)
+            # Row 0: Speed tracking for all episodes (shared x-axis)
+            # Row 1: Actions for all episodes (shared x-axis)
+            # Row 2: Reward breakdown for all episodes (shared x-axis)
+            # Row 3: Training trends (spans first 2 cols) + Annealing multiplier (last col)
             fig = plt.figure(figsize=(20, 14))
             gs = fig.add_gridspec(4, num_episodes, hspace=0.4, wspace=0.3, 
                                  height_ratios=[1, 1, 1, 1.2])
@@ -302,9 +367,24 @@ def create_training_animation(
             ax = fig.add_subplot(gs[0, ep_idx])
             # Show reference on all plots
             ax.plot(tracker.time_steps, tracker.references, 'k--', label='Reference', linewidth=2, alpha=0.7)
+            # Plot filtered reference only if filter_reward_mode or violent_profile_mode is enabled
+            # AND if it's different from regular reference
+            should_show_filtered = (
+                eval_env.config.filter_reward_mode or 
+                eval_env.config.violent_profile_mode
+            )
+            if should_show_filtered and tracker.filtered_references and any(fr != ref for fr, ref in zip(tracker.filtered_references, tracker.references)):
+                ax.plot(tracker.time_steps, tracker.filtered_references, 'r', label='Filtered Reference (reward)', linewidth=2, alpha=0.6, linestyle='--')
             error_str = f" (err: {initial_speed_errors[ep_idx]:+.1f} m/s)"
             ax.plot(tracker.time_steps, tracker.speeds, color=episode_colors[ep_idx], 
                    label=f'Actual Speed{error_str}', linewidth=2)
+            
+            # Mark initial speed with a star
+            if len(tracker.speeds) > 0:
+                initial_speed = tracker.speeds[0]
+                ax.scatter([0.0], [initial_speed], color='orange', s=150, marker='*', 
+                          zorder=5, label='Initial Speed', edgecolors='black', linewidths=0.5)
+            
             ax.fill_between(tracker.time_steps, tracker.references, tracker.speeds, 
                            where=np.array(tracker.speeds) < np.array(tracker.references),
                            alpha=0.2, color='red', label='Error')
@@ -314,7 +394,7 @@ def create_training_animation(
             ax.set_xlim([0, max_time])
             if ep_idx == 0:
                 ax.set_ylabel('Speed (m/s)')
-            ax.set_title(f'Speed Tracking - Episode {ep_idx+1}{error_str}')
+            ax.set_title(f'Episode {ep_idx+1}{error_str}')
             ax.legend()
             ax.grid(True, alpha=0.3)
         
@@ -347,23 +427,55 @@ def create_training_animation(
             if ep_idx == num_episodes - 1:
                 ax.set_xlabel('Time (s)')
         
+        # Determine which components are active based on config
+        active_components = get_active_reward_components(eval_env.config)
+        
         # Plot reward breakdown for each episode (shared time axis) - use line plots instead of stacked
         for ep_idx, tracker in enumerate(episode_trackers):
             ax = fig.add_subplot(gs[2, ep_idx])
             if tracker.tracking_error:
                 # Line plots instead of stacked area to avoid overlap
-                # These are already weighted (including annealing) from reward_components
-                ax.plot(tracker.time_steps, tracker.tracking_error, 'b-', label='Tracking (weighted)', linewidth=1.5, alpha=0.8)
-                ax.plot(tracker.time_steps, tracker.jerk_penalty, 'r-', label='Jerk (weighted, annealed)', linewidth=1.5, alpha=0.8)
-                ax.plot(tracker.time_steps, tracker.action_penalty, 'g-', label='Action (weighted)', linewidth=1.5, alpha=0.8)
-                ax.plot(tracker.time_steps, tracker.smooth_action_penalty, 'm-', label='Smooth (weighted, annealed)', linewidth=1.5, alpha=0.8)
+                # These are already weighted (including annealing) and normalized from reward_components
+                # Only plot active components
+                if active_components['tracking_error']:
+                    ax.plot(tracker.time_steps, tracker.tracking_error, 'b-', label='Tracking', linewidth=1.5, alpha=0.8)
+                if active_components['bias_penalty']:
+                    ax.plot(tracker.time_steps, tracker.bias_penalty, 'c-', label='Bias', linewidth=1.5, alpha=0.8)
+                if active_components['jerk_penalty']:
+                    ax.plot(tracker.time_steps, tracker.jerk_penalty, 'r-', label='Jerk', linewidth=1.5, alpha=0.8)
+                if active_components['action_penalty']:
+                    ax.plot(tracker.time_steps, tracker.action_penalty, 'g-', label='Action', linewidth=1.5, alpha=0.8)
+                if active_components['smooth_action_penalty']:
+                    ax.plot(tracker.time_steps, tracker.smooth_action_penalty, 'm-', label='Smooth', linewidth=1.5, alpha=0.8)
+                if active_components['horizon_penalty']:
+                    ax.plot(tracker.time_steps, tracker.horizon_penalty, 'y-', label='Horizon', linewidth=1.5, alpha=0.8)
+                if active_components['oscillation_penalty']:
+                    ax.plot(tracker.time_steps, tracker.oscillation_penalty, 'orange', label='Oscillation', linewidth=1.5, alpha=0.8, linestyle=':')
+                if active_components['overshoot_penalty']:
+                    ax.plot(tracker.time_steps, tracker.overshoot_penalty, 'brown', label='Overshoot', linewidth=1.5, alpha=0.8, linestyle=':')
+                if active_components['max_acc_penalty']:
+                    ax.plot(tracker.time_steps, tracker.max_acc_penalty, 'pink', label='Max Acc', linewidth=1.5, alpha=0.8, linestyle='--')
+                if active_components['max_jerk_penalty']:
+                    ax.plot(tracker.time_steps, tracker.max_jerk_penalty, 'gray', label='Max Jerk', linewidth=1.5, alpha=0.8, linestyle='--')
+                if active_components['lqr_error_penalty']:
+                    ax.plot(tracker.time_steps, tracker.lqr_error_penalty, 'darkblue', label='LQR Error', linewidth=1.5, alpha=0.8, linestyle='-.')
+                if active_components['lqr_accel_penalty']:
+                    ax.plot(tracker.time_steps, tracker.lqr_accel_penalty, 'magenta', label='LQR Accel', linewidth=1.5, alpha=0.8, linestyle='-.')
+                if active_components['lqr_jerk_penalty']:
+                    ax.plot(tracker.time_steps, tracker.lqr_jerk_penalty, 'teal', label='LQR Jerk', linewidth=1.5, alpha=0.8, linestyle='-.')
+                if active_components['negative_speed_penalty']:
+                    ax.plot(tracker.time_steps, tracker.negative_speed_penalty, 'navy', label='Neg Speed', linewidth=1.5, alpha=0.8, linestyle=':')
+                if active_components['zero_speed_error_penalty']:
+                    ax.plot(tracker.time_steps, tracker.zero_speed_error_penalty, 'maroon', label='Zero Speed Err', linewidth=1.5, alpha=0.8, linestyle=':')
+                if active_components['zero_speed_throttle_penalty']:
+                    ax.plot(tracker.time_steps, tracker.zero_speed_throttle_penalty, 'crimson', label='Zero Speed Throttle', linewidth=1.5, alpha=0.8, linestyle=':')
             else:
                 # Fallback: total reward
                 ax.plot(tracker.time_steps, tracker.total_reward, 'b-', label='Total Reward', linewidth=1.5)
             ax.set_xlim([0, max_time])
             if ep_idx == 0:
-                ax.set_ylabel('Reward Components')
-            ax.set_title('Reward Breakdown')
+                ax.set_ylabel('Reward')
+            ax.set_title('Reward Components')
             ax.legend(loc='upper right', fontsize=8)
             ax.grid(True, alpha=0.3)
             if ep_idx == num_episodes - 1:
@@ -374,26 +486,65 @@ def create_training_animation(
         if len(animation_history) > 0:
             # Extract steps and ensure they're correct (not offset by animation_interval)
             steps = [h['step'] for h in animation_history]
-            # These are already weighted (including annealing) from reward_components
-            tracking_errors = [h.get('avg_tracking_error', 0) for h in animation_history]
-            jerk_penalties = [h.get('avg_jerk_penalty', 0) for h in animation_history]
-            action_penalties = [h.get('avg_action_penalty', 0) for h in animation_history]
-            smooth_action_penalties = [h.get('avg_smooth_action_penalty', 0) for h in animation_history]
-            
-            # Plot with correct step values (already weighted)
-            ax4.plot(steps, tracking_errors, 'o-', label='Tracking Error (weighted)', linewidth=2, markersize=6)
-            ax4.plot(steps, jerk_penalties, 's-', label='Jerk Penalty (weighted, annealed)', linewidth=2, markersize=6)
-            ax4.plot(steps, action_penalties, '^-', label='Action Penalty (weighted)', linewidth=2, markersize=6)
-            ax4.plot(steps, smooth_action_penalties, 'd-', label='Smooth Action Penalty (weighted, annealed)', linewidth=2, markersize=6)
+            # These are already weighted (including annealing) and normalized from reward_components
+            # Only plot active components
+            if active_components['tracking_error']:
+                tracking_errors = [h.get('avg_tracking_error', 0) for h in animation_history]
+                ax4.plot(steps, tracking_errors, 'o-', label='Tracking', linewidth=2, markersize=6)
+            if active_components['bias_penalty']:
+                bias_penalties = [h.get('avg_bias_penalty', 0) for h in animation_history]
+                ax4.plot(steps, bias_penalties, 'o-', label='Bias', linewidth=2, markersize=6, color='cyan')
+            if active_components['jerk_penalty']:
+                jerk_penalties = [h.get('avg_jerk_penalty', 0) for h in animation_history]
+                ax4.plot(steps, jerk_penalties, 's-', label='Jerk', linewidth=2, markersize=6)
+            if active_components['action_penalty']:
+                action_penalties = [h.get('avg_action_penalty', 0) for h in animation_history]
+                ax4.plot(steps, action_penalties, '^-', label='Action', linewidth=2, markersize=6)
+            if active_components['smooth_action_penalty']:
+                smooth_action_penalties = [h.get('avg_smooth_action_penalty', 0) for h in animation_history]
+                ax4.plot(steps, smooth_action_penalties, 'd-', label='Smooth', linewidth=2, markersize=6)
+            if active_components['horizon_penalty']:
+                horizon_penalties = [h.get('avg_horizon_penalty', 0) for h in animation_history]
+                ax4.plot(steps, horizon_penalties, 'o-', label='Horizon', linewidth=2, markersize=6, color='yellow')
+            if active_components['oscillation_penalty']:
+                oscillation_penalties = [h.get('avg_oscillation_penalty', 0) for h in animation_history]
+                ax4.plot(steps, oscillation_penalties, 'o', label='Oscillation', linewidth=2, markersize=6, color='orange', linestyle=':')
+            if active_components['overshoot_penalty']:
+                overshoot_penalties = [h.get('avg_overshoot_penalty', 0) for h in animation_history]
+                ax4.plot(steps, overshoot_penalties, 'o', label='Overshoot', linewidth=2, markersize=6, color='brown', linestyle=':')
+            if active_components['max_acc_penalty']:
+                max_acc_penalties = [h.get('avg_max_acc_penalty', 0) for h in animation_history]
+                ax4.plot(steps, max_acc_penalties, 'y^', label='Max Acc', linewidth=2, markersize=6, linestyle='--')
+            if active_components['max_jerk_penalty']:
+                max_jerk_penalties = [h.get('avg_max_jerk_penalty', 0) for h in animation_history]
+                ax4.plot(steps, max_jerk_penalties, 'k^', label='Max Jerk', linewidth=2, markersize=6, linestyle='--')
+            if active_components['lqr_error_penalty']:
+                lqr_error_penalties = [h.get('avg_lqr_error_penalty', 0) for h in animation_history]
+                ax4.plot(steps, lqr_error_penalties, 'o', label='LQR Error', linewidth=2, markersize=6, color='darkblue', linestyle='-.')
+            if active_components['lqr_accel_penalty']:
+                lqr_accel_penalties = [h.get('avg_lqr_accel_penalty', 0) for h in animation_history]
+                ax4.plot(steps, lqr_accel_penalties, 'o', label='LQR Accel', linewidth=2, markersize=6, color='magenta', linestyle='-.')
+            if active_components['lqr_jerk_penalty']:
+                lqr_jerk_penalties = [h.get('avg_lqr_jerk_penalty', 0) for h in animation_history]
+                ax4.plot(steps, lqr_jerk_penalties, 'o', label='LQR Jerk', linewidth=2, markersize=6, color='teal', linestyle='-.')
+            if active_components['negative_speed_penalty']:
+                negative_speed_penalties = [h.get('avg_negative_speed_penalty', 0) for h in animation_history]
+                ax4.plot(steps, negative_speed_penalties, 'o', label='Neg Speed', linewidth=2, markersize=6, color='navy', linestyle=':')
+            if active_components['zero_speed_error_penalty']:
+                zero_speed_error_penalties = [h.get('avg_zero_speed_error_penalty', 0) for h in animation_history]
+                ax4.plot(steps, zero_speed_error_penalties, 'o', label='Zero Speed Err', linewidth=2, markersize=6, color='maroon', linestyle=':')
+            if active_components['zero_speed_throttle_penalty']:
+                zero_speed_throttle_penalties = [h.get('avg_zero_speed_throttle_penalty', 0) for h in animation_history]
+                ax4.plot(steps, zero_speed_throttle_penalties, 'o', label='Zero Speed Throttle', linewidth=2, markersize=6, color='crimson', linestyle=':')
             ax4.set_xlabel('Training Step')
-            ax4.set_ylabel('Average Reward Component (Weighted)')
-            ax4.set_title('Reward Components Over Training (Weighted with Annealing)')
+            ax4.set_ylabel('Reward Component')
+            ax4.set_title('Reward Components Over Training')
             ax4.legend()
             ax4.grid(True, alpha=0.3)
         else:
             ax4.text(0.5, 0.5, 'No training history yet', 
                     ha='center', va='center', transform=ax4.transAxes)
-            ax4.set_title('Reward Components Over Training (Weighted with Annealing)')
+            ax4.set_title('Reward Components Over Training')
         
         # Plot 5: Annealing multiplier over training - right side (last column)
         ax5 = fig.add_subplot(gs[3, -1])  # Last column
@@ -413,8 +564,8 @@ def create_training_animation(
                     ha='center', va='center', transform=ax5.transAxes, fontsize=8)
             ax5.set_title('Annealing', fontsize=10)
         
-        plt.suptitle(f'Training Progress - Step {step}', fontsize=16, y=0.995)
-        plt.tight_layout()
+        plt.suptitle(f'Step {step}', fontsize=16, y=0.995)
+        plt.subplots_adjust(top=0.95, bottom=0.05, left=0.05, right=0.95, hspace=0.4, wspace=0.3)
         
         # Display interactively
         if _backend_set:
@@ -438,13 +589,37 @@ def create_training_animation(
         
         # Store episode summary for history (average across all episodes)
         avg_tracking_error = np.mean([np.mean(np.abs(np.array(t.speeds) - np.array(t.references))) 
-                                     for t in episode_trackers])
+                                      for t in episode_trackers])
+        avg_bias_penalty = np.mean([np.mean(np.abs(t.bias_penalty)) if t.bias_penalty else 0.0 
+                                    for t in episode_trackers])
         avg_jerk_penalty = np.mean([np.mean(np.abs(t.jerk_penalty)) if t.jerk_penalty else 0.0 
                                     for t in episode_trackers])
         avg_action_penalty = np.mean([np.mean(np.abs(t.action_penalty)) if t.action_penalty else 0.0 
-                                      for t in episode_trackers])
+                                     for t in episode_trackers])
         avg_smooth_action_penalty = np.mean([np.mean(np.abs(t.smooth_action_penalty)) if t.smooth_action_penalty else 0.0 
                                              for t in episode_trackers])
+        avg_oscillation_penalty = np.mean([np.mean(np.abs(t.oscillation_penalty)) if t.oscillation_penalty else 0.0 
+                                           for t in episode_trackers])
+        avg_overshoot_penalty = np.mean([np.mean(np.abs(t.overshoot_penalty)) if t.overshoot_penalty else 0.0 
+                                         for t in episode_trackers])
+        avg_max_acc_penalty = np.mean([np.mean(np.abs(t.max_acc_penalty)) if t.max_acc_penalty else 0.0 
+                                       for t in episode_trackers])
+        avg_max_jerk_penalty = np.mean([np.mean(np.abs(t.max_jerk_penalty)) if t.max_jerk_penalty else 0.0 
+                                        for t in episode_trackers])
+        avg_lqr_error_penalty = np.mean([np.mean(np.abs(t.lqr_error_penalty)) if t.lqr_error_penalty else 0.0 
+                                        for t in episode_trackers])
+        avg_lqr_accel_penalty = np.mean([np.mean(np.abs(t.lqr_accel_penalty)) if t.lqr_accel_penalty else 0.0 
+                                        for t in episode_trackers])
+        avg_lqr_jerk_penalty = np.mean([np.mean(np.abs(t.lqr_jerk_penalty)) if t.lqr_jerk_penalty else 0.0 
+                                       for t in episode_trackers])
+        avg_negative_speed_penalty = np.mean([np.mean(np.abs(t.negative_speed_penalty)) if t.negative_speed_penalty else 0.0 
+                                             for t in episode_trackers])
+        avg_zero_speed_error_penalty = np.mean([np.mean(np.abs(t.zero_speed_error_penalty)) if t.zero_speed_error_penalty else 0.0 
+                                               for t in episode_trackers])
+        avg_zero_speed_throttle_penalty = np.mean([np.mean(np.abs(t.zero_speed_throttle_penalty)) if t.zero_speed_throttle_penalty else 0.0 
+                                                  for t in episode_trackers])
+        avg_horizon_penalty = np.mean([np.mean(np.abs(t.horizon_penalty)) if t.horizon_penalty else 0.0 
+                                      for t in episode_trackers])
         avg_annealing_multiplier = np.mean([np.mean(t.annealing_multiplier) if t.annealing_multiplier else 1.0 
                                             for t in episode_trackers])
         total_reward = np.sum([np.sum(t.total_reward) for t in episode_trackers])
@@ -452,9 +627,21 @@ def create_training_animation(
         episode_summary = {
             'step': step,  # Store actual step, not offset
             'avg_tracking_error': avg_tracking_error,
+            'avg_bias_penalty': avg_bias_penalty,
             'avg_jerk_penalty': avg_jerk_penalty,
             'avg_action_penalty': avg_action_penalty,
             'avg_smooth_action_penalty': avg_smooth_action_penalty,
+            'avg_horizon_penalty': avg_horizon_penalty,
+            'avg_oscillation_penalty': avg_oscillation_penalty,
+            'avg_overshoot_penalty': avg_overshoot_penalty,
+            'avg_max_acc_penalty': avg_max_acc_penalty,
+            'avg_max_jerk_penalty': avg_max_jerk_penalty,
+            'avg_lqr_error_penalty': avg_lqr_error_penalty,
+            'avg_lqr_accel_penalty': avg_lqr_accel_penalty,
+            'avg_lqr_jerk_penalty': avg_lqr_jerk_penalty,
+            'avg_negative_speed_penalty': avg_negative_speed_penalty,
+            'avg_zero_speed_error_penalty': avg_zero_speed_error_penalty,
+            'avg_zero_speed_throttle_penalty': avg_zero_speed_throttle_penalty,
             'avg_annealing_multiplier': avg_annealing_multiplier,
             'total_reward': total_reward,
             'episode_length': np.mean([len(t.time_steps) for t in episode_trackers]),

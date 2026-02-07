@@ -39,11 +39,11 @@ def create_interactive_visualizer():
     
     # Default filter parameters
     default_freq_cutoff = 0.6
-    default_zeta = 0.9
+    default_zeta = 4.0
     default_dt = 0.1
-    default_rate_max = 15.0
-    default_rate_neg_max = 20.0
-    default_jerk_max = 12.0
+    default_rate_max = 1.8
+    default_rate_neg_max = 1.8
+    default_jerk_max = 0.5
     
     # Generate step functions
     dt = 0.1

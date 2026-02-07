@@ -67,13 +67,14 @@ class SingleEpisodeGenerator:
         self.device = device or torch.device('cpu')
         self.generator = BatchTargetGenerator(batch_config, batch_size=1, episode_length=1000, device=device)
 
-    def sample(self, length: int, rng: np.random.Generator | None = None, vehicle: VehicleCapabilities | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self, length: int, rng: np.random.Generator | None = None, vehicle: VehicleCapabilities | None = None, initial_speed: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Generate a single reference profile and grade profile of given length.
 
         Args:
             length: Length of the profile in steps
             rng: Random number generator (unused, kept for compatibility)
             vehicle: Optional VehicleCapabilities object. If None, uses default vehicle.
+            initial_speed: Optional initial speed (m/s). If None, samples random speed.
 
         Returns:
             Tuple of (filtered_speed_profile, grade_profile, raw_speed_profile) as numpy arrays [length]
@@ -118,7 +119,13 @@ class SingleEpisodeGenerator:
         generator = BatchTargetGenerator(single_config, batch_size=1, episode_length=length, device=self.device)
         # Override the prediction_horizon in the config
         generator.config.prediction_horizon = min(self.prediction_horizon, length)
-        targets, grades, raw_targets = generator.generate_batch(vehicle)
+        
+        # Convert initial_speed to tensor if provided
+        initial_speed_tensor = None
+        if initial_speed is not None:
+            initial_speed_tensor = torch.tensor([initial_speed], device=self.device)
+        
+        targets, grades, raw_targets = generator.generate_batch(vehicle, initial_speed=initial_speed_tensor)
 
         # Extract the speed profiles (first element of each horizon)
         filtered_speed_profile = targets[0, :, 0].cpu().numpy()  # [length] - filtered profile
@@ -182,6 +189,7 @@ def create_reference_generator(
             p_zero_stop=generator_config.get('p_zero_stop', 0.08),
             v_min=generator_config.get('v_min', 0.0),
             v_max_sample=generator_config.get('v_max_sample', 30.0),
+            speed_beta=generator_config.get('speed_beta', 1.0),
             t_min=generator_config.get('t_min', 2.0),
             t_max=generator_config.get('t_max', 12.0),
             stop_hold_min=generator_config.get('stop_hold_min', 1.0),

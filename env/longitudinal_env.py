@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -75,6 +76,9 @@ class LongitudinalEnvConfig:
     comfort_anneal_steps: int = 500000  # Number of steps to anneal over
     # Violent profile training mode configuration
     violent_profile_mode: bool = False  # Enable/disable violent profile mode (non-smooth profiles in observations)
+    filter_reward_mode: bool = False  # Enable/disable filter reward mode (standard profiles in observations, filtered profiles for reward)
+    reward_filter_use_lookahead: bool = False  # Enable/disable look-ahead mode for reward filter
+    reward_filter_lookahead_s: float = 3.0  # Look-ahead time for reward filter (seconds, must be <= preview_horizon_s)
     reward_filter_freq_cutoff: float = 0.6  # Filter cutoff frequency for reward (Hz)
     reward_filter_zeta: float = 0.9  # Filter damping ratio for reward
     reward_filter_dt: float = 0.1  # Filter timestep for reward (should match env dt)
@@ -87,6 +91,25 @@ class LongitudinalEnvConfig:
     
     # Initial action randomization
     randomize_initial_action: bool = False  # If True, initialize the first previous action to a random value in [action_low, action_high]. If False, initialize to 0.0.
+    
+    # Sliding-window mean speed error penalty (bias elimination)
+    bias_penalty_enabled: bool = False  # Enable sliding-window mean error penalty
+    bias_penalty_window_s: float = 2.0  # Window length in seconds (T_window)
+    bias_penalty_weight: float = 0.0  # Weight for bias penalty (w_bias), typically 0.1-1.0 × track_weight
+    bias_penalty_v_scale: float = 15.0  # Speed scale for normalization (typical operating speed)
+    bias_penalty_v_ref_dot_threshold: float = 0.2  # Reference speed change threshold for gating (m/s²)
+    bias_penalty_a_threshold: float = 0.3  # Vehicle acceleration threshold for gating (m/s²)
+    
+    # Maximum absolute acceleration and jerk penalties (H-infinity norm)
+    max_acc_penalty_weight: float = 0.0  # Weight for maximum absolute acceleration penalty (only when |acc| > |target_acc|)
+    max_jerk_penalty_weight: float = 0.0  # Weight for maximum absolute jerk penalty (only when |jerk| > |target_jerk|)
+    
+    # LQR penalty mode (speed shaper integration)
+    lqr_penalty_enabled: bool = False  # Enable LQR penalty mode using speed shaper config
+    lqr_penalty_config_path: str | None = None  # Path to speed shaper config JSON file
+    lqr_error_weight: float = 0.1  # Global multiplier for LQR error (tracking) penalty
+    lqr_accel_weight: float = 0.1  # Global multiplier for LQR acceleration penalty
+    lqr_jerk_weight: float = 0.1  # Global multiplier for LQR jerk penalty
     
     # Deprecated parameters (kept for backward compatibility with config files)
     force_initial_speed_zero: bool = False  # Ignored - new generator handles feasibility
@@ -125,6 +148,15 @@ class LongitudinalEnv(gym.Env):
             self._reference_callable = reference_generator
 
         self.preview_steps = max(int(round(self.config.preview_horizon_s / self.config.dt)), 1)
+        
+        # Validate reward filter lookahead doesn't exceed preview horizon
+        if self.config.reward_filter_use_lookahead:
+            if self.config.reward_filter_lookahead_s > self.config.preview_horizon_s:
+                raise ValueError(
+                    f"reward_filter_lookahead_s ({self.config.reward_filter_lookahead_s}) "
+                    f"cannot exceed preview_horizon_s ({self.config.preview_horizon_s})"
+                )
+        
         if reference_generator is None:
             self.reference_generator = create_reference_generator(
                 dt=self.config.dt,
@@ -167,15 +199,24 @@ class LongitudinalEnv(gym.Env):
         self._prev_action: float = 0.0
         self._prev_accel: float = 0.0
         self._filtered_accel: float = 0.0  # Filtered acceleration for jerk calculation
+        self._prev_jerk: float = 0.0  # Previous jerk value (for last step continuity)
+        self._prev_target_jerk: float = 0.0  # Previous target jerk value (for last step continuity)
         self._last_state: ExtendedPlantState | None = None
         # Tracking variables for oscillation and overshoot penalties
         self._prev_action_sign: float = 0.0  # Previous smooth action sign for oscillation penalty
         self._prev_error: float = 0.0  # Previous tracking error for overshoot penalty
         self._prev_ref_speed: float = 0.0  # Previous reference speed for stationarity gate
         
-        # Initialize reward filter if violent profile mode is enabled
+        # Initialize sliding-window error buffer for bias penalty
+        self._bias_error_buffer: deque[float] | None = None
+        self._bias_window_steps: int = 0
+        if self.config.bias_penalty_enabled:
+            self._bias_window_steps = max(1, int(self.config.bias_penalty_window_s / self.config.dt))
+            self._bias_error_buffer = deque(maxlen=self._bias_window_steps)
+        
+        # Initialize reward filter if violent profile mode or filter reward mode is enabled
         self._reward_filter = None
-        if self.config.violent_profile_mode:
+        if self.config.violent_profile_mode or self.config.filter_reward_mode:
             from generator.lpf import SecondOrderLPF
             import torch
             # Create a single-element batch filter for reward filtering
@@ -193,6 +234,21 @@ class LongitudinalEnv(gym.Env):
                 jerk_max=jerk_max,
                 device=torch.device('cpu')
             )
+        
+        # Load LQR penalty configuration if enabled
+        self._lqr_config: 'ShaperConfig | None' = None
+        self._lqr_error_weights: np.ndarray | None = None
+        self._lqr_accel_weights: np.ndarray | None = None
+        self._lqr_jerk_weights: np.ndarray | None = None
+        
+        if self.config.lqr_penalty_enabled:
+            if not self.config.lqr_penalty_config_path:
+                raise ValueError("lqr_penalty_enabled=True but lqr_penalty_config_path not provided")
+            from speed_shaper.src.config_schema import ShaperConfig
+            from pathlib import Path
+            config_path = Path(self.config.lqr_penalty_config_path)
+            self._lqr_config = ShaperConfig.from_json(config_path)
+            # Weight schedules will be computed per-episode in reset()
 
     # ------------------------------------------------------------------
     # Gym API
@@ -286,8 +342,8 @@ class LongitudinalEnv(gym.Env):
             device = torch.device('cpu')
             vehicle = extended_params_to_vehicle_capabilities(self.extended_params, device=device)
             
-            # Update reward filter limits based on vehicle capabilities if violent mode is enabled
-            if self.config.violent_profile_mode and self._reward_filter is not None:
+            # Update reward filter limits based on vehicle capabilities if violent mode or filter reward mode is enabled
+            if (self.config.violent_profile_mode or self.config.filter_reward_mode) and self._reward_filter is not None:
                 # Compute vehicle-specific LPF limits
                 rate_max, rate_neg_max = self._compute_vehicle_lpf_limits(vehicle)
                 
@@ -330,29 +386,7 @@ class LongitudinalEnv(gym.Env):
             # Clamp raw profile to [0, v_max_feasible]
             self.raw_reference = np.clip(self.raw_reference, 0.0, v_max_feasible)
         
-        # Apply reward filter to raw profile if violent mode is enabled
-        if self.config.violent_profile_mode and self._reward_filter is not None:
-            # Filter the raw profile using the reward filter
-            import torch
-            raw_tensor = torch.from_numpy(self.raw_reference).unsqueeze(0)  # [1, T]
-            filtered_tensor = torch.zeros_like(raw_tensor)
-            
-            # Reset filter state with initial value from raw profile
-            initial_y = torch.tensor([[self.raw_reference[0]]], device=torch.device('cpu'), dtype=torch.float32)
-            self._reward_filter.reset(initial_y=initial_y)
-            
-            # Process each timestep through the filter
-            for t in range(len(self.raw_reference)):
-                u_t = raw_tensor[:, t:t+1]  # [1, 1]
-                filtered_y = self._reward_filter.update(u_t)
-                filtered_tensor[:, t] = filtered_y.squeeze(0)
-            
-            self.filtered_reference = filtered_tensor.squeeze(0).cpu().numpy().astype(np.float32)
-        elif self.filtered_reference is None:
-            # Fallback: if filtered_reference not set, use reference (for backward compatibility)
-            self.filtered_reference = self.reference.copy() if self.reference is not None else None
-        
-        # Set reference based on mode: raw for violent mode, filtered otherwise
+        # Set reference based on mode (before determining initial speed)
         if self.config.violent_profile_mode:
             self.reference = self.raw_reference
         else:
@@ -376,23 +410,143 @@ class LongitudinalEnv(gym.Env):
             # Default behavior
             initial_speed = self.reference[0]
         
+        # Apply reward filter based on mode (after initial speed is determined)
+        # Initialize filter with vehicle's initial speed for smooth error closure
+        if self.config.filter_reward_mode and self._reward_filter is not None:
+            # Filter reward mode: filter the standard generator profile for reward calculation
+            # Standard filtered_profile is used for observations, filtered version for rewards
+            import torch
+            standard_profile_tensor = torch.from_numpy(self.filtered_reference).unsqueeze(0)  # [1, T]
+            filtered_tensor = torch.zeros_like(standard_profile_tensor)
+            
+            # Reset filter state with vehicle's initial speed (not reference speed)
+            # This ensures smooth closure of initial speed error
+            initial_y = torch.tensor([[initial_speed]], device=torch.device('cpu'), dtype=torch.float32)
+            self._reward_filter.reset(initial_y=initial_y)
+            
+            # Determine look-ahead steps (within preview horizon)
+            lookahead_steps = 0
+            if self.config.reward_filter_use_lookahead:
+                # Convert lookahead time to steps, but don't exceed preview horizon
+                lookahead_steps_float = self.config.reward_filter_lookahead_s / self.config.dt
+                max_lookahead_steps = min(self.preview_steps, len(self.filtered_reference) - 1)
+                lookahead_steps = min(int(lookahead_steps_float), max_lookahead_steps)
+            
+            # Process each timestep through the filter
+            for t in range(len(self.filtered_reference)):
+                # Use look-ahead reference if enabled, otherwise use current-time reference
+                if self.config.reward_filter_use_lookahead and t + lookahead_steps < len(self.filtered_reference):
+                    input_idx = t + lookahead_steps
+                else:
+                    input_idx = t
+                
+                u_t = standard_profile_tensor[:, input_idx:input_idx+1]  # [1, 1]
+                filtered_y = self._reward_filter.update(u_t)
+                filtered_tensor[:, t] = filtered_y.squeeze(0)
+            
+            # Store original filtered profile for observations, filtered version for rewards
+            self._observation_reference = self.filtered_reference.copy()  # Standard profile for observations
+            self.filtered_reference = filtered_tensor.squeeze(0).cpu().numpy().astype(np.float32)  # Filtered for rewards
+            self.reference = self._observation_reference  # Use standard profile for observations
+        elif self.config.violent_profile_mode and self._reward_filter is not None:
+            # Violent mode: filter the raw profile using the reward filter
+            import torch
+            raw_tensor = torch.from_numpy(self.raw_reference).unsqueeze(0)  # [1, T]
+            filtered_tensor = torch.zeros_like(raw_tensor)
+            
+            # Reset filter state with vehicle's initial speed (not reference speed)
+            # This ensures smooth closure of initial speed error
+            initial_y = torch.tensor([[initial_speed]], device=torch.device('cpu'), dtype=torch.float32)
+            self._reward_filter.reset(initial_y=initial_y)
+            
+            # Determine look-ahead steps (within preview horizon)
+            lookahead_steps = 0
+            if self.config.reward_filter_use_lookahead:
+                # Convert lookahead time to steps, but don't exceed preview horizon
+                lookahead_steps_float = self.config.reward_filter_lookahead_s / self.config.dt
+                max_lookahead_steps = min(self.preview_steps, len(self.raw_reference) - 1)
+                lookahead_steps = min(int(lookahead_steps_float), max_lookahead_steps)
+            
+            # Process each timestep through the filter
+            for t in range(len(self.raw_reference)):
+                # Use look-ahead reference if enabled, otherwise use current-time reference
+                if self.config.reward_filter_use_lookahead and t + lookahead_steps < len(self.raw_reference):
+                    input_idx = t + lookahead_steps
+                else:
+                    input_idx = t
+                
+                u_t = raw_tensor[:, input_idx:input_idx+1]  # [1, 1]
+                filtered_y = self._reward_filter.update(u_t)
+                filtered_tensor[:, t] = filtered_y.squeeze(0)
+            
+            self.filtered_reference = filtered_tensor.squeeze(0).cpu().numpy().astype(np.float32)
+            self.reference = self.raw_reference  # Use raw profile for observations
+        elif self.filtered_reference is None:
+            # Fallback: if filtered_reference not set, use reference (for backward compatibility)
+            self.filtered_reference = self.reference.copy() if self.reference is not None else None
+            self.reference = self.filtered_reference
+        else:
+            # Normal mode: use filtered profile for both observations and rewards
+            self.reference = self.filtered_reference
+        
         self.speed = initial_speed  # No clamping - allow negative speeds if sampled
         self.prev_speed = self.speed  # Start with consistent prev_speed
         self._prev_prev_speed = self.speed  # Initialize speed history to initial speed
         self.position = 0.0
-        # Initialize previous action: randomize if enabled, otherwise use 0.0
-        if self.config.randomize_initial_action:
+        # Initialize previous action: explicit override > randomization > default
+        if "initial_action" in options:
+            # Explicit override - use provided value
+            self._prev_action = float(options["initial_action"])
+        elif self.config.randomize_initial_action:
             self._prev_action = self._rng.uniform(self.config.action_low, self.config.action_high)
         else:
             self._prev_action = 0.0
         self._prev_accel = 0.0  # Start with zero acceleration
         self._filtered_accel = 0.0  # Start filtered accel at zero
+        self._prev_jerk = 0.0  # Start with zero jerk
+        self._prev_target_jerk = 0.0  # Start with zero target jerk
         # Initialize tracking variables for oscillation and overshoot penalties
         self._prev_action_sign = 0.0
         self._prev_error = 0.0
         self._prev_ref_speed = float(self.reference[0]) if len(self.reference) > 0 else 0.0
         self._ref_idx = 0
+        
+        # Reset max acceleration and jerk tracking
+        self._max_abs_acc_exceeding_target = 0.0
+        self._max_abs_jerk_exceeding_target = 0.0
+        self._prev_target_accel = 0.0
         self._step_count = 0
+        
+        # Reset bias error buffer
+        if self._bias_error_buffer is not None:
+            self._bias_error_buffer.clear()
+        
+        # Compute LQR penalty weight schedules if enabled
+        if self._lqr_config is not None:
+            from speed_shaper.src.shaper_math import weight_schedule
+            episode_length = len(self.reference)
+            t_array = np.arange(episode_length) * self.config.dt
+            
+            # Compute time-varying weights for error, acceleration, and jerk
+            self._lqr_error_weights = weight_schedule(
+                t_array,
+                self._lqr_config.wE_start,
+                self._lqr_config.wE_end,
+                self._lqr_config.lamE
+            )
+            self._lqr_accel_weights = weight_schedule(
+                t_array,
+                self._lqr_config.wA_start,
+                self._lqr_config.wA_end,
+                self._lqr_config.lamA
+            )
+            self._lqr_jerk_weights = weight_schedule(
+                t_array,
+                self._lqr_config.wJ_start,
+                self._lqr_config.wJ_end,
+                self._lqr_config.lamJ
+            )
+        
         if self.config.use_extended_plant:
             self.extended = ExtendedPlant(self.extended_params)
             self._last_state = self.extended.reset(speed=self.speed, position=self.position)
@@ -444,8 +598,49 @@ class LongitudinalEnv(gym.Env):
         alpha = self.config.accel_filter_alpha
         self._filtered_accel = alpha * accel + (1 - alpha) * self._filtered_accel
 
+        # Check if this is the first or last step of the episode
+        is_first_step = bool(self._step_count == 0)  # First call to step() has _step_count=0
+        is_last_step = bool((self._step_count + 1) >= self.config.max_episode_steps)
+        
         # Compute jerk from filtered acceleration
-        jerk = (self._filtered_accel - self._prev_accel) / max(self.config.dt, 1e-6)
+        # At the first step: jerk is an initialization artifact (prev_accel=0), so set to 0
+        # At the last step: use the previous step's jerk value for continuity
+        if is_first_step:
+            jerk = 0.0  # First step jerk is initialization artifact
+        elif is_last_step:
+            jerk = self._prev_jerk  # Last step uses previous jerk for continuity
+        else:
+            jerk = (self._filtered_accel - self._prev_accel) / max(self.config.dt, 1e-6)
+        
+        # Compute target acceleration and jerk from reference profile
+        current_ref = float(self.filtered_reference[self._ref_idx])
+        prev_ref_idx = max(0, self._ref_idx - 1)
+        prev_ref = float(self.filtered_reference[prev_ref_idx])
+        target_accel = (current_ref - prev_ref) / max(self.config.dt, 1e-6)
+        
+        # Compute target jerk from target acceleration change
+        # At the first step: target jerk is 0 (initialization)
+        # At the last step: use the previous step's target jerk value for continuity
+        if is_first_step:
+            target_jerk = 0.0  # First step target jerk is initialization
+        elif is_last_step:
+            target_jerk = self._prev_target_jerk  # Last step uses previous target jerk
+        else:
+            target_jerk = (target_accel - self._prev_target_accel) / max(self.config.dt, 1e-6)
+        self._prev_target_accel = target_accel
+        
+        # Track maximum absolute acceleration and jerk (only when exceeding target)
+        # Skip tracking at first and last steps since they involve initialization/boundary artifacts
+        if not is_first_step and not is_last_step:
+            abs_acc = abs(self._filtered_accel)
+            abs_target_acc = abs(target_accel)
+            if abs_acc > abs_target_acc:
+                self._max_abs_acc_exceeding_target = max(self._max_abs_acc_exceeding_target, abs_acc)
+            
+            abs_jerk_val = abs(jerk)
+            abs_target_jerk = abs(target_jerk)
+            if abs_jerk_val > abs_target_jerk:
+                self._max_abs_jerk_exceeding_target = max(self._max_abs_jerk_exceeding_target, abs_jerk_val)
 
         # Update speed and position (only for simple plant, extended plant handles this internally)
         if not self.config.use_extended_plant:
@@ -473,22 +668,85 @@ class LongitudinalEnv(gym.Env):
             self._last_state = plant_state
 
         # Current speed tracking penalty - always use filtered reference for reward
+        # Normalize by episode length to match scale of single-value penalties (like max_acc_penalty)
         assert self.filtered_reference is not None
         current_filtered_ref = float(self.filtered_reference[self._ref_idx])
         speed_error = self.speed - current_filtered_ref
-        tracking_error_penalty = -self.config.track_weight * (speed_error**2)
+        
+        # Standard tracking error penalty (using track_weight)
+        tracking_error_penalty = -self.config.track_weight * (speed_error**2) / self.config.max_episode_steps
         reward = tracking_error_penalty
 
         # Track reward components for animation/debugging
         reward_components = {
             'tracking_error': tracking_error_penalty,
+            'bias_penalty': 0.0,
             'jerk_penalty': 0.0,
             'action_penalty': 0.0,
             'smooth_action_penalty': 0.0,
             'horizon_penalty': 0.0,
             'oscillation_penalty': 0.0,
             'overshoot_penalty': 0.0,
+            'max_acc_penalty': 0.0,
+            'max_jerk_penalty': 0.0,
+            'lqr_error_penalty': 0.0,
+            'lqr_accel_penalty': 0.0,
+            'lqr_jerk_penalty': 0.0,
+            'negative_speed_penalty': 0.0,
+            'zero_speed_error_penalty': 0.0,
+            'zero_speed_throttle_penalty': 0.0,
         }
+        
+        # LQR error penalty (additive to standard tracking error penalty)
+        if self._lqr_config is not None and self._lqr_error_weights is not None:
+            # Ensure we have valid weights for current timestep
+            if self._ref_idx < len(self._lqr_error_weights):
+                # Get time-varying error weight for current timestep
+                w_error_lqr = self._lqr_error_weights[self._ref_idx]
+                
+                # Error penalty (use speed error squared)
+                # Normalize by episode length to match scale of single-value penalties
+                lqr_error_penalty = (
+                    -self.config.lqr_error_weight
+                    * w_error_lqr
+                    * (speed_error ** 2)
+                    / self.config.max_episode_steps
+                )
+                reward += lqr_error_penalty
+                reward_components['lqr_error_penalty'] = lqr_error_penalty
+        
+        # Sliding-window mean speed error penalty (bias elimination)
+        if self.config.bias_penalty_enabled and self._bias_error_buffer is not None:
+            # Add current error to buffer
+            self._bias_error_buffer.append(speed_error)
+            
+            # Compute mean error only when buffer is full
+            if len(self._bias_error_buffer) == self._bias_window_steps:
+                e_mean = sum(self._bias_error_buffer) / self._bias_window_steps
+                
+                # Normalize by speed scale
+                e_mean_norm = e_mean / self.config.bias_penalty_v_scale
+                
+                # Gate: only apply penalty during steady-state conditions
+                # Check if reference speed is approximately constant
+                prev_ref_idx = max(0, self._ref_idx - 1)
+                prev_ref = float(self.filtered_reference[prev_ref_idx])
+                ref_rate = abs(current_filtered_ref - prev_ref) / max(self.config.dt, 1e-6)
+                
+                # Check if vehicle acceleration is small
+                vehicle_accel = abs(self._filtered_accel)
+                
+                # Steady-state condition: constant reference and small acceleration
+                steady_state = (
+                    ref_rate < self.config.bias_penalty_v_ref_dot_threshold and
+                    vehicle_accel < self.config.bias_penalty_a_threshold
+                )
+                
+                if steady_state:
+                    # Apply bias penalty (normalize by episode length to match scale of single-value penalties)
+                    bias_penalty = -self.config.bias_penalty_weight * (e_mean_norm ** 2) / self.config.max_episode_steps
+                    reward += bias_penalty
+                    reward_components['bias_penalty'] = bias_penalty
 
         # Horizon penalty: encourage anticipation of future speed changes
         # Penalize deviations from future reference speeds with exponential decay
@@ -508,40 +766,90 @@ class LongitudinalEnv(gym.Env):
                 # Apply exponential decay for future timesteps
                 decay_factor *= self.config.horizon_penalty_decay
 
-            horizon_penalty_scaled = self.config.horizon_penalty_weight * horizon_penalty
+            # Normalize by episode length to match scale of single-value penalties
+            horizon_penalty_scaled = self.config.horizon_penalty_weight * horizon_penalty / self.config.max_episode_steps
             reward += horizon_penalty_scaled
             reward_components['horizon_penalty'] = horizon_penalty_scaled
 
         # Other penalties (comfort penalties use annealing multiplier)
+        # Normalize by episode length to match scale of single-value penalties
+        # Skip jerk penalty at first and last steps (initialization and boundary artifacts)
         comfort_mult = self.get_comfort_anneal_multiplier()
-        jerk_penalty = -comfort_mult * self.config.jerk_weight * abs(jerk)
+        if is_first_step or is_last_step:
+            jerk_penalty = 0.0  # No jerk penalty at first/last step
+        else:
+            jerk_penalty = -comfort_mult * self.config.jerk_weight * abs(jerk) / self.config.max_episode_steps
         reward += jerk_penalty
         reward_components['jerk_penalty'] = jerk_penalty
         
-        action_penalty = -self.config.action_weight * (abs(action_value))
+        action_penalty = -self.config.action_weight * (abs(action_value)) / self.config.max_episode_steps
         reward += action_penalty
         reward_components['action_penalty'] = action_penalty
         
-        smooth_action_penalty = -comfort_mult * self.config.smooth_action_weight * abs(action_value - self._prev_action)
+        # Skip smooth action penalty at the last step since there's no next action to compare to
+        if is_last_step:
+            smooth_action_penalty = 0.0  # No smooth action penalty at last step (no transition)
+        else:
+            smooth_action_penalty = -comfort_mult * self.config.smooth_action_weight * abs(action_value - self._prev_action) / self.config.max_episode_steps
         reward += smooth_action_penalty
         reward_components['smooth_action_penalty'] = smooth_action_penalty
         
+        # LQR acceleration and jerk penalties (additive to existing penalties)
+        if self._lqr_config is not None and self._lqr_accel_weights is not None:
+            # Ensure we have valid weights for current timestep
+            if self._ref_idx < len(self._lqr_accel_weights):
+                # Get time-varying weights for current timestep
+                w_accel_lqr = self._lqr_accel_weights[self._ref_idx]
+                w_jerk_lqr = self._lqr_jerk_weights[self._ref_idx]
+                
+                # Acceleration penalty (use filtered acceleration)
+                # Normalize by episode length to match scale of single-value penalties
+                lqr_accel_penalty = (
+                    -self.config.lqr_accel_weight
+                    * w_accel_lqr
+                    * (self._filtered_accel ** 2)
+                    / self.config.max_episode_steps
+                )
+                reward += lqr_accel_penalty
+                reward_components['lqr_accel_penalty'] = lqr_accel_penalty
+                
+                # Jerk penalty (skip at first/last steps like existing jerk penalty)
+                if not is_first_step and not is_last_step:
+                    lqr_jerk_penalty = (
+                        -self.config.lqr_jerk_weight
+                        * w_jerk_lqr
+                        * (jerk ** 2)
+                        / self.config.max_episode_steps
+                    )
+                    reward += lqr_jerk_penalty
+                    reward_components['lqr_jerk_penalty'] = lqr_jerk_penalty
+                # else: lqr_jerk_penalty already initialized to 0.0 in reward_components
+        
         if self.config.use_extended_plant and plant_state is not None:
-            reward -= self.config.brake_weight * abs(plant_state.brake_torque)
+            # Normalize by episode length to match scale of single-value penalties
+            reward -= self.config.brake_weight * abs(plant_state.brake_torque) / self.config.max_episode_steps
 
-        # Negative speed penalty
+        # Negative speed penalty (normalize by episode length)
         if self.speed < 0.0:
-            reward -= self.config.negative_speed_weight * abs(self.speed)
+            negative_speed_penalty = -self.config.negative_speed_weight * abs(self.speed) / self.config.max_episode_steps
+            reward += negative_speed_penalty
+            reward_components['negative_speed_penalty'] = negative_speed_penalty
         
         # Zero-speed penalties: when target speed is 0 (use filtered reference for reward)
         current_ref = float(self.filtered_reference[self._ref_idx])
         if abs(current_ref) < 1e-6:  # Target speed is 0 (with epsilon for floating point)
             # Penalty for speed error when target is 0 (only if vehicle is moving)
+            # Normalize by episode length to match scale of single-value penalties
             if self.speed > 0.0:
-                reward -= self.config.zero_speed_error_weight * abs(self.speed)
+                zero_speed_error_penalty = -self.config.zero_speed_error_weight * abs(self.speed) / self.config.max_episode_steps
+                reward += zero_speed_error_penalty
+                reward_components['zero_speed_error_penalty'] = zero_speed_error_penalty
             # Penalty for throttle usage when target is 0 (constant penalty for any positive action)
+            # Normalize by episode length to match scale of single-value penalties
             if action_value > 0.0:
-                reward -= self.config.zero_speed_throttle_weight
+                zero_speed_throttle_penalty = -self.config.zero_speed_throttle_weight / self.config.max_episode_steps
+                reward += zero_speed_throttle_penalty
+                reward_components['zero_speed_throttle_penalty'] = zero_speed_throttle_penalty
         
         # Oscillation and overshoot penalties (from oscillation_and_overshoot_penalties_for_rl_longitudinal_control.md)
         if self.config.oscillation_weight > 0.0 or self.config.overshoot_weight > 0.0:
@@ -567,12 +875,13 @@ class LongitudinalEnv(gym.Env):
                 ref_scale = self.config.oscillation_ref_scale
                 stationarity_gate = np.exp(-ref_rate / ref_scale)
                 
-                # Final oscillation penalty
+                # Final oscillation penalty (normalize by episode length to match scale of single-value penalties)
                 oscillation_penalty = (
                     -self.config.oscillation_weight
                     * switching_energy
                     * proximity_gate
                     * stationarity_gate
+                    / self.config.max_episode_steps
                 )
                 reward += oscillation_penalty
                 reward_components['oscillation_penalty'] = oscillation_penalty
@@ -596,12 +905,13 @@ class LongitudinalEnv(gym.Env):
                 error_scale = self.config.oscillation_error_scale
                 proximity_gate = np.exp(-np.abs(current_error) / error_scale)
                 
-                # Final overshoot penalty
+                # Final overshoot penalty (normalize by episode length to match scale of single-value penalties)
                 overshoot_penalty = (
                     -self.config.overshoot_weight
                     * (error_rate ** 2)
                     * crossing_gate
                     * proximity_gate
+                    / self.config.max_episode_steps
                 )
                 reward += overshoot_penalty
                 reward_components['overshoot_penalty'] = overshoot_penalty
@@ -612,11 +922,45 @@ class LongitudinalEnv(gym.Env):
             self._prev_error = current_error
             self._prev_ref_speed = current_ref
         
+        # Apply maximum absolute acceleration and jerk penalties at episode end
+        terminated = False
+        truncated = bool(self._step_count >= self.config.max_episode_steps)
+        
+        if truncated:
+            # Episode ended - apply penalties based on maximum values
+            if self.config.max_acc_penalty_weight > 0.0:
+                max_acc_penalty = -self.config.max_acc_penalty_weight * (self._max_abs_acc_exceeding_target ** 2)
+                reward += max_acc_penalty
+                reward_components['max_acc_penalty'] = max_acc_penalty
+            
+            if self.config.max_jerk_penalty_weight > 0.0:
+                max_jerk_penalty = -self.config.max_jerk_penalty_weight * (self._max_abs_jerk_exceeding_target ** 2)
+                reward += max_jerk_penalty
+                reward_components['max_jerk_penalty'] = max_jerk_penalty
+        
+        # Check if episode will end after this step
+        will_truncate = bool((self._step_count + 1) >= self.config.max_episode_steps)
+        
+        # Apply maximum absolute acceleration and jerk penalties at episode end
+        if will_truncate:
+            # Episode ending - apply penalties based on maximum values
+            if self.config.max_acc_penalty_weight > 0.0:
+                max_acc_penalty = -self.config.max_acc_penalty_weight * (self._max_abs_acc_exceeding_target ** 2)
+                reward += max_acc_penalty
+                reward_components['max_acc_penalty'] = max_acc_penalty
+            
+            if self.config.max_jerk_penalty_weight > 0.0:
+                max_jerk_penalty = -self.config.max_jerk_penalty_weight * (self._max_abs_jerk_exceeding_target ** 2)
+                reward += max_jerk_penalty
+                reward_components['max_jerk_penalty'] = max_jerk_penalty
+        
         reward = float(np.clip(reward, -self.config.base_reward_clip, self.config.base_reward_clip))
 
         self._prev_prev_speed = self.prev_speed  # Shift speed history back
         self.prev_speed = self.speed
         self._prev_accel = self._filtered_accel  # Use filtered accel for jerk calculation consistency
+        self._prev_jerk = jerk  # Store current jerk for next step (or last step continuity)
+        self._prev_target_jerk = target_jerk  # Store current target jerk for next step (or last step continuity)
         self._prev_action = action_value
         self._step_count += 1
 
@@ -693,7 +1037,14 @@ class LongitudinalEnv(gym.Env):
                 import torch
                 device = torch.device('cpu')  # Generator uses CPU by default
                 vehicle = extended_params_to_vehicle_capabilities(self.extended_params, device=device)
-            result = self.reference_generator.sample(length, self._rng, vehicle=vehicle)
+            
+            # Try calling with vehicle parameter, fall back to old interface if not supported
+            try:
+                result = self.reference_generator.sample(length, self._rng, vehicle=vehicle)
+            except TypeError:
+                # Old generator interface without vehicle parameter
+                result = self.reference_generator.sample(length, self._rng)
+            
             if isinstance(result, tuple) and len(result) == 3:
                 # New interface: returns (filtered_profile, grade_profile, raw_profile)
                 filtered_profile, grade_profile, raw_profile = result

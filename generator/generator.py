@@ -44,6 +44,7 @@ class GeneratorConfig:
     p_zero_stop: float = 0.08
     v_min: float = 0.0
     v_max_sample: float = 30.0
+    speed_beta: float = 1.0  # Beta distribution parameter for speed sampling (higher = more small speeds, 1.0 = uniform)
     t_min: float = 2.0
     t_max: float = 12.0
     stop_hold_min: float = 1.0
@@ -178,6 +179,7 @@ class BatchTargetGenerator:
 
         # Create parameter objects
         self.generator_params = GeneratorParams(
+            speed_beta=self.config.speed_beta,
             p_change=config.p_change,
             p_zero_stop=config.p_zero_stop,
             v_min=config.v_min,
@@ -191,12 +193,14 @@ class BatchTargetGenerator:
 
     def generate_batch(
         self,
-        vehicle: VehicleCapabilities
+        vehicle: VehicleCapabilities,
+        initial_speed: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate a batch of target speed sequences.
 
         Args:
             vehicle: Vehicle capabilities [B] tensors
+            initial_speed: Optional initial speed for each batch element [B]. If None, samples random speeds.
 
         Returns:
             Tuple of (targets, grades, raw_targets) tensors:
@@ -216,6 +220,20 @@ class BatchTargetGenerator:
         v_max_feasible = self.config.speed_limit_safety_factor * v_max_theoretical
         zero_tensor = torch.tensor(0.0, device=self.device)  # Reusable zero tensor
 
+        # Sample initial speed if not provided, constrained to vehicle-feasible range
+        if initial_speed is None:
+            # Sample random initial speeds within [v_min, min(v_max_sample, v_max_feasible)]
+            # Use v_max_sample as the upper limit to keep initial speeds within reasonable operating range
+            v_max_for_sampling = torch.minimum(
+                torch.full_like(v_max_feasible, self.config.v_max_sample),
+                v_max_feasible
+            )
+            initial_speed = torch.rand(B, device=self.device) * (v_max_for_sampling - self.config.v_min) + self.config.v_min
+            initial_speed = torch.clamp(initial_speed, min=zero_tensor, max=v_max_feasible)
+        else:
+            # Ensure provided initial speed is within vehicle-feasible range
+            initial_speed = torch.clamp(initial_speed, min=zero_tensor, max=v_max_feasible)
+
         # Initialize LPF states for each batch element with vehicle-specific limits
         # Convert scalar jerk_max to tensor
         jerk_max_tensor = torch.full((B,), self.config.jerk_max, device=self.device)
@@ -230,6 +248,9 @@ class BatchTargetGenerator:
             jerk_max=jerk_max_tensor,   # Convert to tensor
             device=self.device
         )
+        
+        # Reset LPF with the initial speed
+        lpf.reset(initial_y=initial_speed, initial_r=None)
 
         # Reuse feasibility parameters across steps
         feasibility_params = FeasibilityParams()
@@ -259,6 +280,9 @@ class BatchTargetGenerator:
         # Initialize output tensors
         targets = torch.zeros(B, T, H, device=self.device)
         raw_targets = torch.zeros(B, T, H, device=self.device)  # Track raw (unfiltered) targets
+
+        # Store the initial speed for direct assignment at t=0
+        exact_initial_speed = initial_speed.clone()
 
         # Simulation time
         t_now = 0.0
@@ -392,24 +416,98 @@ class BatchTargetGenerator:
             lpf.rate_neg_max = original_rate_neg_max
             lpf.jerk_max = original_jerk_max
 
-            # Store raw target (u_target) for all horizon steps (for violent profile mode)
-            raw_target_window = u_target.unsqueeze(-1).expand(-1, H)  # [B, H] - repeat u_target for all H steps
+            # Generate raw profile using a separate LPF with config limits
+            # This ensures the raw profile respects the configured limits even in violent mode
+            # Use config limits for raw profile generation (not vehicle-based limits)
+            raw_rate_max = torch.full((B,), self.config.rate_max_limit, device=self.device)
+            raw_rate_neg_max = torch.full((B,), self.config.rate_neg_max_limit, device=self.device)
+            raw_jerk_max = torch.full((B,), self.config.jerk_max, device=self.device)
             
-            # Generate raw H-step lookahead by simulating LPF for H steps
-            # Use the same stochastic bounds for the entire lookahead window
-            y_h = lpf.y.clone()
-            r_h = lpf.r.clone()
+            # For raw profile, use a separate LPF state that tracks the raw profile
+            # Initialize from raw_lpf state if this is the first step
+            if t == 0:
+                # Initialize raw LPF state to match initial speed
+                raw_y = exact_initial_speed.clone()
+                raw_r = torch.zeros_like(raw_y)  # Zero initial rate
+            
+            # Step the raw LPF once for this timestep (not H times)
+            # Check if we need to plan a smooth stop (approaching 0 with negative rate)
+            approaching_zero = (raw_y < 0.5) & (raw_r < -0.1) & (u_target < 0.1)
+            if approaching_zero.any():
+                # Plan smooth stop: compute required deceleration to stop at v=0
+                # Using v^2 = v0^2 + 2*a*d, where d is distance to stop
+                # For smooth stop: a = -v^2 / (2*d) where d = v*t_stop
+                # With jerk constraint, we need to reduce deceleration gradually
+                # Time to stop with current deceleration: t = v / |a|
+                # But we need to reduce deceleration to 0 over this time, respecting jerk
+                
+                # Compute minimum stopping distance with jerk constraint
+                # If we're decelerating at rate a, we need to reduce a to 0 over time t
+                # With jerk j, this takes time t = |a| / j
+                # Distance covered while reducing deceleration: integral of v(t) dt
+                
+                # Simplified approach: if we're close to 0, limit the deceleration
+                # so we can stop smoothly
+                stopping_distance = raw_y  # Approximate distance to stop
+                current_decel = -raw_r
+                
+                # Maximum deceleration that allows smooth stop with jerk constraint
+                # d = v^2 / (2*a) + a^2 / (2*j) (distance to stop + distance to reduce decel)
+                # Solving for a: a = sqrt(2 * j * d / 3) approximately
+                max_decel_for_smooth_stop = torch.sqrt(2 * raw_jerk_max * stopping_distance / 3)
+                max_decel_for_smooth_stop = torch.clamp(max_decel_for_smooth_stop, min=torch.zeros_like(max_decel_for_smooth_stop), max=raw_rate_neg_max)
+                
+                # Limit the current deceleration
+                limited_rate = torch.where(
+                    approaching_zero & (current_decel > max_decel_for_smooth_stop),
+                    -max_decel_for_smooth_stop,
+                    raw_r
+                )
+                raw_r = limited_rate
+            
+            raw_y_prev = raw_y.clone()
+            raw_y, raw_r = second_order_lpf_update(
+                raw_y, raw_r, u_target, lpf.dt, lpf.wc, lpf.zeta,
+                raw_rate_max, raw_rate_neg_max, raw_jerk_max, lpf.device
+            )
+            # Ensure speeds stay within feasible bounds
+            raw_y = torch.clamp(raw_y, min=zero_tensor, max=v_max_feasible)
+            # If speed hit 0, set rate to 0 as well
+            at_zero = (raw_y <= 0.0)
+            raw_r = torch.where(at_zero, torch.zeros_like(raw_r), raw_r)
+            
+            # Generate H-step lookahead window from current raw state
             raw_window = torch.zeros(B, H, device=self.device)
+            y_h = raw_y.clone()
+            r_h = raw_r.clone()
 
             for h in range(H):
-                # Use same u_target and stochastic bounds for lookahead
+                raw_window[:, h] = y_h
+                
+                # Check if we need to plan a smooth stop (approaching 0 with negative rate)
+                approaching_zero = (y_h < 0.5) & (r_h < -0.1) & (u_target < 0.1)
+                if approaching_zero.any():
+                    stopping_distance = y_h
+                    current_decel = -r_h
+                    max_decel_for_smooth_stop = torch.sqrt(2 * raw_jerk_max * stopping_distance / 3)
+                    max_decel_for_smooth_stop = torch.clamp(max_decel_for_smooth_stop, min=torch.zeros_like(max_decel_for_smooth_stop), max=raw_rate_neg_max)
+                    limited_rate = torch.where(
+                        approaching_zero & (current_decel > max_decel_for_smooth_stop),
+                        -max_decel_for_smooth_stop,
+                        r_h
+                    )
+                    r_h = limited_rate
+                
+                # Step for next horizon position
                 y_h, r_h = second_order_lpf_update(
                     y_h, r_h, u_target, lpf.dt, lpf.wc, lpf.zeta,
-                    rate_max, rate_neg_max, jerk_bound, lpf.device
+                    raw_rate_max, raw_rate_neg_max, raw_jerk_max, lpf.device
                 )
                 # Ensure speeds stay within feasible bounds during lookahead
                 y_h = torch.clamp(y_h, min=zero_tensor, max=v_max_feasible)
-                raw_window[:, h] = y_h
+                # If speed hit 0, set rate to 0 as well
+                at_zero = (y_h <= 0.0)
+                r_h = torch.where(at_zero, torch.zeros_like(r_h), r_h)
 
             # Since we've constrained targets, LPF input, and LPF output during generation,
             # the raw_window should already respect the max feasible speed limit.
@@ -447,7 +545,12 @@ class BatchTargetGenerator:
                 )
 
             targets[:, t, :] = feasible_window
-            raw_targets[:, t, :] = raw_target_window  # Store raw targets
+            raw_targets[:, t, :] = raw_window  # Store raw targets (filtered with config limits)
+            
+            # At t=0, ensure the first value matches the exact initial speed
+            if t == 0:
+                targets[:, 0, 0] = exact_initial_speed
+                raw_targets[:, 0, 0] = exact_initial_speed
 
             # Advance time
             t_now += self.config.dt

@@ -26,6 +26,28 @@ from tqdm.auto import tqdm
 from env.longitudinal_env import LongitudinalEnv, LongitudinalEnvConfig
 from utils.dynamics import RandomizationConfig
 
+# ClearML integration (optional)
+try:
+    import clearml
+    from utils.clearml_logger import (
+        init_clearml_task,
+        log_metrics,
+        log_config,
+        upload_plot,
+        upload_artifact,
+        close_task,
+    )
+    CLEARML_LOGGER_AVAILABLE = True
+except ImportError:
+    CLEARML_LOGGER_AVAILABLE = False
+    clearml = None
+    init_clearml_task = None
+    log_metrics = None
+    log_config = None
+    upload_plot = None
+    upload_artifact = None
+    close_task = None
+
 
 @dataclass(slots=True)
 class TrainingParams:
@@ -152,6 +174,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to checkpoint file to resume training from",
+    )
+    parser.add_argument(
+        "--disable-clearml",
+        action="store_true",
+        help="Disable ClearML logging even if ClearML is installed",
     )
     return parser.parse_args()
 
@@ -1245,10 +1272,10 @@ class SACTrainer:
         if self.cfg.output.save_latest:
             torch.save(state, self.cfg.output.dir / "latest.pt")
 
-        self.accelerator.print(f"[checkpoint] saved {ckpt_path}")
+        # Checkpoint saved silently (no print to avoid interrupting progress bar)
 
 
-def train(config: ConfigBundle) -> None:
+def train(config: ConfigBundle, disable_clearml: bool = False) -> None:
     accelerator = Accelerator()
     accelerator.init_trackers(
         project_name="sac_longitudinal",
@@ -1257,6 +1284,30 @@ def train(config: ConfigBundle) -> None:
             "num_train_timesteps": config.training.num_train_timesteps,
         },
     )
+    
+    # Initialize ClearML task
+    clearml_task = None
+    if not disable_clearml and CLEARML_LOGGER_AVAILABLE and init_clearml_task is not None and clearml is not None:
+        clearml_task = init_clearml_task(
+            task_name="SAC_Training",
+            project="RL_Longitudinal",
+            tags=["training", "sac"],
+            task_type=clearml.Task.TaskTypes.training,
+        )
+        if clearml_task:
+            # Log full config as hyperparameters
+            config_dict = {
+                "seed": config.seed,
+                "context_mode": config.context_mode,
+                "env": asdict(config.env),
+                "training": asdict(config.training),
+                "sysid": asdict(config.sysid) if config.sysid else None,
+                "dynamics_map": asdict(config.dynamics_map) if config.dynamics_map else None,
+                "output_dir": str(config.output.dir),
+                "fitted_params_path": config.fitted_params_path,
+                "fitted_spread_pct": config.fitted_spread_pct,
+            }
+            log_config(clearml_task, config_dict)
 
     # Build generator config with vehicle randomization
     generator_config = config.generator_config or {}
@@ -1332,7 +1383,7 @@ def train(config: ConfigBundle) -> None:
             
             # Apply reward filter to raw profile (as done in reset)
             if env._reward_filter is not None:
-                import torch
+                # torch already imported at module level
                 raw_tensor = torch.from_numpy(raw_profile).unsqueeze(0)  # [1, T]
                 filtered_by_reward_filter = torch.zeros_like(raw_tensor)
                 
@@ -1444,44 +1495,15 @@ def train(config: ConfigBundle) -> None:
             animation_history = load_animation_history(animation_output_dir)
         
         # Generate a fixed reference profile for consistent evaluation
-        # Create a deterministic profile that covers full speed range with acceleration and deceleration
+        # Use the same generator as training to ensure consistency and respect vehicle capabilities
         accelerator.print("[animation] Generating fixed reference profile for animation...")
         profile_length = config.env.max_episode_steps
-        max_speed = config.env.max_speed
-        dt = config.env.dt
         
-        # Create a profile: start low -> accelerate to max -> decelerate to low
-        # Split into 3 segments: acceleration (1/3), constant max (1/6), deceleration (1/2)
-        accel_steps = profile_length // 3
-        constant_steps = profile_length // 6
-        decel_steps = profile_length - accel_steps - constant_steps
-        
-        v_start = 2.0  # Start at low speed (m/s)
-        v_max = max_speed * 0.9  # Use 90% of max speed to ensure feasibility
-        v_end = 3.0  # End at low speed (m/s)
-        
-        # Generate acceleration segment (linear ramp)
-        accel_profile = np.linspace(v_start, v_max, accel_steps, dtype=np.float32)
-        
-        # Constant speed segment
-        constant_profile = np.full(constant_steps, v_max, dtype=np.float32)
-        
-        # Deceleration segment (linear ramp)
-        decel_profile = np.linspace(v_max, v_end, decel_steps, dtype=np.float32)
-        
-        # Combine segments
-        fixed_reference_for_animation = np.concatenate([accel_profile, constant_profile, decel_profile])
-        
-        # Ensure length matches exactly
-        if len(fixed_reference_for_animation) > profile_length:
-            fixed_reference_for_animation = fixed_reference_for_animation[:profile_length]
-        elif len(fixed_reference_for_animation) < profile_length:
-            # Pad with final value
-            padding = np.full(profile_length - len(fixed_reference_for_animation), 
-                            fixed_reference_for_animation[-1], dtype=np.float32)
-            fixed_reference_for_animation = np.concatenate([fixed_reference_for_animation, padding])
-        
-        # Note: grade_profile will be automatically set to zeros by the environment when using custom reference_profile
+        # Use eval_env's reference generator (same as training) with a fixed seed for reproducibility
+        # This ensures the profile respects vehicle capabilities and uses the same filtering/feasibility constraints
+        animation_seed = config.seed + 9999  # Use a different seed from training but fixed for consistency
+        eval_env._rng = np.random.default_rng(animation_seed)
+        fixed_reference_for_animation, _, _ = eval_env._generate_reference(profile_length)
         
         reference_initial_speed = float(fixed_reference_for_animation[0])
         reference_max_speed = float(np.max(fixed_reference_for_animation))
@@ -1492,18 +1514,26 @@ def train(config: ConfigBundle) -> None:
         
         # Generate initial speed errors for episodes (configurable via training.num_animation_episodes)
         num_animation_episodes = getattr(config.training, 'num_animation_episodes', 3)
+        # Default to -2, 0, 2 m/s errors for 3 episodes
         if num_animation_episodes == 1:
-            initial_speed_errors_for_animation = [0.5]
+            initial_speed_errors_for_animation = [0.0]
         elif num_animation_episodes == 2:
-            initial_speed_errors_for_animation = [0.5, 2.5]
+            initial_speed_errors_for_animation = [-1.0, 1.0]
         elif num_animation_episodes == 3:
-            initial_speed_errors_for_animation = [0.5, 1.5, 3.0]
+            initial_speed_errors_for_animation = [-2.0, 0.0, 2.0]
         else:
-            # For more episodes, distribute evenly from small to large
-            min_error = 0.3
-            max_error = 3.5
-            initial_speed_errors_for_animation = np.linspace(min_error, max_error, num_animation_episodes).tolist()
-        accelerator.print(f"[animation] Initial speed errors: {initial_speed_errors_for_animation}")
+            # For more episodes, distribute evenly from -2 to 2
+            initial_speed_errors_for_animation = np.linspace(-2.0, 2.0, num_animation_episodes).tolist()
+        
+        # Generate fixed initial actions for each episode (constant across training)
+        # Use a fixed seed to ensure reproducibility
+        action_rng = np.random.default_rng(animation_seed + 1000)
+        initial_actions_for_animation = []
+        for _ in range(num_animation_episodes):
+            # Sample initial actions uniformly from action space
+            initial_action = action_rng.uniform(config.env.action_low, config.env.action_high)
+            initial_actions_for_animation.append(float(initial_action))
+        accelerator.print(f"[animation] Initial actions: {initial_actions_for_animation}")
 
     # Load checkpoint if specified
     start_step = 0
@@ -1601,32 +1631,35 @@ def train(config: ConfigBundle) -> None:
             
             if step % config.training.log_interval == 0:
                 accelerator.log(metrics, step=step)
+                # Also log to ClearML
+                if clearml_task:
+                    log_metrics(clearml_task, metrics, step)
 
+        eval_metrics = None
         if step % config.training.eval_interval == 0:
             eval_metrics = trainer.evaluate()
             accelerator.log(eval_metrics, step=step)
-            accelerator.print(f"[eval] step={step} metrics={json.dumps(eval_metrics)}")
-            
-            # Create animation if enabled
-            if config.training.enable_animation and fixed_reference_for_animation is not None:
-                if step % config.training.animation_interval == 0:
-                    accelerator.print(f"[animation] Updating animation at step {step}...")
-                    num_animation_episodes = getattr(config.training, 'num_animation_episodes', 3)
-                    animation_path = create_training_animation(
-                        trainer=trainer,
-                        eval_env=eval_env,
-                        fixed_reference=fixed_reference_for_animation,
-                        output_dir=config.output.dir / "animations",
-                        step=step,
-                        animation_history=animation_history,
-                        max_history=50,
-                        initial_speed_errors=initial_speed_errors_for_animation,
-                        num_episodes=num_animation_episodes
-                    )
-                    if animation_path:
-                        accelerator.print(f"[animation] Animation saved to {animation_path}")
-                    else:
-                        accelerator.print(f"[animation] Animation displayed (interactive mode)")
+            # Also log eval metrics to ClearML
+            if clearml_task:
+                log_metrics(clearml_task, eval_metrics, step)
+        
+        # Create animation if enabled (independent of evaluation interval)
+        if config.training.enable_animation and fixed_reference_for_animation is not None:
+            if step % config.training.animation_interval == 0:
+                num_animation_episodes = getattr(config.training, 'num_animation_episodes', 3)
+                create_training_animation(
+                    trainer=trainer,
+                    eval_env=eval_env,
+                    fixed_reference=fixed_reference_for_animation,
+                    output_dir=config.output.dir / "animations",
+                    step=step,
+                    animation_history=animation_history,
+                    max_history=50,
+                    initial_speed_errors=initial_speed_errors_for_animation,
+                    initial_actions=initial_actions_for_animation,
+                    num_episodes=num_animation_episodes
+                )
+                # Note: Animation plots are not uploaded to ClearML during training to avoid slowdown
 
         if step % config.training.checkpoint_interval == 0:
             trainer.save_checkpoint(step)
@@ -1637,21 +1670,41 @@ def train(config: ConfigBundle) -> None:
             now = time.time()
             fps = config.training.log_interval / max(now - last_log, 1e-6)
             
-            # Build log message
-            log_msg = f"[train] step={step} reward={reward:.3f} buffer={trainer.replay_buffer.size} fps={fps:.1f}"
-            if config.sysid.enabled and "sysid/pred_loss" in metrics:
-                log_msg += f" sysid_loss={metrics['sysid/pred_loss']:.4f}"
+            # Update progress bar with all relevant info
+            postfix_dict = {
+                'reward': f"{reward:.2f}",
+                'buffer': trainer.replay_buffer.size,
+                'fps': f"{fps:.1f}",
+            }
             
-            accelerator.print(log_msg)
-            progress.set_postfix(
-                reward=f"{reward:.2f}",
-                buffer=trainer.replay_buffer.size,
-                fps=f"{fps:.1f}",
-                refresh=False,
-            )
+            # Add eval metrics if available
+            if eval_metrics:
+                if 'eval/avg_reward' in eval_metrics:
+                    postfix_dict['eval_reward'] = f"{eval_metrics['eval/avg_reward']:.2f}"
+                if 'eval/avg_abs_speed_error' in eval_metrics:
+                    postfix_dict['eval_error'] = f"{eval_metrics['eval/avg_abs_speed_error']:.3f}"
+            
+            # Add sysid loss if available
+            if config.sysid.enabled and "sysid/pred_loss" in metrics:
+                postfix_dict['sysid_loss'] = f"{metrics['sysid/pred_loss']:.4f}"
+            
+            progress.set_postfix(**postfix_dict, refresh=True)
             last_log = now
 
     trainer.save_checkpoint(config.training.num_train_timesteps)
+    
+    # Upload final checkpoint to ClearML
+    if clearml_task:
+        final_checkpoint_path = config.output.dir / f"sac_step_{config.training.num_train_timesteps}.pt"
+        if final_checkpoint_path.exists():
+            upload_artifact(
+                clearml_task,
+                final_checkpoint_path,
+                artifact_name="final_checkpoint",
+                description=f"Final checkpoint after {config.training.num_train_timesteps} training steps",
+            )
+        close_task(clearml_task)
+    
     progress.close()
     accelerator.end_training()
     accelerator.print("[done] training complete")
@@ -1661,7 +1714,7 @@ def main() -> None:
     args = parse_args()
     raw = load_config(args.config)
     bundle = build_config_bundle(raw, args)
-    train(bundle)
+    train(bundle, disable_clearml=args.disable_clearml)
 
 
 if __name__ == "__main__":

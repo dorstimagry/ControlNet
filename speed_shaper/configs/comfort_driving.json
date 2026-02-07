@@ -1,0 +1,24 @@
+{
+  "dt": 0.1,
+  "wE_start": 40.0,
+  "wE_end": 40.0,
+  "lamE": 1.0,
+  "wA_start": 10.0,
+  "wA_end": 10.0,
+  "lamA": 0.0,
+  "wJ_start": 2.0,
+  "wJ_end": 2.0,
+  "lamJ": 1.0,
+  "a_min": -2.0,
+  "a_max": 2.0,
+  "j_min": -2.0,
+  "j_max": 2.0,
+  "enable_accel_bounds": true,
+  "enable_jerk_bounds": true,
+  "enable_terminal_constraint": true,
+  "metadata": {
+    "profile_type": "random_smooth",
+    "description": "Speed shaper config for random_smooth profile",
+    "created_at": "2026-01-25T12:25:55.829136"
+  }
+}

@@ -11,6 +11,7 @@ class GeneratorParams:
     p_zero_stop: float = 0.08  # Probability of sampling zero speed target
     v_min: float = 0.0  # Minimum speed (m/s)
     v_max_sample: float = 30.0  # Maximum speed for sampling (m/s)
+    speed_beta: float = 1.0  # Beta distribution parameter for speed sampling (higher = more small speeds, 1.0 = uniform)
     t_min: float = 2.0  # Minimum arrival time (s)
     t_max: float = 12.0  # Maximum arrival time (s)
     stop_hold_min: float = 1.0  # Minimum dwell time for stops (s)
@@ -40,9 +41,17 @@ def sample_eventual_targets(
     is_zero = torch.rand(num_samples, device=device) < params.p_zero_stop
 
     # Sample non-zero targets
-    non_zero_targets = torch.rand(num_samples, device=device) * (
-        params.v_max_sample - params.v_min
-    ) + params.v_min
+    # Use Beta distribution to bias towards lower speeds if speed_beta > 1.0
+    if params.speed_beta > 1.0:
+        # Beta distribution (1.0, speed_beta) favors smaller values
+        beta_dist = torch.distributions.Beta(1.0, params.speed_beta)
+        speed_scale = beta_dist.sample([num_samples]).to(device)  # [0, 1]
+        non_zero_targets = speed_scale * (params.v_max_sample - params.v_min) + params.v_min
+    else:
+        # Uniform sampling (when speed_beta = 1.0)
+        non_zero_targets = torch.rand(num_samples, device=device) * (
+            params.v_max_sample - params.v_min
+        ) + params.v_min
 
     # If allowing negative speeds, randomly flip sign
     if params.allow_negative_speeds:

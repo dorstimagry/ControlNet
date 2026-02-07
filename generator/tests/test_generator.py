@@ -47,7 +47,7 @@ class TestBatchTargetGenerator:
         generator = BatchTargetGenerator(config, batch_size=2, episode_length=5)
         vehicle = self.create_test_vehicle(2)
 
-        targets, grades = generator.generate_batch(vehicle)
+        targets, grades, raw_targets = generator.generate_batch(vehicle)
 
         # Check output shapes
         assert targets.shape == (2, 5, 3)  # [B, T, H]
@@ -66,7 +66,7 @@ class TestBatchTargetGenerator:
         generator = BatchTargetGenerator(config, batch_size=1, episode_length=3)
         vehicle = self.create_test_vehicle(1)
 
-        targets, _ = generator.generate_batch(vehicle)
+        targets, _, _ = generator.generate_batch(vehicle)
 
         # The first element of each horizon should be consistent with the next step's first element
         # This is a basic consistency check
@@ -86,7 +86,7 @@ class TestBatchTargetGenerator:
         generator = BatchTargetGenerator(config, batch_size=1, episode_length=10)
         vehicle = self.create_test_vehicle(1)
 
-        targets, _ = generator.generate_batch(vehicle)
+        targets, _, _ = generator.generate_batch(vehicle)
 
         # Check speed bounds
         assert torch.all(targets >= 0)
@@ -109,7 +109,7 @@ class TestBatchTargetGenerator:
         generator = BatchTargetGenerator(config, batch_size=1, episode_length=20)
         vehicle = self.create_test_vehicle(1)
 
-        targets, _ = generator.generate_batch(vehicle)
+        targets, _, _ = generator.generate_batch(vehicle)
 
         # Should see some variation in the target speeds
         # Check that not all targets are identical
@@ -126,7 +126,7 @@ class TestBatchTargetGenerator:
         generator = BatchTargetGenerator(config, batch_size=batch_size, episode_length=3)
         vehicle = self.create_test_vehicle(batch_size)
 
-        targets, grades = generator.generate_batch(vehicle)
+        targets, grades, raw_targets = generator.generate_batch(vehicle)
 
         assert targets.shape == (batch_size, 3, 2)
         assert grades.shape == (batch_size, 3)
@@ -142,7 +142,7 @@ class TestBatchTargetGenerator:
         generator = BatchTargetGenerator(config, batch_size=10, episode_length=50)
         vehicle = self.create_test_vehicle(10)
 
-        targets, _ = generator.generate_batch(vehicle)
+        targets, _, _ = generator.generate_batch(vehicle)
 
         # Check if any episodes contain near-zero speeds
         min_speeds = torch.min(targets.view(10, -1), dim=1)[0]

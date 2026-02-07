@@ -35,6 +35,12 @@ def second_order_lpf_update(
     if device is None:
         device = y.device
 
+    # Store previous rate for jerk limiting
+    r_prev = r.clone()
+    
+    # Maximum allowed rate change in this timestep
+    max_rate_change = jerk_max * dt
+
     # Compute LPF parameters
     wc_LPO1 = 2 * zeta * wc  # [B]
     K = wc**2 / wc_LPO1      # [B]
@@ -49,9 +55,20 @@ def second_order_lpf_update(
     d_r_dt_clamped = torch.clamp(d_r_dt, -jerk_max, jerk_max)
 
     # Update rate
-    r = r + d_r_dt_clamped * dt
+    r_new = r + d_r_dt_clamped * dt
 
-    # Limit rate to bounds
+    # Limit rate to bounds, but respect jerk constraint
+    # If clamping would cause excessive jerk, limit the clamp
+    r_clamped = torch.clamp(r_new, -rate_neg_max, rate_max)
+    
+    # Compute the rate change that would result from clamping
+    rate_change = r_clamped - r_prev
+    
+    # Ensure rate change doesn't exceed jerk limit
+    rate_change_limited = torch.clamp(rate_change, -max_rate_change, max_rate_change)
+    r = r_prev + rate_change_limited
+    
+    # Final rate clamp (should be redundant but ensures safety)
     r = torch.clamp(r, -rate_neg_max, rate_max)
 
     # Integrate to get new value

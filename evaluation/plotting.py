@@ -50,6 +50,16 @@ def plot_sequence_diagnostics(
     reference = _to_numpy(trace["reference"])
     acceleration = _to_numpy(trace["acceleration"])
     jerk = _to_numpy(trace.get("jerk", np.zeros_like(time)))
+    
+    # Compute target acceleration and jerk from reference speed
+    # Use numpy.gradient which handles edge cases and variable spacing
+    if len(time) > 1:
+        target_acceleration = np.gradient(reference, time)  # Derivative of reference speed w.r.t. time
+        target_jerk = np.gradient(target_acceleration, time)  # Derivative of target acceleration w.r.t. time
+    else:
+        # Fallback for single point
+        target_acceleration = np.zeros_like(reference)
+        target_jerk = np.zeros_like(reference)
     V_cmd = _to_numpy(trace.get("V_cmd", np.zeros_like(time)))
     brake_torque = _to_numpy(trace.get("brake_torque", np.zeros_like(time)))
     brake_torque_max = float(trace.get("brake_torque_max", [10000.0])[0])  # Get max brake torque for this vehicle
@@ -128,14 +138,16 @@ def plot_sequence_diagnostics(
     axes[0].set_title("Speed Tracking")
 
     # 2. Acceleration
-    axes[1].plot(time, acceleration, label="Acceleration")
+    axes[1].plot(time, acceleration, label="Vehicle Acceleration", linewidth=2)
+    axes[1].plot(time, target_acceleration, label="Target Acceleration", linestyle="--", linewidth=1.5, alpha=0.7)
     axes[1].set_ylabel("Acceleration (m/s²)")
     axes[1].legend(loc="upper right")
     axes[1].grid(alpha=0.3)
     axes[1].set_title("Vehicle Acceleration")
 
     # 3. Jerk
-    axes[2].plot(time, jerk, label="Jerk")
+    axes[2].plot(time, jerk, label="Vehicle Jerk", linewidth=2)
+    axes[2].plot(time, target_jerk, label="Target Jerk", linestyle="--", linewidth=1.5, alpha=0.7)
     axes[2].set_ylabel("Jerk (m/s³)")
     axes[2].legend(loc="upper right")
     axes[2].grid(alpha=0.3)
@@ -233,10 +245,11 @@ def plot_sequence_diagnostics(
     fig.tight_layout(rect=(0, 0.02, 1, 0.98))
     _ensure_parent(output_path)
     fig.savefig(output_path, dpi=150)
-    plt.close(fig)
+    # Return figure instead of closing it so it can be uploaded to ClearML
+    return fig
 
 
-def plot_summary(metrics: list[Mapping[str, float]], output_path: Path) -> None:
+def plot_summary(metrics: list[Mapping[str, float]], output_path: Path):
     """Plot aggregate statistics across all sequences/episodes."""
 
     seq_ids = [str(m.get("sequence_id", idx)) for idx, m in enumerate(metrics)]
@@ -272,10 +285,11 @@ def plot_summary(metrics: list[Mapping[str, float]], output_path: Path) -> None:
     fig.tight_layout()
     _ensure_parent(output_path)
     fig.savefig(output_path, dpi=150)
-    plt.close(fig)
+    # Return figure instead of closing it so it can be uploaded to ClearML
+    return fig
 
 
-def plot_feasibility_diagnostics(trace: dict, vehicle_caps, output_path: Path) -> None:
+def plot_feasibility_diagnostics(trace: dict, vehicle_caps, output_path: Path):
     """Plot feasibility diagnostics for a profile.
 
     Args:
@@ -294,8 +308,7 @@ def plot_feasibility_diagnostics(trace: dict, vehicle_caps, output_path: Path) -
     time = np.arange(len(feasible_v)) * dt
 
     if len(original_v) == 0 or len(feasible_v) == 0:
-        plt.close(fig)
-        return
+        return fig
 
     # 1. Speed profiles comparison
     axes[0].plot(time, original_v, label="Original", color="#ff7f0e", linestyle="--", alpha=0.7)
@@ -371,10 +384,11 @@ def plot_feasibility_diagnostics(trace: dict, vehicle_caps, output_path: Path) -
     fig.tight_layout()
     _ensure_parent(output_path)
     fig.savefig(output_path, dpi=150)
-    plt.close(fig)
+    # Return figure instead of closing it so it can be uploaded to ClearML
+    return fig
 
 
-def plot_profile_statistics(traces: list[Mapping[str, object]], output_path: Path) -> None:
+def plot_profile_statistics(traces: list[Mapping[str, object]], output_path: Path):
     """Plot comprehensive statistics across all episodes.
     
     Includes:
@@ -541,14 +555,15 @@ def plot_profile_statistics(traces: list[Mapping[str, object]], output_path: Pat
     fig.tight_layout(rect=(0, 0, 1, 0.99))
     _ensure_parent(output_path)
     fig.savefig(output_path, dpi=150)
-    plt.close(fig)
+    # Return figure instead of closing it so it can be uploaded to ClearML
+    return fig
 
 
 def plot_z_latent_analysis(
     traces: list[dict],
     vehicle_params_log: list[dict],
     output_path: Path,
-) -> None:
+):
     """
     Analyze SysID latent z to verify it represents vehicle dynamics.
     
@@ -760,12 +775,13 @@ def plot_z_latent_analysis(
     fig.tight_layout(rect=(0, 0, 1, 0.99))
     _ensure_parent(output_path)
     fig.savefig(output_path, dpi=150)
-    plt.close(fig)
+    # Return figure instead of closing it so it can be uploaded to ClearML
+    return fig
     
     print(f"Z latent analysis saved to {output_path}")
 
 
-def plot_step_function_results(step_traces: list[dict], output_path: Path) -> None:
+def plot_step_function_results(step_traces: list[dict], output_path: Path):
     """Plot all step function evaluation results in a single figure with multiple subplots.
     
     Creates a 10x5 grid of subplots with alternating rows:
@@ -888,12 +904,13 @@ def plot_step_function_results(step_traces: list[dict], output_path: Path) -> No
     fig.tight_layout(rect=(0, 0, 1, 0.99))
     _ensure_parent(output_path)
     fig.savefig(output_path, dpi=150)
-    plt.close(fig)
+    # Return figure instead of closing it so it can be uploaded to ClearML
+    return fig
     
     print(f"Step function results plot saved to {output_path}")
 
 
-def plot_initial_error_analysis(initial_error_traces: list[dict], output_path: Path) -> None:
+def plot_initial_error_analysis(initial_error_traces: list[dict], output_path: Path):
     """Plot throttle/brake response to different initial speed errors.
     
     Creates a figure with 3 subplots:
@@ -982,6 +999,8 @@ def plot_initial_error_analysis(initial_error_traces: list[dict], output_path: P
     plt.close(fig)
     
     print(f"Initial error analysis plot saved to {output_path}")
+    # Return figure instead of closing it so it can be uploaded to ClearML
+    return fig
 
 
 __all__ = ["plot_sequence_diagnostics", "plot_summary", "plot_feasibility_diagnostics", "plot_profile_statistics", "plot_z_latent_analysis", "plot_step_function_results", "plot_initial_error_analysis"]

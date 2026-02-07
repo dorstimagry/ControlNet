@@ -19,21 +19,34 @@ env:
 
   # Reward function weights (dimensionless, affect reward scaling)
   accel_filter_alpha: 0.2   # Exponential smoothing factor for acceleration (0=no smoothing, 1=instant)
-  action_weight: 100.0       # Penalty weight for action magnitude (reduces aggressive control)
+  action_weight: 4000.0       # Penalty weight for action magnitude (reduces aggressive control)
   brake_weight: 0.0         # Penalty weight for brake usage (set to 0 to disable)
-  negative_speed_weight: 10.0   # Penalty weight for negative vehicle speeds (prevents reverse)
-  zero_speed_error_weight: 0.25    # Penalty for speed error when target speed is 0
-  zero_speed_throttle_weight: 100.0 # Penalty for throttle usage when target speed is 0
+  negative_speed_weight: 1000.0   # Penalty weight for negative vehicle speeds (prevents reverse)
+  zero_speed_error_weight: 1000.0    # Penalty for speed error when target speed is 0
+  zero_speed_throttle_weight: 1000.0 # Penalty for throttle usage when target speed is 0
   horizon_penalty_weight: 0.0  # Weight for future horizon tracking penalties
   horizon_penalty_decay: 0.99  # Exponential decay factor for future penalties (0.9-1.0)
-  jerk_weight: 50.0          # Penalty weight for acceleration changes (smoothness)
-  smooth_action_weight: 1000.0 # Penalty weight for action changes (stability)
-  track_weight: 1000.0         # Weight for speed tracking error in reward
+  jerk_weight: 4500.0          # Penalty weight for acceleration changes (smoothness)
+  smooth_action_weight: 25000.0 # Penalty weight for action changes (stability)
+  track_weight: 15000.0         # Weight for speed tracking error in reward
+  
+  # Sliding-window mean speed error penalty (bias elimination)
+  # See docs/accumulated_error.md for details
+  bias_penalty_enabled: false  # Enable sliding-window mean error penalty
+  bias_penalty_window_s: 2.0  # Window length in seconds (T_window, recommended: 1-3 s)
+  bias_penalty_weight: 2000.0  # Weight for bias penalty (w_bias, recommended: 0.3 × track_weight = 0.3 × 1500)
+  bias_penalty_v_scale: 15.0  # Speed scale for normalization (typical operating speed)
+  bias_penalty_v_ref_dot_threshold: 0.3  # Reference speed change threshold for gating (m/s², recommended: 0.1-0.3)
+  bias_penalty_a_threshold: 0.5  # Vehicle acceleration threshold for gating (m/s², recommended: 0.2-0.5)
+  
+  # Maximum absolute acceleration and jerk penalties (H-infinity norm)
+  max_acc_penalty_weight: 35.0  # Weight for maximum absolute acceleration penalty (only when |acc| > |target_acc|)
+  max_jerk_penalty_weight: 15.0  # Weight for maximum absolute jerk penalty (only when |jerk| > |target_jerk|)
   
   # Oscillation and overshoot penalty configuration
   # See docs/oscillation_and_overshoot_penalties_for_rl_longitudinal_control.md for details
-  oscillation_weight: 10.0  # Weight for oscillatory switching penalty (λ_osc) - start small (1-5% of track_weight)
-  overshoot_weight: 10.0  # Weight for overshoot crossing penalty (λ_over) - typically 0.1-0.3 × oscillation_weight
+  oscillation_weight: 20000.0  # Weight for oscillatory switching penalty (λ_osc) - start small (1-5% of track_weight)
+  overshoot_weight: 0.0  # Weight for overshoot crossing penalty (λ_over) - typically 0.1-0.3 × oscillation_weight
   oscillation_epsilon: 0.05  # Smoothing parameter for action sign (ε) - typical range: 0.03-0.08
   oscillation_error_scale: 0.3  # Error scale for proximity gate (e_s in m/s) - typical range: 0.2-0.5
   oscillation_ref_scale: 0.3  # Reference rate scale for stationarity gate (r_s in m/s²) - typical range: 0.2-0.5
@@ -58,6 +71,9 @@ env:
   
   # Violent profile training mode configuration
   violent_profile_mode: false  # Enable/disable violent profile mode (non-smooth profiles in observations)
+  filter_reward_mode: false  # Enable/disable filter reward mode (standard profiles in observations, filtered profiles for reward)
+  reward_filter_use_lookahead: false  # Enable/disable look-ahead mode for reward filter
+  reward_filter_lookahead_s: 3.0  # Look-ahead time for reward filter (seconds, must be <= preview_horizon_s)
   reward_filter_freq_cutoff: 0.8  # Filter cutoff frequency for reward (Hz)
   reward_filter_zeta: 4.0  # Filter damping ratio for reward
   reward_filter_dt: 0.1  # Filter timestep for reward (should match env dt)
@@ -157,6 +173,7 @@ generator:
   p_zero_stop: 0.08        # Probability of sampling full stops vs. speed targets (0-1)
   v_min: 0.0               # Minimum speed for random targets (m/s)
   v_max_sample: 25.0       # Maximum speed for random targets (m/s)
+  speed_beta: 3.0          # Beta distribution parameter for speed sampling (higher = more small speeds, 1.0 = uniform)
   t_min: 2.0               # Minimum time to reach new target (seconds)
   t_max: 12.0              # Maximum time to reach new target (seconds)
   stop_hold_min: 1.0       # Minimum dwell time for full stops (seconds)
@@ -166,7 +183,7 @@ generator:
   p_change_acc: 0.01       # Probability of changing acceleration scale per step (0-1)
   p_change_jerk: 0.01      # Probability of changing jerk scale per step (0-1)
   p_zero_accel: 0.15        # Probability of sampling zero acceleration when acceleration changes
-  accel_beta: 2.0          # Beta distribution parameter (higher = more small accelerations)
+  accel_beta: 3.0          # Beta distribution parameter (higher = more small accelerations)
 
   # Road grade generation parameters (Ornstein-Uhlenbeck process)
   ds: 1.0                  # Spatial grid step size (meters) - resolution of grade map

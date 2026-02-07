@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import yaml
@@ -25,6 +26,30 @@ try:
     from evaluation.cpp_onnx_policy import CppOnnxPolicy
 except ImportError:
     CppOnnxPolicy = None
+
+# ClearML integration (optional)
+try:
+    import clearml
+    from utils.clearml_logger import (
+        init_clearml_task,
+        log_metrics,
+        log_config,
+        upload_plot,
+        log_matplotlib_figure,
+        upload_artifact,
+        close_task,
+    )
+    CLEARML_LOGGER_AVAILABLE = True
+except ImportError:
+    CLEARML_LOGGER_AVAILABLE = False
+    clearml = None
+    init_clearml_task = None
+    log_metrics = None
+    log_config = None
+    upload_plot = None
+    log_matplotlib_figure = None
+    upload_artifact = None
+    close_task = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +126,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Evaluate over sharp step functions (no filtering) in addition to standard generator profiles.",
     )
+    parser.add_argument(
+        "--upload-plots-to-clearml",
+        action="store_true",
+        help="Upload plots to ClearML (default: False, plots are always saved offline).",
+    )
+    parser.add_argument(
+        "--disable-clearml",
+        action="store_true",
+        help="Disable ClearML logging even if ClearML is installed",
+    )
     return parser.parse_args()
 
 
@@ -138,12 +173,58 @@ def run_closed_loop_evaluation(
     onnx_model_path: Optional[Path] = None,
     force_export_onnx: bool = False,
     step_functions: bool = False,
+    upload_plots_to_clearml: bool = False,
+    disable_clearml: bool = False,
 ) -> dict[str, float]:
     device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
     policy, env_cfg, _ = load_policy_from_checkpoint(checkpoint, device=device)
     
+    # Initialize ClearML task for evaluation
+    clearml_task = None
+    if not disable_clearml and CLEARML_LOGGER_AVAILABLE and init_clearml_task is not None and clearml is not None:
+        checkpoint_stem = checkpoint.stem
+        clearml_task = init_clearml_task(
+            task_name=f"Evaluation_{checkpoint_stem}",
+            project="RL_Longitudinal",
+            tags=["evaluation", "closed_loop"],
+            task_type=clearml.Task.TaskTypes.testing,
+        )
+        if clearml_task:
+            # Log evaluation configuration
+            eval_config = {
+                "checkpoint": str(checkpoint),
+                "episodes": episodes,
+                "device": str(device),
+                "pid_kp": pid_kp,
+                "pid_ki": pid_ki,
+                "pid_kd": pid_kd,
+                "pid_integral_min": pid_integral_min,
+                "pid_integral_max": pid_integral_max,
+                "pid_feedback_rl_only": pid_feedback_rl_only,
+                "use_cpp_inference": use_cpp_inference,
+                "step_functions": step_functions,
+            }
+            if config_path:
+                eval_config["config_path"] = str(config_path)
+            if onnx_model_path:
+                eval_config["onnx_model_path"] = str(onnx_model_path)
+    
     # Check if SysID is enabled
     checkpoint_data = torch.load(checkpoint, map_location=device, weights_only=False)
+    
+    # Log checkpoint config to ClearML if available
+    if clearml_task:
+        checkpoint_config = checkpoint_data.get("config", {})
+        if checkpoint_config:
+            eval_config["checkpoint_config"] = checkpoint_config
+        log_config(clearml_task, eval_config)
+    
+    # Log checkpoint config to ClearML if available
+    if clearml_task:
+        checkpoint_config = checkpoint_data.get("config", {})
+        if checkpoint_config:
+            eval_config["checkpoint_config"] = checkpoint_config
+        log_config(clearml_task, eval_config)
     meta = checkpoint_data.get("meta", {})
     sysid_enabled_meta = meta.get("sysid_enabled", False)
     
@@ -394,7 +475,42 @@ def run_closed_loop_evaluation(
     vehicle_params_log = []
 
     for episode in tqdm(range(episodes), desc="Evaluating episodes"):
+        # Reset environment - for regular evaluation, start with no initial error and zero initial action
+        # Temporarily disable randomization to ensure consistent initial conditions
+        original_randomize_action = env.config.randomize_initial_action
+        original_speed_error_range = env.config.initial_speed_error_range
+        env.config.randomize_initial_action = False
+        env.config.initial_speed_error_range = 0.0
+        
         obs, _ = env.reset()
+        
+        # Get the initial reference speed (first reference in the preview horizon)
+        initial_reference_speed = float(obs[4]) if len(obs) > 4 else float(env.reference[0]) if len(env.reference) > 0 else 0.0
+        
+        # Reset again with initial speed matching reference (no initial error)
+        obs, _ = env.reset(options={"initial_speed": initial_reference_speed})
+        
+        # Ensure speed exactly matches reference (override any randomization)
+        env.speed = initial_reference_speed
+        
+        # Ensure previous action is zero and previous speeds match initial speed
+        # (Override any config-based randomization that might have been applied)
+        env._prev_action = 0.0
+        env.prev_speed = initial_reference_speed
+        env._prev_prev_speed = initial_reference_speed
+        
+        # Restore original config values
+        env.config.randomize_initial_action = original_randomize_action
+        env.config.initial_speed_error_range = original_speed_error_range
+        
+        # Rebuild observation with correct values
+        obs = env._build_observation()
+        
+        # Verify initial conditions are correct
+        if abs(env.speed - initial_reference_speed) > 1e-6:
+            print(f"[Warning] Speed mismatch after reset: speed={env.speed:.6f}, reference={initial_reference_speed:.6f}")
+        if abs(env._prev_action) > 1e-6:
+            print(f"[Warning] Non-zero initial action: {env._prev_action:.6f}")
         
         # Reset SysID encoder state for new episode
         if sysid_enabled:
@@ -404,8 +520,9 @@ def run_closed_loop_evaluation(
             feature_builder.reset()
             # Action history for SysID: track 3 previous actions to match FeatureBuilder bug
             # Due to FeatureBuilder's implementation, features at step t use action from step t-2
-            prev_speed = 0.0  # v_{t-1}, matches FeatureBuilder.v_prev initial value
-            prev_action = 0.0  # u_{t-1}, most recent action
+            # Initialize with initial speed (no error) and zero actions
+            prev_speed = initial_reference_speed  # v_{t-1}, start with initial speed
+            prev_action = 0.0  # u_{t-1}, most recent action (zero at start)
             prev_prev_action = 0.0  # u_{t-2}, used in features (due to FeatureBuilder bug)
             prev_prev_prev_action = 0.0  # u_{t-3}, used for du computation
 
@@ -737,6 +854,10 @@ def run_closed_loop_evaluation(
         
         invalid_combinations = []
         
+        # Create progress bar for step function combinations
+        total_combinations = len(start_speeds) * len(end_speeds)
+        step_pbar = tqdm(total=total_combinations, desc="Step functions", unit="comb")
+        
         for start_speed in start_speeds:
             for end_speed in end_speeds:
                 # Generate step function profile
@@ -925,6 +1046,12 @@ def run_closed_loop_evaluation(
                     step_trace["action_diff"] = action_diffs
                 
                 step_traces.append(step_trace)
+                
+                # Update progress bar
+                step_pbar.update(1)
+        
+        # Close progress bar
+        step_pbar.close()
         
         # Print summary of validation results
         if invalid_combinations:
@@ -1000,9 +1127,30 @@ def run_closed_loop_evaluation(
             }
 
 
+    # Log evaluation metrics to ClearML
+    if clearml_task:
+        # Log all summary metrics
+        for metric_name, metric_value in summary.items():
+            if isinstance(metric_value, (int, float)):
+                log_metrics(clearml_task, {f"eval/{metric_name}": float(metric_value)}, step=0)
+            elif isinstance(metric_value, dict):
+                # Handle nested dictionaries (e.g., cpp_comparison)
+                for nested_key, nested_value in metric_value.items():
+                    if isinstance(nested_value, (int, float)):
+                        log_metrics(clearml_task, {f"eval/{metric_name}/{nested_key}": float(nested_value)}, step=0)
+    
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(summary, indent=2))
+        
+        # Upload JSON summary to ClearML
+        if clearml_task:
+            upload_artifact(
+                clearml_task,
+                output_path,
+                artifact_name="evaluation_summary",
+                description="Evaluation metrics summary JSON",
+            )
 
     if plot_dir:
         plot_dir.mkdir(parents=True, exist_ok=True)
@@ -1027,29 +1175,69 @@ def run_closed_loop_evaluation(
         
         # Plot per-episode diagnostics (with PCA model if available)
         for trace in traces:
-            plot_sequence_diagnostics(
+            plot_path = plot_dir / f"{trace['sequence_id']}.png"
+            fig = plot_sequence_diagnostics(
                 trace,
-                plot_dir / f"{trace['sequence_id']}.png",
+                plot_path,
                 pca_model=pca_model
             )
-        plot_summary(per_episode_metrics, plot_dir / "closed_loop_summary.png")
+            # Upload per-episode plot to ClearML as matplotlib figure (if enabled)
+            if upload_plots_to_clearml and clearml_task and log_matplotlib_figure is not None:
+                log_matplotlib_figure(
+                    clearml_task,
+                    fig,
+                    title=f"Episode {trace['sequence_id']}",
+                )
+            plt.close(fig)  # Close after uploading
+        
+        summary_plot_path = plot_dir / "closed_loop_summary.png"
+        fig = plot_summary(per_episode_metrics, summary_plot_path)
+        if upload_plots_to_clearml and clearml_task and log_matplotlib_figure is not None:
+            log_matplotlib_figure(
+                clearml_task,
+                fig,
+                title="Closed Loop Summary",
+            )
+        plt.close(fig)  # Close after uploading
         
         # Plot comprehensive statistics across all episodes
         from evaluation.plotting import plot_profile_statistics, plot_z_latent_analysis
-        plot_profile_statistics(traces, plot_dir / "profile_statistics.png")
+        profile_stats_path = plot_dir / "profile_statistics.png"
+        fig = plot_profile_statistics(traces, profile_stats_path)
+        if upload_plots_to_clearml and clearml_task and log_matplotlib_figure is not None:
+            log_matplotlib_figure(
+                clearml_task,
+                fig,
+                title="Profile Statistics",
+            )
+        plt.close(fig)  # Close after uploading
         
         # Plot z latent analysis if SysID is enabled
         if sysid_enabled:
             z_analysis_path = plot_dir / "z_latent_analysis.png"
             print("Creating z latent analysis...")
-            plot_z_latent_analysis(traces, vehicle_params_log, z_analysis_path)
+            fig = plot_z_latent_analysis(traces, vehicle_params_log, z_analysis_path)
+            if upload_plots_to_clearml and clearml_task and log_matplotlib_figure is not None:
+                log_matplotlib_figure(
+                    clearml_task,
+                    fig,
+                    title="SysID Z Latent Analysis",
+                )
+            plt.close(fig)  # Close after uploading
         
         # Plot step function results if available
         if step_functions and len(step_traces) > 0:
             from evaluation.plotting import plot_step_function_results
             step_function_plot_path = plot_dir / "step_function_results.png"
             print("Creating step function results plot...")
-            plot_step_function_results(step_traces, step_function_plot_path)
+            fig = plot_step_function_results(step_traces, step_function_plot_path)
+            if upload_plots_to_clearml and clearml_task and log_matplotlib_figure is not None:
+                log_matplotlib_figure(
+                    clearml_task,
+                    fig,
+                    title="Step Function Results",
+                )
+            plt.close(fig)  # Close after uploading
         
         # Initial error step function analysis (if step_functions enabled)
         initial_error_traces = []
@@ -1059,6 +1247,9 @@ def run_closed_loop_evaluation(
             initial_errors = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]  # m/s error
             initial_speeds = [target_speed + err for err in initial_errors]
             profile_length = min(env.config.max_episode_steps, int(10.0 / env.config.dt))  # 10 seconds
+            
+            # Create progress bar for initial error analysis
+            initial_error_pbar = tqdm(total=len(initial_errors), desc="Initial errors", unit="err")
             
             for initial_speed, initial_error in zip(initial_speeds, initial_errors):
                 # Generate step function profile (constant target speed)
@@ -1162,6 +1353,12 @@ def run_closed_loop_evaluation(
                     "rl_action": rl_actions,
                 }
                 initial_error_traces.append(initial_error_trace)
+                
+                # Update progress bar
+                initial_error_pbar.update(1)
+            
+            # Close progress bar
+            initial_error_pbar.close()
             
             print(f"[Initial Error Analysis] Completed {len(initial_error_traces)} initial error evaluations.")
             
@@ -1170,7 +1367,14 @@ def run_closed_loop_evaluation(
                 from evaluation.plotting import plot_initial_error_analysis
                 initial_error_plot_path = plot_dir / "initial_error_analysis.png"
                 print("Creating initial error analysis plot...")
-                plot_initial_error_analysis(initial_error_traces, initial_error_plot_path)
+                fig = plot_initial_error_analysis(initial_error_traces, initial_error_plot_path)
+                if upload_plots_to_clearml and clearml_task and log_matplotlib_figure is not None:
+                    log_matplotlib_figure(
+                        clearml_task,
+                        fig,
+                        title="Initial Error Analysis",
+                    )
+                plt.close(fig)  # Close after uploading
 
         # Save vehicle parameters to a text file
         vehicle_params_file = plot_dir / "vehicle_parameters.txt"
@@ -1183,6 +1387,11 @@ def run_closed_loop_evaluation(
                 for key, value in sorted(params.items()):
                     f.write(f"  {key}: {value}\n")
                 f.write("\n")
+    
+    # Close ClearML task
+    if clearml_task:
+        close_task(clearml_task)
+    
     return summary
 
 
@@ -1213,6 +1422,8 @@ def main() -> None:
         onnx_model_path=args.onnx_model,
         force_export_onnx=args.force_export_onnx,
         step_functions=args.step_functions,
+        upload_plots_to_clearml=args.upload_plots_to_clearml,
+        disable_clearml=args.disable_clearml,
     )
     print(json.dumps(summary, indent=2))
 

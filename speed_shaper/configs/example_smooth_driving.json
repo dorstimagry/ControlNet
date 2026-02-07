@@ -1,0 +1,28 @@
+{
+  "dt": 0.1,
+  "wE_start": 30.0,
+  "wE_end": 10.0,
+  "lamE": 1.0,
+  "wA_start": 5.0,
+  "wA_end": 15.0,
+  "lamA": -0.3,
+  "wJ_start": 3.0,
+  "wJ_end": 12.0,
+  "lamJ": -0.3,
+  "a_min": null,
+  "a_max": null,
+  "j_min": null,
+  "j_max": null,
+  "enable_accel_bounds": false,
+  "enable_jerk_bounds": false,
+  "enable_terminal_constraint": false,
+  "metadata": {
+    "created_at": "2026-01-25T00:00:00",
+    "description": "Example configuration for smooth driving with increasing comfort penalties over time",
+    "use_case": "Highway cruise control with gradual emphasis on smoothness",
+    "recommended_multipliers": {
+      "lqr_accel_weight": 0.2,
+      "lqr_jerk_weight": 0.2
+    }
+  }
+}

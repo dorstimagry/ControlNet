@@ -721,6 +721,8 @@ pytest tests/test_pid_controller.py  # PID controller tests
 - `tqdm`: Progress bars
 
 ### Optional Dependencies
+
+- **ClearML** (`clearml>=1.0.0`): For experiment tracking and visualization. Automatically enabled if installed. Task names include date/time stamps (e.g., `SAC_Training_20240101_120000`).
 - `wandb`: Experiment tracking
 - `pytest`: Testing framework
 - `onnx`: ONNX model format

@@ -1,0 +1,622 @@
+"""Interactive GUI for speed profile shaping with matplotlib widgets."""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.widgets import Slider, Button, CheckButtons, RadioButtons
+import sys
+import os
+
+# Add parent directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from src.shaper_math import shape_speed_profile
+
+
+class SpeedShaperGUI:
+    """Interactive GUI for tuning speed profile shaper weights."""
+    
+    def __init__(self, example_type='step'):
+        """
+        Args:
+            example_type: Profile type - 'step', 'sine', 'random_quantized', 'random_smooth', etc.
+        """
+        # Profile parameters (will be controlled by sliders)
+        self.profile_params = {
+            'step_size': 3.0,      # For step profile
+            'amplitude': 5.0,      # For sine profile
+            'frequency': 0.2,      # For sine profile
+            'num_steps': 5,        # For random_quantized
+            'speed_range': 10.0,   # For random profiles
+            'smoothness': 0.5,     # For random_smooth
+        }
+        
+        # Generate example raw profile
+        self.dt = 0.1  # 100 ms
+        self.example_type = example_type
+        self.t, self.r = self._generate_example_profile(example_type, self.profile_params)
+        self.N = len(self.r) - 1
+        
+        # Initial measurements
+        self.meas = {
+            'v_meas': self.r[0],
+            'a_meas': 0.0,
+            'j_meas': 0.0
+        }
+        
+        # Initial shaped profile (will be computed)
+        self.v = self.r.copy()
+        
+        # Setup figure and axes
+        self._setup_figure()
+        
+        # Setup widgets
+        self._setup_widgets()
+        
+        # Initial solve
+        self._update_profile(None)
+        
+    def _generate_example_profile(self, example_type='coarse'):
+        """Generate example piecewise speed profile.
+        
+        Args:
+            example_type: 'coarse' for discontinuous steps with large jumps,
+                         'smooth' for smooth profile with high acceleration/jerk
+        """
+        dt = 0.1
+        
+        if example_type == 'coarse':
+            # Coarse example: Step from 0 to 3 m/s and back to 0
+            segments = []
+            
+            # Start at 0 m/s
+            t0 = np.array([0.0])
+            v0 = np.array([0.0])
+            segments.append((t0, v0))
+            
+            # Hold at 0 m/s (5 seconds)
+            t1 = np.arange(dt, 5.0, dt)
+            v1 = np.zeros(len(t1))
+            segments.append((t1, v1))
+            
+            # JUMP to 3 m/s (instantaneous step)
+            t2 = np.array([t1[-1] + dt])
+            v2 = np.array([3.0])
+            segments.append((t2, v2))
+            
+            # Hold at 3 m/s (10 seconds)
+            t3 = np.arange(t2[-1] + dt, t2[-1] + 10.0, dt)
+            v3 = np.ones(len(t3)) * 3.0
+            segments.append((t3, v3))
+            
+            # JUMP back to 0 m/s (instantaneous step)
+            t4 = np.array([t3[-1] + dt])
+            v4 = np.array([0.0])
+            segments.append((t4, v4))
+            
+            # Hold at 0 m/s (remaining time to reach 20 seconds)
+            t5 = np.arange(t4[-1] + dt, 20.0, dt)
+            v5 = np.zeros(len(t5))
+            segments.append((t5, v5))
+            
+            # Concatenate all segments
+            t_all = np.concatenate([t for t, v in segments])
+            v_all = np.concatenate([v for t, v in segments])
+            
+            # Add very small noise to make it look realistic
+            np.random.seed(42)
+            v_all += np.random.normal(0, 0.02, len(v_all))
+            
+        else:  # 'smooth'
+            # Smooth example: No discontinuities but with high acceleration and jerk
+            segments = []
+            
+            # Aggressive acceleration from 0 to 20 m/s (2 seconds, a=10 m/s²)
+            t1 = np.arange(0, 2.0, dt)
+            v1 = 10.0 * t1**2  # Quadratic (constant jerk start)
+            v1 = np.clip(v1, 0, 20)
+            segments.append((t1, v1))
+            
+            # Sinusoidal oscillation around 20 m/s (high jerk)
+            t2 = np.arange(t1[-1] + dt, t1[-1] + 3.0, dt)
+            v2 = 20.0 + 4.0 * np.sin(2 * np.pi * (t2 - t1[-1]) * 2.0)
+            segments.append((t2, v2))
+            
+            # Aggressive deceleration (3 seconds, a=-6.67 m/s²)
+            t3 = np.arange(t2[-1] + dt, t2[-1] + 3.0, dt)
+            t3_local = t3 - t2[-1]
+            v3 = v2[-1] - 3.33 * t3_local**2  # Quadratic deceleration
+            v3 = np.clip(v3, 2, None)
+            segments.append((t3, v3))
+            
+            # Sharp S-curve acceleration (tanh profile, high jerk at inflection)
+            t4 = np.arange(t3[-1] + dt, t3[-1] + 2.5, dt)
+            t4_local = t4 - t3[-1]
+            v4 = v3[-1] + 10.0 * (1 + np.tanh(4*(t4_local - 1.25))) / 2
+            segments.append((t4, v4))
+            
+            # High-frequency oscillation (very high jerk)
+            t5 = np.arange(t4[-1] + dt, t4[-1] + 2.0, dt)
+            v5 = v4[-1] + 3.0 * np.sin(2 * np.pi * (t5 - t4[-1]) * 4.0)
+            segments.append((t5, v5))
+            
+            # Final aggressive ramp up
+            t6 = np.arange(t5[-1] + dt, t5[-1] + 1.5, dt)
+            t6_local = t6 - t5[-1]
+            v6 = v5[-1] + 8.0 * t6_local
+            segments.append((t6, v6))
+            
+            # Concatenate all segments
+            t_all = np.concatenate([t for t, v in segments])
+            v_all = np.concatenate([v for t, v in segments])
+            
+            # Add very small noise
+            np.random.seed(42)
+            v_all += np.random.normal(0, 0.05, len(v_all))
+        
+        return t_all, v_all
+    
+    def _setup_figure(self):
+        """Setup matplotlib figure with GridSpec layout."""
+        # Step 1: Increase figure size (MANDATORY)
+        self.fig = plt.figure(figsize=(16, 12))
+        
+        # Step 2: Create top-level GridSpec with 3 rows
+        # Plots much larger, weights taller for larger sliders (but still lower than original)
+        gs = GridSpec(
+            nrows=3,
+            ncols=1,
+            height_ratios=[7.5, 1.1, 2.0],  # plots (much larger) / weights (taller for larger sliders) / constraints
+            hspace=0.55,  # More spacing to push weights lower
+            figure=self.fig
+        )
+        
+        # Step 3: Setup plots area (top section)
+        gs_plots = gs[0].subgridspec(
+            nrows=2,
+            ncols=1,
+            hspace=0.25
+        )
+        
+        # Speed profile plot
+        self.ax_speed = self.fig.add_subplot(gs_plots[0])
+        title_text = f'Speed Profile Shaping - {self.example_type.capitalize()} Example'
+        if self.example_type == 'coarse':
+            title_text += ' (Discontinuous Steps with Large Jumps)'
+        else:
+            title_text += ' (Smooth with High Acceleration/Jerk)'
+        self.ax_speed.set_title(title_text, fontsize=13, fontweight='bold', pad=10)
+        self.ax_speed.set_xlabel('Time (s)', labelpad=8)
+        self.ax_speed.set_ylabel('Speed (m/s)', labelpad=8)
+        self.ax_speed.grid(True, alpha=0.3)
+        
+        # Plot raw and shaped profiles
+        self.line_raw, = self.ax_speed.plot(self.t, self.r, 'k--', linewidth=1.5, 
+                                             label='Raw target', alpha=0.6)
+        self.line_shaped, = self.ax_speed.plot(self.t, self.v, 'b-', linewidth=2.5, 
+                                                label='Shaped profile')
+        self.ax_speed.legend(loc='upper right')
+        
+        # Acceleration and jerk plot
+        self.ax_accel = self.fig.add_subplot(gs_plots[1])
+        self.ax_accel.set_xlabel('Time (s)', labelpad=8)
+        self.ax_accel.set_ylabel('Acceleration (m/s²)', color='g', labelpad=8)
+        self.ax_accel.tick_params(axis='y', labelcolor='g', pad=6)
+        self.ax_accel.grid(True, alpha=0.3)
+        
+        self.ax_jerk = self.ax_accel.twinx()
+        self.ax_jerk.set_ylabel('Jerk (m/s³)', color='r', labelpad=8)
+        self.ax_jerk.tick_params(axis='y', labelcolor='r', pad=6)
+        
+        # Will be populated after first solve
+        self.line_accel = None
+        self.line_jerk = None
+        self.line_a_min = None
+        self.line_a_max = None
+        self.line_j_min = None
+        self.line_j_max = None
+        
+        # Store GridSpec for widget setup
+        self.gs = gs
+        
+        # Step 9: Final spacing cleanup (MANDATORY)
+        # Slightly narrower plots horizontally (increased left/right margins)
+        plt.subplots_adjust(
+            left=0.08,   # Increased from 0.06 (narrower plots)
+            right=0.95,  # Decreased from 0.97 (narrower plots)
+            top=0.95,
+            bottom=0.05
+        )
+    
+    def _setup_widgets(self):
+        """Setup sliders and checkbox widgets using GridSpec."""
+        # Step 4: Fix the weight sliders layout (middle section)
+        # 3 columns × 3 rows: Error | Accel | Jerk
+        # Increased hspace for more vertical spacing between rows
+        gs_weights = self.gs[1].subgridspec(
+            nrows=3,
+            ncols=3,
+            wspace=0.35,
+            hspace=1.2  # Much more spacing between rows (was 0.6)
+        )
+        
+        # Error weight sliders (column 0)
+        ax_wE_start = self.fig.add_subplot(gs_weights[0, 0])
+        ax_wE_end = self.fig.add_subplot(gs_weights[1, 0])
+        ax_lamE = self.fig.add_subplot(gs_weights[2, 0])
+        
+        ax_wE_start.set_facecolor("#f5f5f5")
+        ax_wE_end.set_facecolor("#f5f5f5")
+        ax_lamE.set_facecolor("#f5f5f5")
+        
+        self.slider_wE_start = Slider(ax_wE_start, 'wE start', 0.0, 100.0, valinit=30.0, valstep=1.0)
+        self.slider_wE_end = Slider(ax_wE_end, 'wE end', 0.0, 100.0, valinit=10.0, valstep=1.0)
+        self.slider_lamE = Slider(ax_lamE, 'λE', -5.0, 5.0, valinit=1.0, valstep=0.1)
+        
+        # Make slider fonts larger
+        self.slider_wE_start.label.set_fontsize(12)
+        self.slider_wE_start.valtext.set_fontsize(11)
+        self.slider_wE_end.label.set_fontsize(12)
+        self.slider_wE_end.valtext.set_fontsize(11)
+        self.slider_lamE.label.set_fontsize(12)
+        self.slider_lamE.valtext.set_fontsize(11)
+        
+        # Acceleration weight sliders (column 1)
+        ax_wA_start = self.fig.add_subplot(gs_weights[0, 1])
+        ax_wA_end = self.fig.add_subplot(gs_weights[1, 1])
+        ax_lamA = self.fig.add_subplot(gs_weights[2, 1])
+        
+        ax_wA_start.set_facecolor("#f5f5f5")
+        ax_wA_end.set_facecolor("#f5f5f5")
+        ax_lamA.set_facecolor("#f5f5f5")
+        
+        self.slider_wA_start = Slider(ax_wA_start, 'wA start', 0.0, 50.0, valinit=2.0, valstep=0.5)
+        self.slider_wA_end = Slider(ax_wA_end, 'wA end', 0.0, 50.0, valinit=10.0, valstep=0.5)
+        self.slider_lamA = Slider(ax_lamA, 'λA', -5.0, 5.0, valinit=-0.5, valstep=0.1)
+        
+        # Make slider fonts larger
+        self.slider_wA_start.label.set_fontsize(12)
+        self.slider_wA_start.valtext.set_fontsize(11)
+        self.slider_wA_end.label.set_fontsize(12)
+        self.slider_wA_end.valtext.set_fontsize(11)
+        self.slider_lamA.label.set_fontsize(12)
+        self.slider_lamA.valtext.set_fontsize(11)
+        
+        # Jerk weight sliders (column 2)
+        ax_wJ_start = self.fig.add_subplot(gs_weights[0, 2])
+        ax_wJ_end = self.fig.add_subplot(gs_weights[1, 2])
+        ax_lamJ = self.fig.add_subplot(gs_weights[2, 2])
+        
+        ax_wJ_start.set_facecolor("#f5f5f5")
+        ax_wJ_end.set_facecolor("#f5f5f5")
+        ax_lamJ.set_facecolor("#f5f5f5")
+        
+        self.slider_wJ_start = Slider(ax_wJ_start, 'wJ start', 0.0, 50.0, valinit=2.0, valstep=0.5)
+        self.slider_wJ_end = Slider(ax_wJ_end, 'wJ end', 0.0, 50.0, valinit=10.0, valstep=0.5)
+        self.slider_lamJ = Slider(ax_lamJ, 'λJ', -5.0, 5.0, valinit=-0.5, valstep=0.1)
+        
+        # Make slider fonts larger
+        self.slider_wJ_start.label.set_fontsize(12)
+        self.slider_wJ_start.valtext.set_fontsize(11)
+        self.slider_wJ_end.label.set_fontsize(12)
+        self.slider_wJ_end.valtext.set_fontsize(11)
+        self.slider_lamJ.label.set_fontsize(12)
+        self.slider_lamJ.valtext.set_fontsize(11)
+        
+        # Connect sliders to update callback (auto-solve on change)
+        self.slider_wE_start.on_changed(self._update_profile)
+        self.slider_wE_end.on_changed(self._update_profile)
+        self.slider_lamE.on_changed(self._update_profile)
+        self.slider_wA_start.on_changed(self._update_profile)
+        self.slider_wA_end.on_changed(self._update_profile)
+        self.slider_lamA.on_changed(self._update_profile)
+        self.slider_wJ_start.on_changed(self._update_profile)
+        self.slider_wJ_end.on_changed(self._update_profile)
+        self.slider_lamJ.on_changed(self._update_profile)
+        
+        # Add section labels for weights (positioned higher to avoid overlap with sliders)
+        # Larger fonts for better visibility
+        self.fig.text(0.17, 0.42, 'Error Weights', ha='center', fontsize=13, fontweight='bold')
+        self.fig.text(0.50, 0.42, 'Acceleration Weights', ha='center', fontsize=13, fontweight='bold')
+        self.fig.text(0.83, 0.42, 'Jerk Weights', ha='center', fontsize=13, fontweight='bold')
+        
+        # Step 5: Fix constraint controls (bottom section)
+        # 3 columns: Accel constraints | Jerk constraints | Global controls
+        gs_constraints = self.gs[2].subgridspec(
+            nrows=1,
+            ncols=3,
+            wspace=0.4
+        )
+        
+        # Step 6: Acceleration constraints column
+        gs_accel = gs_constraints[0].subgridspec(
+            nrows=4,
+            ncols=1,
+            hspace=0.6
+        )
+        
+        # Enable checkbox
+        ax_check_accel = self.fig.add_subplot(gs_accel[0])
+        ax_check_accel.axis("off")
+        self.check_accel = CheckButtons(ax_check_accel, ['Enable accel bounds'], [False])
+        self.check_accel.on_clicked(self._update_profile)
+        
+        # a_min slider
+        ax_a_min = self.fig.add_subplot(gs_accel[1])
+        ax_a_min.set_facecolor("#f5f5f5")
+        self.slider_a_min = Slider(ax_a_min, 'a_min', -10.0, 0.0, valinit=-3.0, valstep=0.5)
+        self.slider_a_min.on_changed(self._update_profile)
+        
+        # a_max slider
+        ax_a_max = self.fig.add_subplot(gs_accel[2])
+        ax_a_max.set_facecolor("#f5f5f5")
+        self.slider_a_max = Slider(ax_a_max, 'a_max', 0.0, 10.0, valinit=3.0, valstep=0.5)
+        self.slider_a_max.on_changed(self._update_profile)
+        
+        # Spacer (empty axis)
+        ax_spacer_accel = self.fig.add_subplot(gs_accel[3])
+        ax_spacer_accel.axis("off")
+        
+        # Step 7: Jerk constraints column
+        gs_jerk = gs_constraints[1].subgridspec(
+            nrows=4,
+            ncols=1,
+            hspace=0.6
+        )
+        
+        # Enable checkbox
+        ax_check_jerk = self.fig.add_subplot(gs_jerk[0])
+        ax_check_jerk.axis("off")
+        self.check_jerk = CheckButtons(ax_check_jerk, ['Enable jerk bounds'], [False])
+        self.check_jerk.on_clicked(self._update_profile)
+        
+        # j_min slider
+        ax_j_min = self.fig.add_subplot(gs_jerk[1])
+        ax_j_min.set_facecolor("#f5f5f5")
+        self.slider_j_min = Slider(ax_j_min, 'j_min', -20.0, 0.0, valinit=-8.0, valstep=1.0)
+        self.slider_j_min.on_changed(self._update_profile)
+        
+        # j_max slider
+        ax_j_max = self.fig.add_subplot(gs_jerk[2])
+        ax_j_max.set_facecolor("#f5f5f5")
+        self.slider_j_max = Slider(ax_j_max, 'j_max', 0.0, 20.0, valinit=8.0, valstep=1.0)
+        self.slider_j_max.on_changed(self._update_profile)
+        
+        # Spacer (empty axis)
+        ax_spacer_jerk = self.fig.add_subplot(gs_jerk[3])
+        ax_spacer_jerk.axis("off")
+        
+        # Step 8: Global controls column (right)
+        gs_global = gs_constraints[2].subgridspec(
+            nrows=4,
+            ncols=1,
+            hspace=0.8
+        )
+        
+        # Terminal constraint checkbox
+        ax_check_term = self.fig.add_subplot(gs_global[0])
+        ax_check_term.axis("off")
+        self.check_terminal = CheckButtons(ax_check_term, ['Enforce v[N]=r[N]'], [False])
+        self.check_terminal.on_clicked(self._update_profile)
+        
+        # Spacer for button area (button removed - auto-update)
+        ax_spacer1 = self.fig.add_subplot(gs_global[1])
+        ax_spacer1.axis("off")
+        
+        # Instructions text
+        ax_instructions = self.fig.add_subplot(gs_global[2])
+        ax_instructions.axis("off")
+        instruction_text = "Move sliders to adjust weights and constraints - plot updates automatically"
+        ax_instructions.text(0.5, 0.5, instruction_text, ha='center', va='center', 
+                           fontsize=9, style='italic', color='blue', transform=ax_instructions.transAxes)
+        
+        # Bottom spacer
+        ax_spacer2 = self.fig.add_subplot(gs_global[3])
+        ax_spacer2.axis("off")
+    
+    def _get_weight_params(self):
+        """Read current slider values into weight parameters dictionary."""
+        return {
+            'wE_start': self.slider_wE_start.val,
+            'wE_end': self.slider_wE_end.val,
+            'lamE': self.slider_lamE.val,
+            'wA_start': self.slider_wA_start.val,
+            'wA_end': self.slider_wA_end.val,
+            'lamA': self.slider_lamA.val,
+            'wJ_start': self.slider_wJ_start.val,
+            'wJ_end': self.slider_wJ_end.val,
+            'lamJ': self.slider_lamJ.val,
+        }
+    
+    def _update_profile(self, event):
+        """Callback for solve button: recompute and update plots."""
+        # Get current parameters
+        weight_params = self._get_weight_params()
+        enforce_terminal = self.check_terminal.get_status()[0]
+        
+        # Get constraint parameters
+        enable_accel = self.check_accel.get_status()[0]
+        enable_jerk = self.check_jerk.get_status()[0]
+        a_min = self.slider_a_min.val
+        a_max = self.slider_a_max.val
+        j_min = self.slider_j_min.val
+        j_max = self.slider_j_max.val
+        
+        # Validate bounds
+        if enable_accel and a_min >= a_max:
+            print(f"Warning: Invalid acceleration bounds: a_min={a_min} >= a_max={a_max}. Skipping solve.")
+            return
+        
+        if enable_jerk and j_min >= j_max:
+            print(f"Warning: Invalid jerk bounds: j_min={j_min} >= j_max={j_max}. Skipping solve.")
+            return
+        
+        # Pre-check feasibility with initial conditions
+        if enable_accel:
+            a_meas = self.meas['a_meas']
+            if not (a_min <= a_meas <= a_max):
+                print(f"Warning: Initial acceleration a_meas={a_meas:.2f} violates bounds [{a_min:.2f}, {a_max:.2f}]")
+                print("  Cannot solve. Adjust bounds or initial conditions.")
+                return
+        
+        if enable_jerk:
+            j_meas = self.meas['j_meas']
+            if not (j_min <= j_meas <= j_max):
+                print(f"Warning: Initial jerk j_meas={j_meas:.2f} violates bounds [{j_min:.2f}, {j_max:.2f}]")
+                print("  Cannot solve. Adjust bounds or initial conditions.")
+                return
+        
+        # Solve QP
+        try:
+            self.v = shape_speed_profile(
+                self.r, self.dt, self.meas, weight_params, enforce_terminal,
+                enable_accel_bounds=enable_accel, a_min=a_min, a_max=a_max,
+                enable_jerk_bounds=enable_jerk, j_min=j_min, j_max=j_max
+            )
+        except Exception as e:
+            print(f"Error solving QP: {e}")
+            return
+        
+        # Update speed plot
+        self.line_shaped.set_ydata(self.v)
+        
+        # Compute acceleration and jerk
+        t_accel = self.t[:-1] + self.dt / 2  # Midpoints
+        accel = np.diff(self.v) / self.dt
+        
+        t_jerk = t_accel[:-1] + self.dt / 2
+        jerk = np.diff(accel) / self.dt
+        
+        # Update acceleration and jerk plots
+        if self.line_accel is None:
+            self.line_accel, = self.ax_accel.plot(t_accel, accel, 'g-', linewidth=2, label='Acceleration')
+            self.ax_accel.legend(loc='upper left')
+        else:
+            self.line_accel.set_data(t_accel, accel)
+        
+        if self.line_jerk is None:
+            self.line_jerk, = self.ax_jerk.plot(t_jerk, jerk, 'r-', linewidth=2, label='Jerk', alpha=0.7)
+            self.ax_jerk.legend(loc='upper right')
+        else:
+            self.line_jerk.set_data(t_jerk, jerk)
+        
+        # Update constraint bound lines
+        t_min, t_max = self.t.min(), self.t.max()
+        
+        # Acceleration bounds
+        if enable_accel:
+            if self.line_a_min is None:
+                self.line_a_min, = self.ax_accel.plot([t_min, t_max], [a_min, a_min], 'g--', 
+                                                       linewidth=1.5, alpha=0.6, label=f'a_min={a_min}')
+                self.line_a_max, = self.ax_accel.plot([t_min, t_max], [a_max, a_max], 'g--', 
+                                                       linewidth=1.5, alpha=0.6, label=f'a_max={a_max}')
+            else:
+                self.line_a_min.set_data([t_min, t_max], [a_min, a_min])
+                self.line_a_max.set_data([t_min, t_max], [a_max, a_max])
+                self.line_a_min.set_label(f'a_min={a_min}')
+                self.line_a_max.set_label(f'a_max={a_max}')
+            self.line_a_min.set_visible(True)
+            self.line_a_max.set_visible(True)
+        else:
+            if self.line_a_min is not None:
+                self.line_a_min.set_visible(False)
+                self.line_a_max.set_visible(False)
+        
+        # Jerk bounds
+        if enable_jerk:
+            if self.line_j_min is None:
+                self.line_j_min, = self.ax_jerk.plot([t_min, t_max], [j_min, j_min], 'r--', 
+                                                      linewidth=1.5, alpha=0.6, label=f'j_min={j_min}')
+                self.line_j_max, = self.ax_jerk.plot([t_min, t_max], [j_max, j_max], 'r--', 
+                                                      linewidth=1.5, alpha=0.6, label=f'j_max={j_max}')
+            else:
+                self.line_j_min.set_data([t_min, t_max], [j_min, j_min])
+                self.line_j_max.set_data([t_min, t_max], [j_max, j_max])
+                self.line_j_min.set_label(f'j_min={j_min}')
+                self.line_j_max.set_label(f'j_max={j_max}')
+            self.line_j_min.set_visible(True)
+            self.line_j_max.set_visible(True)
+        else:
+            if self.line_j_min is not None:
+                self.line_j_min.set_visible(False)
+                self.line_j_max.set_visible(False)
+        
+        # Update legends
+        self.ax_accel.legend(loc='upper left')
+        self.ax_jerk.legend(loc='upper right')
+        
+        # Auto-scale acceleration and jerk axes
+        self.ax_accel.relim()
+        self.ax_accel.autoscale_view()
+        self.ax_jerk.relim()
+        self.ax_jerk.autoscale_view()
+        
+        # Redraw
+        self.fig.canvas.draw_idle()
+        
+        # Print some stats
+        print(f"\n{'='*60}")
+        print(f"Profile updated:")
+        print(f"  Error weights:  start={weight_params['wE_start']:.1f}, end={weight_params['wE_end']:.1f}, λ={weight_params['lamE']:.2f}")
+        print(f"  Accel weights:  start={weight_params['wA_start']:.1f}, end={weight_params['wA_end']:.1f}, λ={weight_params['lamA']:.2f}")
+        print(f"  Jerk weights:   start={weight_params['wJ_start']:.1f}, end={weight_params['wJ_end']:.1f}, λ={weight_params['lamJ']:.2f}")
+        print(f"  Terminal constraint: {enforce_terminal}")
+        if enable_accel:
+            print(f"  Accel bounds:   [{a_min:.1f}, {a_max:.1f}] m/s²  (actual: [{accel.min():.2f}, {accel.max():.2f}])")
+        if enable_jerk:
+            print(f"  Jerk bounds:    [{j_min:.1f}, {j_max:.1f}] m/s³  (actual: [{jerk.min():.2f}, {jerk.max():.2f}])")
+        print(f"  Max |accel|: {np.abs(accel).max():.2f} m/s²")
+        print(f"  Max |jerk|:  {np.abs(jerk).max():.2f} m/s³")
+        print(f"  RMS tracking error: {np.sqrt(np.mean((self.v - self.r)**2)):.3f} m/s")
+        print(f"{'='*60}")
+    
+    def show(self):
+        """Display the GUI."""
+        plt.show()
+
+
+def main():
+    """Main entry point for the GUI."""
+    import sys
+    
+    # Check for command-line argument to select example type
+    example_type = 'coarse'  # default
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ['coarse', 'smooth']:
+            example_type = sys.argv[1]
+        else:
+            print("Usage: python -m src.gui_matplotlib [coarse|smooth]")
+            print("  coarse - Discontinuous steps with large jumps (default)")
+            print("  smooth - Smooth profile with high acceleration/jerk")
+            sys.exit(1)
+    
+    print("=" * 60)
+    print("Speed Profile Shaper - Interactive GUI")
+    print("=" * 60)
+    print(f"\nExample type: {example_type}")
+    if example_type == 'coarse':
+        print("  - Discontinuous steps with large instantaneous jumps")
+        print("  - Great for testing jerk smoothing on sharp transitions")
+    else:
+        print("  - Smooth profile with high acceleration and jerk")
+        print("  - Great for testing dynamic smoothing on aggressive maneuvers")
+    print("\nInstructions:")
+    print("  - Adjust sliders to tune weight schedules")
+    print("  - Plot updates automatically (no button needed)")
+    print("  - wX_start: weight at t=0")
+    print("  - wX_end: weight at t=∞")
+    print("  - λX: exponential decay rate")
+    print("  - Check box to enforce terminal constraint v[N]=r[N]")
+    print("\nTips:")
+    print("  - High error weight → tight tracking")
+    print("  - High accel weight → smooth slopes")
+    print("  - High jerk weight → no sharp corners")
+    print("=" * 60)
+    print()
+    
+    gui = SpeedShaperGUI(example_type=example_type)
+    gui.show()
+
+
+if __name__ == '__main__':
+    main()
